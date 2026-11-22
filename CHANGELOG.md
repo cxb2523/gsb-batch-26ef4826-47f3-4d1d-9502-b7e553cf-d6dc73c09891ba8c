@@ -6,6 +6,17 @@ All notable changes to Umbra EQ are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Bypass no longer ducks the tab at the moment it is switched. The shared output limiter
+  stays in circuit while the equalizer is bypassed, but its detector, lookahead buffer and
+  gain envelope are now cleared on each bypass transition, so the restored curve starts from
+  a clean state instead of the gain reduction earned by the curve that was just left. Editing
+  the curve while bypassed does not reset it.
+- Auto Gain is paused while Bypass is on, where the flat curve leaves nothing to compensate
+  for, and is recomputed from the current curve when Bypass ends — including a curve reshaped
+  during bypass. The saved master volume continues to be left untouched.
+
 ## [2.5.0] — 2026-11-08
 
 Prepared release candidate. Chrome Web Store publication is tracked separately in

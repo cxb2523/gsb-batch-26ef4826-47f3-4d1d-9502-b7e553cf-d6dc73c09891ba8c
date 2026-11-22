@@ -4,6 +4,7 @@ import pkgRaw from '../../package.json?raw';
 import manifestSrc from '../manifest.config.ts?raw';
 import backgroundSrc from '../background.js?raw';
 import offscreenSrc from '../../public/offscreen.js?raw';
+import limiterWorkletSrc from '../../public/limiter-worklet.js?raw';
 import engineIoSrc from './engine-io.ts?raw';
 import audioSrc from './audio.ts?raw';
 import changelogSrc from '../../CHANGELOG.md?raw';
@@ -238,18 +239,21 @@ describe('cross-file invariants', () => {
     expect(appSrc, 'the graph needs the flag to show what is audible').toContain('bypassed={eng.bypassed}');
   });
 
-  it('a bypassed tab is sent flat, and a drag is not sent to it at all', () => {
+  it('a bypassed tab is sent flat with an uncompensated volume, and never reset twice', () => {
     const enter = useEngineSrc.match(/--- bypass:on:start[\s\S]*?--- bypass:on:end/)?.[0] ?? '';
     expect(enter, 'entering bypass must send a flat curve').toContain('eqFilters: io.flatBands()');
     // Bypass must not mute: it silences the equalizer, not the user's volume. It goes through
     // sentGain like every other push, which on a flat curve is the identity — Auto Gain has
-    // nothing to compensate for when nothing is being boosted.
+    // nothing to compensate for when nothing is being boosted. The third argument is what says so
+    // out loud: with the curve off, subtracting its average would duck a tab being heard unshaped.
     expect(enter, 'and must keep the master volume it found').toContain('gainRef.current');
+    expect(enter, 'and must tell Auto Gain the curve is not playing').toContain('sentGain(gainRef.current, io.flatBands(), true)');
     expect(enter, 'bypass is not a mute').not.toMatch(/gain: 0[,\s}]/);
 
     // The live handlers each push their own message and never consulted the preview, so the guard
     // has to be at those two sites. Only the eleven filters are gated: modifyGain keeps flowing,
-    // because bypassing the equalizer is not muting the user's volume.
+    // because bypassing the equalizer is not muting the user's volume — but its gain is still
+    // sent uncompensated for the same reason as above.
     const drag = useEngineSrc.match(/const onBandsLive = useCallback\([\s\S]*?\n  \);/)?.[0] ?? '';
     expect(drag, 'onBandsLive must not push to a bypassed tab').toContain('sendsBandsToActiveTab(');
     expect(drag, 'and must push the curve being dragged, not the stored one').toContain('eqFilters: nb');
@@ -257,6 +261,37 @@ describe('cross-file invariants', () => {
 
     const gain = useEngineSrc.match(/const onGainLive = useCallback\([\s\S]*?\n  \);/)?.[0] ?? '';
     expect(gain, 'the master volume stays audible under bypass').not.toContain('sendsBandsToActiveTab(');
+    expect(gain, 'and is never compensated against a curve that is not playing').toContain(
+      'sentGain(g, bypassed ? io.flatBands() : bandsRef.current, bypassed)'
+    );
+    expect(gain, 'and the bypass answer is read when the message leaves').toContain('const bypassed = isBypassed(previewRef.current);');
+
+    // The limiter reset is a TRANSITION, decided where the preview changes — the one function that
+    // sets bypassed. Putting it in enterBypass/leaveBypass alone would miss no case today, but the
+    // moment another path sets a bypass preview (A/B, restore) the two would drift, which is the
+    // defect class setPreview exists to kill. limiterResetsOn is the tested predicate.
+    const setPreviewBlock = useEngineSrc.match(/const setPreview = useCallback\([\s\S]*?\n  \}, \[\]\);/)?.[0] ?? '';
+    expect(setPreviewBlock, 'setPreview not found').toBeTruthy();
+    expect(setPreviewBlock, 'the limiter reset belongs to the preview edge').toContain('limiterResetsOn(was, next)');
+    expect(setPreviewBlock, 'and must be gated on it, not fired unconditionally').toMatch(/if \(limiterResetsOn\(was, next\)\)/);
+    expect(setPreviewBlock, 'and reach the engine').toContain("toOffscreen('resetLimiter'");
+
+    // Exactly one reset per transition also requires that nothing else resets the limiter as a
+    // side effect of playing audio. A second sender would make repeated toggles accumulate.
+    const resetSenders = (useEngineSrc.match(/resetLimiter/g) ?? []).length;
+    expect(resetSenders, 'the popup may request a limiter reset in exactly one place').toBe(1);
+
+    const off = offscreenSrc.match(/function resetOutputLimiter\([\s\S]*?\n}/)?.[0] ?? '';
+    expect(off, 'the engine handler not found').toBeTruthy();
+    expect(off, 'and it must go through the port, not rebuild the node').toContain("postMessage({ type: 'reset' })");
+    expect(offscreenSrc, 'the resetLimiter message must be routed').toContain("case 'resetLimiter':");
+    // reset() in place: constructing a limiter inside the worklet's port handler allocates on the
+    // audio thread. The worklet must call the method, not throw the object away.
+    const worklet = limiterWorkletSrc;
+    expect(worklet, 'the worklet must reset in place').toContain('this.limiter.reset()');
+    const portHandler = worklet.match(/port\.onmessage = \([\s\S]*?\n    \};/)?.[0] ?? '';
+    expect(portHandler, 'the worklet port handler not found').toBeTruthy();
+    expect(portHandler, 'and never allocate a limiter per message').not.toContain('new LookaheadLimiter');
   });
 
   it('one undo, owned by one reset, cleared by a write and not by a clock', () => {

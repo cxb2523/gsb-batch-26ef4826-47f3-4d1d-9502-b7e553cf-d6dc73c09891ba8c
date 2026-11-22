@@ -39,9 +39,15 @@ export function compensationDb(bands: Band[]): number {
  *
  * With Auto Gain off this returns the caller's own number, identically: switching the feature on
  * should be the only thing that changes the sound.
+ *
+ * `bypassed` pauses the compensation, it does not zero the volume. While the equalizer is bypassed
+ * nothing is being boosted, so there is nothing to compensate for and any subtraction would be an
+ * unasked-for duck of an otherwise unshaped tab. Leaving bypass re-runs this with the curve then in
+ * the buffer, which is exactly the "recompute against the current curve" the draft mode needs —
+ * including a curve that was reshaped while bypassed.
  */
-export function outputGain(input: { userGain: number; bands: Band[]; on: boolean }): number {
-  if (!input.on) return input.userGain;
+export function outputGain(input: { userGain: number; bands: Band[]; on: boolean; bypassed?: boolean }): number {
+  if (!input.on || input.bypassed) return input.userGain;
   const comp = compensationDb(input.bands);
   if (comp === 0) return input.userGain;
   return clampMasterGain(dbToMasterGain(masterGainToDb(clampMasterGain(input.userGain)) - comp));

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isBypassed, previewAfterDrag, previewAfterCommit, persistsNow, sendsBandsToActiveTab, mayMirrorBuffer, commitOnUnbypass } from './bypass';
+import { isBypassed, previewAfterDrag, previewAfterCommit, persistsNow, sendsBandsToActiveTab, mayMirrorBuffer, commitOnUnbypass, limiterResetsOn } from './bypass';
 import { NO_PREVIEW, previewForDrag, previewForBypass } from './edit-state';
 import { flatBands } from './engine-io';
 
@@ -80,5 +80,30 @@ describe('the buffer must keep tracking storage, even under bypass', () => {
 
   it('a drag preview freezes it', () => {
     expect(mayMirrorBuffer({ interacting: false, dirty: false, preview: previewForDrag() })).toBe(false);
+  });
+});
+
+describe('the output limiter is cleared exactly when bypass changes', () => {
+  // One shared output stage, so the gain reduction earned by the curve the user stopped hearing
+  // must not be released onto the signal that replaces it. The switch is an EDGE, not a level:
+  // asking "are we bypassed" inside the mode would re-arm on every drag made against the draft.
+  it('resets on entry and on exit — both directions hand over a different signal', () => {
+    expect(limiterResetsOn(NO_PREVIEW, BYPASS())).toBe(true);
+    expect(limiterResetsOn(BYPASS(), NO_PREVIEW)).toBe(true);
+  });
+
+  it('staying inside or outside the mode resets nothing', () => {
+    expect(limiterResetsOn(NO_PREVIEW, previewForDrag())).toBe(false);
+    expect(limiterResetsOn(previewForDrag(), NO_PREVIEW)).toBe(false);
+    expect(limiterResetsOn(BYPASS(), BYPASS())).toBe(false);
+  });
+
+  it('a drag made while bypassed is not a transition — the mode never changed', () => {
+    // previewAfterDrag keeps the bypass preview, so this is the same edge the drag handler sees.
+    expect(limiterResetsOn(BYPASS(), previewAfterDrag(BYPASS()))).toBe(false);
+  });
+
+  it('a commit (which leaves a drag preview) is not a bypass transition', () => {
+    expect(limiterResetsOn(previewForDrag(), previewAfterCommit(previewForDrag()))).toBe(false);
   });
 });

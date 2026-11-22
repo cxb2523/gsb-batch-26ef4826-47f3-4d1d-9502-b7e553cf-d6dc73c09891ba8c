@@ -29,8 +29,30 @@ try {
   browser = await chromium.launch({headless:true,...(process.env.UMBRA_AUDIT_CHROMIUM ? {executablePath:process.env.UMBRA_AUDIT_CHROMIUM}: {})});
   const page = await browser.newPage();
   await page.goto(base);
-  const result = await page.evaluate(async ({audio,engine,base}) => {
+    const result = await page.evaluate(async ({audio,engine,base}) => {
     const math = new Function(audio+';return {biquadCoefficients,bandDbAtY,masterGainToDb,dbToMasterGain};')();
+    // The shipped limiter module itself, so reset() is exercised in a real JS engine rather than
+    // only under Node — it is the code the worklet runs.
+    const {LookaheadLimiter} = await import(base + '/limiter-core.js');
+    const resetCheck = (() => {
+      const hot = Float32Array.from({length:24000}, (_, i) => i % 89 === 0 ? 60 : 8 * Math.sin(i * .21));
+      const quiet = Float32Array.from({length:4800}, (_, i) => .1 * Math.sin(i * .2));
+      const dirty = new LookaheadLimiter(48000, 2);
+      const stereo = [hot, Float32Array.from(hot, x => -.5 * x)];
+      dirty.process(stereo, stereo.map(c => new Float32Array(c.length)));
+      dirty.reset();
+      const fresh = new LookaheadLimiter(48000, 2);
+      const tail = [quiet, Float32Array.from(quiet, x => -.5 * x)];
+      const a = tail.map(c => new Float32Array(c.length));
+      const b = tail.map(c => new Float32Array(c.length));
+      dirty.process(tail, a);
+      fresh.process(tail, b);
+      const maxDiff = a.reduce((worst, ch, i) => Math.max(worst, ...ch.map((v, j) => Math.abs(v - b[i][j]))), 0);
+      // Everything past the declared lookahead is the input, unattenuated: no leftover duck.
+      // output[n] carries input[n - delaySamples], so compare from the delayed offset on.
+      const unityError = a.reduce((worst, ch, i) => Math.max(worst, ...ch.slice(dirty.delaySamples).map((v, j) => Math.abs(v - tail[i][j]))), 0);
+      return {maxDiff, unityError, delaySamples: dirty.delaySamples};
+    })();
     let maxResponseError = 0;
     let worstResponse;
     let comparisons=0;
@@ -84,11 +106,15 @@ try {
       const meterPeak=readOutputPeak();
       renders.push({sampleRate,scenario,peak,quietError,stereoError,meterPeak});
     }
-    return {comparisons,maxResponseError,worstResponse,ceiling,renders,master6dB:math.dbToMasterGain(6),masterStored2:math.masterGainToDb(2)};
+    return {comparisons,maxResponseError,worstResponse,ceiling,renders,resetCheck,master6dB:math.dbToMasterGain(6),masterStored2:math.masterGainToDb(2)};
   },{audio,engine,base});
   console.log(JSON.stringify(result,null,2));
   assert.ok(result.maxResponseError<0.02,`Graph differs from native Web Audio by ${result.maxResponseError} dB`);
   assert.ok(Math.abs(result.master6dB-10**(6/20))<1e-12);
+  // A bypass toggle resets the shared limiter; the shipped module must leave it equal to a new one,
+  // with nothing but the lookahead delay between the tail and the input it is fed.
+  assert.equal(result.resetCheck.maxDiff,0,'Reset limiter differs from a freshly constructed one');
+  assert.ok(result.resetCheck.unityError<1e-6,'Reset limiter still ducks the signal it receives');
   for(const render of result.renders){
     assert.ok(Number.isFinite(render.peak)&&render.peak<=result.ceiling,`${render.scenario} exceeds sample ceiling`);
     assert.ok(render.quietError<1e-6,'Quiet signal changed beyond its declared delay');

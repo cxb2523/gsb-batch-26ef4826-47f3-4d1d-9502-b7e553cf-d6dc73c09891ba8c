@@ -83,3 +83,28 @@ describe('what the engine is told to play', () => {
     expect(outputGain({ userGain: 1, bands, on: true })).toBe(once);
   });
 });
+
+describe('bypass pauses the compensation without touching the volume', () => {
+  it('sends the user’s own gain while the equalizer is bypassed', () => {
+    // Nothing is being boosted behind a flat curve, so there is nothing to subtract. Applying it
+    // anyway would duck a tab the user asked to hear unshaped — the opposite of "bypass".
+    for (const userGain of [1, 0.5, 2]) {
+      expect(outputGain({ userGain, bands: all(6), on: true, bypassed: true })).toBe(userGain);
+    }
+  });
+
+  it('resumes compensation when bypass ends', () => {
+    const bands = all(6);
+    expect(outputGain({ userGain: 1, bands, on: true, bypassed: false })).toBe(outputGain({ userGain: 1, bands, on: true }));
+    expect(outputGain({ userGain: 1, bands, on: true, bypassed: false })).toBeLessThan(1);
+  });
+
+  it('uses the curve in the buffer at the time bypass ends, not the one it started with', () => {
+    // The acceptance case: shape the curve while bypassed, then leave. The compensation must be
+    // the new curve's, so the same stored volume produces a different sent value per curve.
+    const before = outputGain({ userGain: 1, bands: all(3), on: true, bypassed: true });
+    const after = outputGain({ userGain: 1, bands: all(9), on: true, bypassed: false });
+    expect(before).toBe(1);
+    expect(after).toBeLessThan(outputGain({ userGain: 1, bands: all(3), on: true, bypassed: false }));
+  });
+});

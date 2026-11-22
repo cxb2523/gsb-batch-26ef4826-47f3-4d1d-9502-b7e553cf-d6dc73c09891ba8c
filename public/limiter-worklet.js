@@ -5,7 +5,9 @@ class UmbraOutputLimiter extends AudioWorkletProcessor {
     super();
     this.limiter = new LookaheadLimiter(sampleRate, 2);
     this.port.onmessage = ({ data }) => {
-      if (data?.type === 'reset') this.limiter = new LookaheadLimiter(sampleRate, 2);
+      // reset() in place: allocating a limiter here would run on the audio thread, and every
+      // bypass toggle would risk a GC pause inside the render quantum.
+      if (data?.type === 'reset') this.limiter.reset();
     };
   }
 

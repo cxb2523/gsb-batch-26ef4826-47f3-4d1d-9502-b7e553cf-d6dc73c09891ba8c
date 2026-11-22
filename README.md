@@ -50,11 +50,15 @@ Thin bass on laptop speakers, one video mixed too quiet, another too harsh — U
 - **Reset** — put the sound back to what it was when you opened Umbra. Not one step back; all the
   way back.
 - **Bypass** — hear the tab unshaped while the curve stays editable, then switch back to compare.
-  Nothing is saved until you leave Bypass.
+  Nothing is saved until you leave Bypass. The output limiter keeps working while bypassed, and it
+  is cleared on each switch so the restored curve starts from a clean detector instead of the gain
+  reduction the previous signal earned.
 - **Presets you can build on** — Bass Boost / Vocal / Movie / Warm, plus your own. Nudge a band and
   the header keeps saying *Based on Vocal*, so a tweaked preset never becomes an anonymous curve.
 - **Auto Gain** *(off by default)* — estimates level compensation from the EQ settings without
-  changing your saved volume. It does not measure the track’s loudness or automatically normalize different videos.
+  changing your saved volume. It pauses while Bypass is on, because a flat curve has nothing to
+  compensate for, and resumes from the current curve when Bypass ends. It does not measure the
+  track’s loudness or automatically normalize different videos.
 - **Output peak meter** — shows the combined stereo output of all captured tabs after the limiter.
   The spectrum still shows the selected tab.
 - **Browser-tab audio capture** — processes the audio Chrome makes available from a tab.

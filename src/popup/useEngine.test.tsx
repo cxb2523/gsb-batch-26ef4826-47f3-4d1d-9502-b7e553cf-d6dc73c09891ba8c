@@ -447,3 +447,101 @@ describe('useEngine storage and lifecycle integration', () => {
     expect(sync.RULES).toHaveLength(1);
   });
 });
+
+// The shared output limiter is one stage for every tab, so a bypass toggle swaps what it is
+// limiting while leaving it in circuit ("bypass the equalizer, keep the safety net"). These pin the
+// wiring: the switch is announced, exactly once per transition, and never in the middle of the mode.
+describe('bypass and the shared output limiter', () => {
+  const resets = () => messages.filter(m => m.type === 'resetLimiter');
+
+  it('asks for exactly one reset on entry and one on exit, in each direction', async () => {
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(resets()).toHaveLength(1);
+    expect(resets()[0].reason).toBe('bypass-on');
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(resets()).toHaveLength(2);
+    expect(resets()[1].reason).toBe('bypass-off');
+  });
+
+  it('repeated toggles produce one reset each — nothing accumulates', async () => {
+    const hook = await setup();
+    for (let i = 0; i < 6; i++) act(() => hook.result.current.toggleBypass());
+    await settle(200);
+    expect(resets()).toHaveLength(6);
+    act(() => hook.result.current.toggleBypass()); await settle();
+    expect(resets()).toHaveLength(7);
+  });
+
+  it('editing the draft while bypassed is not a mode change, so it does not reset', async () => {
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass()); await settle();
+    const before = resets().length;
+    act(() => { hook.result.current.onBandsLive(io.presetToBands(preset(9))); hook.result.current.onCommit(); });
+    act(() => hook.result.current.onGainLive(1.3));
+    await settle(250);
+    expect(hook.result.current.bypassed).toBe(true);
+    expect(resets()).toHaveLength(before);
+  });
+
+  it('leaving bypass plays the draft with no reset still queued behind the curve change', async () => {
+    // Order matters on the wire: the flat curve is re-sent on entry and the restored one on exit,
+    // and the reset is a separate message either way — the limiter must not be re-armed by an edit
+    // message arriving after the toggle.
+    const hook = await setup();
+    act(() => hook.result.current.toggleBypass());
+    act(() => { hook.result.current.onBandsLive(io.presetToBands(preset(9))); hook.result.current.onCommit(); });
+    await settle(250);
+    act(() => hook.result.current.toggleBypass()); await settle(250);
+    expect(hook.result.current.bypassed).toBe(false);
+    expect(resets().map(m => m.reason)).toEqual(['bypass-on', 'bypass-off']);
+    expect(live[0].eqFilters[2].gain).toBe(9);
+    expect(messages.filter(m => m.type === 'applySettings').at(-1)!.eqFilters[2].gain).toBe(9);
+  });
+
+  it('keeps the saved volume and sends an uncompensated one while bypassed', async () => {
+    // Auto Gain on, curve boosting, bypass dragged through the gain control: the stored value is
+    // the user's own, the flat curve is sent, and no compensation is subtracted from it.
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 6;
+    live[0].eqFilters = io.presetToBands(preset(6));
+    const hook = await setup();
+    expect(live[0].gain).toBeCloseTo(10 ** (-6 / 11 / 20));
+    act(() => hook.result.current.toggleBypass()); await settle();
+    const applied = messages.filter(m => m.type === 'applySettings').at(-1)!;
+    expect(applied.eqFilters.every((b: any) => b.gain === 0)).toBe(true);
+    expect(applied.gain).toBe(1);
+    act(() => hook.result.current.onGainLive(1.4)); await settle(50);
+    expect(messages.filter(m => m.type === 'modifyGain').at(-1)!.gain).toBe(1.4);
+    expect(local.DEFAULT_EQ.gain).toBe(1);
+    expect(local.DEFAULT_EQ.filters[2].g).toBe(6);
+  });
+
+  it('recomputes the compensation from the curve reshaped under bypass when it ends', async () => {
+    local.AUTO_GAIN = true;
+    local.DEFAULT_EQ.filters[2].g = 3;
+    live[0].eqFilters = io.presetToBands(preset(3));
+    const hook = await setup();
+    const compensated = (gain: number) => 10 ** (-gain / 11 / 20);
+    expect(live[0].gain).toBeCloseTo(compensated(3));
+    // Bypass, reshape, leave. The sent gain must match the NEW curve, and the stored one must not
+    // have moved: 3 dB band at index 2, saved gain 1.
+    act(() => hook.result.current.toggleBypass()); await settle();
+    act(() => { hook.result.current.onBandsLive(io.presetToBands(preset(9))); hook.result.current.onCommit(); });
+    await settle(250);
+    act(() => hook.result.current.toggleBypass()); await settle(250);
+    expect(local.DEFAULT_EQ.filters[2].g).toBe(9);
+    expect(local.DEFAULT_EQ.gain).toBe(1);
+    expect(live[0].gain).toBeCloseTo(compensated(9));
+  });
+
+  it('emits no limiter message at all when the live curve changes', async () => {
+    // The safety property of the "edge, not level" rule: an ordinary drag or commit must never
+    // reach into the limiter's detector, or every gesture would cut the lookahead.
+    const hook = await setup();
+    act(() => hook.result.current.onBandsLive(io.presetToBands(preset(6)))); await settle(50);
+    act(() => hook.result.current.onCommit()); await settle(250);
+    act(() => hook.result.current.applyPreset('Vocal')); await settle(250);
+    expect(resets()).toHaveLength(0);
+  });
+});

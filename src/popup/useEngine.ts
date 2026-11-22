@@ -14,7 +14,8 @@ import {
   persistsNow,
   sendsBandsToActiveTab,
   mayMirrorBuffer,
-  commitOnUnbypass
+  commitOnUnbypass,
+  limiterResetsOn
 } from '@/lib/bypass';
 import { planResetProfile, makeResetSnapshot, applyUndoReset, resetControls } from '@/lib/reset';
 import { NO_UNDO, armUndo, undoAfter, canUndo, type UndoEvent, type UndoSlot } from '@/lib/undo';
@@ -147,7 +148,11 @@ export function useEngine() {
   const autoGainRef = useRef(autoGain);
   autoGainRef.current = autoGain;
   /** What to SEND. The stored gain is always the user's own; this is only ever a message payload. */
-  const sentGain = useCallback((userGain: number, bands: Band[]) => outputGain({ userGain, bands, on: autoGainRef.current }), []);
+  const sentGain = useCallback(
+    (userGain: number, bands: Band[], bypassed = false) =>
+      outputGain({ userGain, bands, on: autoGainRef.current, bypassed }),
+    []
+  );
 
   // The "Full window" page runs as a GLOBAL-PROFILE editor: its own tab isn't capturable, so
   // instead of editing a real tab it edits the sound-everywhere profile (host '' → global).
@@ -240,9 +245,17 @@ export function useEngine() {
    * audibly played again. Setting them together makes that class unrepresentable.
    */
   const setPreview = useCallback((next: Preview) => {
+    const was = previewRef.current;
     previewRef.current = next;
     setPreviewOn(next.has);
     setBypassed(isBypassed(next));
+    // A bypass ENTRY or EXIT also has to reach the audio stage, and the transition is where it is
+    // decided — never "we are bypassed now", which would fire on every drag made inside the mode.
+    // The limiter is one shared output stage, so the gain reduction it built from the curve the
+    // user just stopped hearing would otherwise be released onto the new signal: that is the short
+    // duck at the switch. Exactly one message per real transition (limiterResetsOn is a parity
+    // test, so re-setting the same preview cannot enqueue a second one).
+    if (limiterResetsOn(was, next)) io.toOffscreen('resetLimiter', { reason: isBypassed(next) ? 'bypass-on' : 'bypass-off' });
   }, []);
 
   /**
@@ -835,7 +848,13 @@ export function useEngine() {
       }
       const id = activeIdRef.current;
       if (id == null) return;
-      send(() => io.toOffscreen('modifyGain', { tabId: id, gain: sentGain(g, isBypassed(previewRef.current) ? io.flatBands() : bandsRef.current), activePreset: activeRef.current }));
+      send(() => {
+        // Read inside the throttled callback, not beside the send: the queued message must reflect
+        // whether bypass is on when it actually leaves. A bypassed tab is playing a flat curve, so
+        // Auto Gain must not subtract for a boost that is not in the graph.
+        const bypassed = isBypassed(previewRef.current);
+        io.toOffscreen('modifyGain', { tabId: id, gain: sentGain(g, bypassed ? io.flatBands() : bandsRef.current, bypassed), activePreset: activeRef.current });
+      });
     },
     [send, captureBaseline, recordJournal]
   );
@@ -992,7 +1011,11 @@ export function useEngine() {
     const id = activeIdRef.current;
     // No activePreset in the payload: the engine only overwrites the label when it is defined, so
     // the tab keeps showing which preset it is on while muted-flat.
-    if (id != null) io.toOffscreen('applySettings', { tabId: id, eqFilters: io.flatBands(), gain: sentGain(gainRef.current, io.flatBands()) });
+    // The gain goes out UNCOMPENSATED (bypassed=true): nothing is being boosted behind the flat
+    // curve, so applying Auto Gain's subtraction here would duck the tab for a curve it is not
+    // playing. setPreview above already asked the limiter for a clean detector — the flat signal
+    // must not inherit the reduction the boosted one earned.
+    if (id != null) io.toOffscreen('applySettings', { tabId: id, eqFilters: io.flatBands(), gain: sentGain(gainRef.current, io.flatBands(), true) });
   }, [setPreview]);
   // --- bypass:on:end --------------------------------------------------------------------------
 

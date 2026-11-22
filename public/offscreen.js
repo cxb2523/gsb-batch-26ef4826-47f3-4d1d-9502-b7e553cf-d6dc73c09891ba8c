@@ -113,6 +113,16 @@ async function setupOutputNodes() {
   };
 }
 
+// Ask the shared limiter to forget its detector, delay line and gain envelope. Used on a bypass
+// transition: the state it holds describes a signal the user is no longer hearing, and replaying
+// it into the new mode is the short duck the switch used to produce. Safe to call at any time —
+// reset() is synchronous on the audio thread and leaves a limiter equal to a new one.
+function resetOutputLimiter(reason) {
+  if (!outputLimiter) return;
+  outputLimiter.port.postMessage({ type: 'reset' });
+  dlog('output limiter reset —', reason);
+}
+
 function readOutputPeak() {
   let peak = 0;
   for (const analyzer of outputAnalyzers) {
@@ -268,7 +278,7 @@ function disconnectTab(tabId) {
   if (audioContext && Object.keys(streams).length === 0) {
     // Clear the delayed samples before an idle/resume cycle, so a later capture cannot replay
     // the final 5 ms of the old tab or inherit its gain-reduction envelope.
-    outputLimiter?.port.postMessage({ type: 'reset' });
+    resetOutputLimiter('no captured tabs left');
     audioContext.suspend().catch((e) => dlog('suspend failed:', e && e.message));
   }
   broadcastStatus();
@@ -497,6 +507,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         break;
       case 'applySettings':
         applySettings(message);
+        break;
+      case 'resetLimiter':
+        resetOutputLimiter(message.reason || 'requested');
         break;
     }
   };

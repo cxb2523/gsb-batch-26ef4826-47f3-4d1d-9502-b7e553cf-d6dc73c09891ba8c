@@ -83,3 +83,28 @@ export function mayMirrorBuffer(input: { interacting: boolean; dirty: boolean; p
 export function commitOnUnbypass(input: { dirty: boolean }): boolean {
   return input.dirty;
 }
+
+/**
+ * Whether a change of preview must ask the shared output limiter to forget its state.
+ *
+ * The limiter is ONE output stage after every tab's chain, so a bypass toggle changes what it is
+ * being fed, not whether it is working. That is intentional — bypass the equalizer, keep the
+ * safety net — but it leaves the detector holding gain reduction earned by the signal the user
+ * just stopped listening to. A boosted curve that was being limited hands its ducked gain to the
+ * now-flat output, and the release tail (80 ms) is audible as a short dip at the switch. Leaving
+ * bypass has the mirror problem: the unshaped signal never asked for reduction, and the detector
+ * carries nothing worth keeping into the restored curve.
+ *
+ * So the rule is symmetric and keyed on the TRANSITION, never on being bypassed:
+ *
+ *   enter   reset — the flat output starts from a clean detector and empty delay line
+ *   leave   reset — the restored curve is detected from its own samples, not the bypass ones
+ *   drag    nothing — a drag under bypass is not a mode change (previewAfterDrag keeps it)
+ *
+ * One reset per real transition. Passing the parity check (not a stored "already sent" flag) is
+ * what makes it idempotent: an unchanged preview cannot enqueue a second message, so repeated
+ * toggles produce one reset each rather than accumulating a queue.
+ */
+export function limiterResetsOn(previous: Preview, next: Preview): boolean {
+  return isBypassed(previous) !== isBypassed(next);
+}

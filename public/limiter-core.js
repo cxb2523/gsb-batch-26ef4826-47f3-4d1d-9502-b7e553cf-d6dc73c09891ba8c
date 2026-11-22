@@ -20,6 +20,33 @@ export class LookaheadLimiter {
     this.detector = 0;
   }
 
+  /**
+   * Forget everything the detector has seen: the delay line, the sliding-maximum history and the
+   * released gain envelope.
+   *
+   * Why this exists rather than "make a new one": the limiter is a SINGLE shared output stage, so a
+   * bypass toggle changes what every tab sounds like at once. If the detector kept the gain
+   * reduction it built during a boosted curve, the newly quieter (bypassed or freshly unbypassed)
+   * output would sit ducked for the whole release tail — audible as a short dip right at the
+   * switch. Clearing the delay line too is deliberate: the samples held in it belong to the
+   * previous mode, and carrying them over is carrying state the caller asked us to drop.
+   *
+   * The cost is the lookahead itself: the first `delaySamples` frames after a reset read from the
+   * now-empty ring. That is the limiter's declared delay, not a duck — once the ring refills the
+   * output is unity unless a real peak is anticipated. A reset limiter is therefore sample-for-
+   * sample identical to a freshly constructed one (limiter.test.ts pins that), which is the
+   * strongest statement of "no state survived".
+   */
+  reset() {
+    for (const channel of this.delay) channel.fill(0);
+    this.indices.fill(0);
+    this.peaks.fill(0);
+    this.head = 0;
+    this.count = 0;
+    this.at = 0;
+    this.detector = 0;
+  }
+
   process(input, output) {
     const frames = output[0]?.length ?? 0;
     const channels = output.length;

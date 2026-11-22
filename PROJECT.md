@@ -311,8 +311,18 @@ order; all six were verified after saving and reloading. PR #27 merged as
 publication, store submission and store approval are separate states.
 
 **Auto Gain:** compensation is calculated from the mean of band gains, in amplitude dB,
-and applied before the common limiter without changing the stored master gain. It is an
+and applied before the common limiter without changing the stored master gain. It is paused
+while Bypass is on — the flat curve has nothing to compensate for — and recomputed from the
+curve in the buffer (including one reshaped during Bypass) when Bypass ends. It is an
 estimate, not measured loudness matching; an engaged limiter can reduce its audible effect.
+
+**Bypass and the limiter:** Bypass removes the eleven filters from the audible path but not the
+shared output limiter, which stays in circuit as the safety net. Because that limiter is a single
+shared stage, its detector, delay line and gain envelope are cleared on every bypass transition
+(entry and exit) via a `resetLimiter` message; without this the gain reduction earned by the curve
+being left would be released onto the newly switched signal, audible as a short dip. The reset is
+an edge, so an edit made while bypassed never sends one. See `limiterResetsOn` in
+`src/lib/bypass.ts`.
 
 **Pending / optional:**
 1. After approval, **publish manually within 30 days**, as warned by the submission UI,
