@@ -79,7 +79,15 @@ export async function adoptSharedContextForStrudel(): Promise<void> {
   const ctx = getSharedContext()
   try {
     const { setAudioContext, getAudioContext } = await import('@strudel/webaudio')
-    if (getAudioContext() !== ctx) setAudioContext(ctx)
+    if (getAudioContext() !== ctx) {
+      setAudioContext(ctx)
+      /* The context superdough runs on is being replaced. Any resolved
+       * takeover still points at the previous context, so invalidate it —
+       * otherwise the visualizer analyser and recorder tap would keep reading
+       * a dead chain until the next re-evaluation. */
+      const { resetStrudelTap } = await import('./strudel-tap')
+      resetStrudelTap()
+    }
   } catch {
     /* @strudel/webaudio unavailable — the non-Strudel engines still work. */
   }
@@ -95,6 +103,12 @@ export function setMasterVolume(volume: number): void {
 /** Closes the AudioContext and releases all resources */
 export async function disposeContext(): Promise<void> {
   if (audioContext) {
+    /* Invalidate the takeover BEFORE closing: the old analyser and recorder
+     * edges belong to this context and must never be handed out again. A
+     * dynamic import keeps the dependency cycle (strudel-tap → context)
+     * acyclic at module-evaluation time. */
+    const { resetStrudelTap } = await import('./strudel-tap')
+    resetStrudelTap()
     await audioContext.close()
   }
   audioContext = null

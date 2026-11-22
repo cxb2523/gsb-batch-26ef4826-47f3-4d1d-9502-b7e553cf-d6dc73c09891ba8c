@@ -7,7 +7,10 @@
    ────────────────────────────────────────────────────────── */
 
 import { getSharedContext, getMasterGain } from './context'
-import { getStrudelOutputNode } from './strudel-tap'
+import {
+  acquireStrudelRecorderTap,
+  releaseStrudelRecorderTap,
+} from './strudel-tap'
 
 /** Records audio from the master gain node and exports as WebM download. */
 export class AudioRecorder {
@@ -16,36 +19,49 @@ export class AudioRecorder {
   private stream: MediaStream | null = null
   private destination: MediaStreamAudioDestinationNode | null = null
 
-  /** Node tapped in addition to masterGain, kept so stop() can disconnect it. */
-  private strudelTap: AudioNode | null = null
-
   /** The most recent finished take, kept so Export Audio has something to write. */
   private lastTake: Blob | null = null
 
   /**
    * Start recording — taps master gain into a MediaStreamDestination.
    *
-   * Strudel is tapped SEPARATELY and deliberately. superdough terminates at
-   * `audioContext.destination`, not at masterGain, so a recording that only
-   * tapped the master bus captured silence for the default engine — which is
-   * every session in the library. adoptSharedContextForStrudel() puts both on
-   * the same context, which is what makes a single MediaStreamDestination able
-   * to receive both.
+   * Strudel is tapped through the shared takeover state in strudel-tap. The
+   * tap is guaranteed to come from the same running AudioContext and the same
+   * superdough output node as the visualizer analyser, so a take captures
+   * exactly what is heard. superdough's controller only exists once a note has
+   * played; if it is not up yet the recording still captures Tone.js and
+   * WebAudio, and an invalidation/re-resolution joins it in as soon as it
+   * appears. Re-evaluation while recording re-routes the edge via the same
+   * state instead of stacking a second connection.
    */
   start(): void {
+    /* A second start() would orphan the previous destination (its edges would
+     * never be disconnected) and create duplicate connections. */
+    if (this.mediaRecorder) return
+
     const ctx = getSharedContext()
     this.destination = ctx.createMediaStreamDestination()
     getMasterGain().connect(this.destination)
 
-    /* Fire-and-forget: superdough's controller only exists once a note has
-     * played. If it is not up yet the recording still captures Tone.js and
-     * WebAudio; if it comes up during the take, it joins from that point. */
-    void getStrudelOutputNode().then((node) => {
-      if (!node || !this.destination) return
-      if (node.context !== this.destination.context) return
-      node.connect(this.destination)
-      this.strudelTap = node
-    })
+    /* Fire-and-forget: the takeover resolves asynchronously because
+     * @strudel/webaudio is dynamically imported and its controller initialises
+     * lazily. When it is not ready yet the destination stays REGISTERED: the
+     * next invalidation/re-resolution connects it as soon as the chain exists,
+     * so a take that started before the first note still captures Strudel.
+     * A stop() that wins the race (or a second start) unregisters it instead. */
+    const destination = this.destination
+    void acquireStrudelRecorderTap(destination)
+      .then((node) => {
+        /* Stale destination: stop() ran first or another start() replaced it.
+         * null is not stale — the registration must survive until ready. */
+        if (node && this.destination !== destination) {
+          releaseStrudelRecorderTap(destination)
+        }
+      })
+      .catch(() => {
+        /* Strudel unavailable — the masterGain tap still records, and the
+         * registration remains so a later re-resolution can still join. */
+      })
 
     this.stream = this.destination.stream
 
@@ -104,7 +120,14 @@ export class AudioRecorder {
     return this.mediaRecorder?.state === 'recording'
   }
 
-  /** Disconnect destination and release all references */
+  /**
+   * Disconnect destination and release all references.
+   *
+   * Only the edges THIS recording created are removed: the masterGain edge and
+   * the recorder's own superdough edge. The visualization analyser taps the
+   * same superdough output node and is owned by the takeover state, so it is
+   * left connected and keeps drawing after the take ends.
+   */
   private cleanup(): void {
     if (this.destination) {
       try {
@@ -112,17 +135,10 @@ export class AudioRecorder {
       } catch {
         /* Already disconnected — safe to ignore */
       }
-      if (this.strudelTap) {
-        try {
-          /* Disconnect only this edge, not every consumer of superdough's
-             output — the visualizer analyser hangs off the same node. */
-          this.strudelTap.disconnect(this.destination)
-        } catch {
-          /* Already disconnected — safe to ignore */
-        }
-      }
+      /* Removes exactly this destination's edge from the current output node
+       * and unregisters it so a re-evaluation can never reconnect it. */
+      releaseStrudelRecorderTap(this.destination)
     }
-    this.strudelTap = null
     this.mediaRecorder = null
     this.destination = null
     this.stream = null
