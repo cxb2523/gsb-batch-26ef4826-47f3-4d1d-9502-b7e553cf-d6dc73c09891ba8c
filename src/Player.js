@@ -59,6 +59,14 @@ export default class Player {
     this.currentlyPlaying = null;
     this.nextTrack = null;
 
+    // Monotonically increasing token identifying the current playback
+    // request. Every new playTrack/play/jump/skip invalidates the previous
+    // generation: callbacks (clip events, progress interval, late promises)
+    // capture the generation they were created with and become no-ops once a
+    // newer request has started. This guarantees that only the current track
+    // can ever mutate Player state or surface buffer/progress/ended events.
+    this._playbackGeneration = 0;
+
     const silenceChunkSize = 64 * 64;
     this.silenceClipState = new ClipState(silenceChunkSize);
 
@@ -68,18 +76,31 @@ export default class Player {
 
       document.body.appendChild(audioElement);
 
-      audioElement.addEventListener('ended', () => {
-        this.currentlyPlaying?.clip?.playbackEnded();
-      });
+      // These element-level events are asynchronous and can arrive after a
+      // track switch. Each one is gated on the request that owns the *current*
+      // clip so a stale waiting/canplay/ended event from the previous audio
+      // pipeline can never alter the new track's buffer state.
+      const withCurrentRequest = (handler) => () => {
+        const current = this.currentlyPlaying;
+        if (!current || this._isStale(current.generation)) return;
+        handler(current);
+      };
 
-      audioElement.addEventListener('waiting', () => {
-        this.currentlyPlaying?.onBufferChange(true);
-      });
+      audioElement.addEventListener(
+        'ended',
+        withCurrentRequest((current) => current.clip?.playbackEnded())
+      );
+
+      audioElement.addEventListener(
+        'waiting',
+        withCurrentRequest((current) => current.onBufferChange(true))
+      );
 
       ['canplay', 'canplaythrough', 'playing'].forEach((eventName) => {
-        audioElement.addEventListener(eventName, () => {
-          this.currentlyPlaying?.onBufferChange(false);
-        });
+        audioElement.addEventListener(
+          eventName,
+          withCurrentRequest((current) => current.onBufferChange(false))
+        );
       });
     }
 
@@ -103,12 +124,34 @@ export default class Player {
     this.currentlyPlaying = null;
     this.nextTrack = null;
 
+    // Any in-flight callbacks belonging to the previous session must be
+    // invalidated before the clips are torn down.
+    this._playbackGeneration += 1;
+    this._clearIntervals();
+
     this.disposeAll();
+  }
+
+  // Cancels all preloading/chunk requests and releases every Clip except the
+  // one matching `keepUrl` (if any). Used when a brand-new playback request
+  // starts: the previous track's request chain must be fully cancelled while a
+  // freshly preloaded Clip for the new track may be kept.
+  _stopAndDisposeExcept(keepUrl = null) {
+    this._playbackGeneration += 1;
+    this._clearIntervals();
+
+    Object.keys(this.clips).forEach((url) => {
+      if (url === keepUrl) return;
+      this._dispose(url);
+    });
   }
 
   playNext(track) {
     if (!track) return;
 
+    // Recreate rather than resurrect: if a Clip for this URL already exists
+    // (e.g. a stale preload), release it first so the new preload starts from
+    // a clean ClipState with no partially downloaded chunks.
     this._dispose(track.url);
 
     this.nextTrack = track;
@@ -149,11 +192,6 @@ export default class Player {
     } else {
       const playPromise = this.__DEPRECATED__playTrack(track, track);
       this.onTrackChanged(currentTrack, track);
-
-      if (currentTrack.url) {
-        this._dispose(currentTrack.url);
-      }
-
       return playPromise;
     }
   }
@@ -190,7 +228,19 @@ export default class Player {
     onBufferProgress(0, 0);
     this.onPlaybackProgress(initialPosition);
 
-    this.stopAll();
+    // Invalidate every previous request BEFORE wiring up the new one. This
+    // bumps the playback generation, clears stale progress intervals, stops
+    // playback and cancels in-flight chunk/preload requests, then disposes
+    // every Clip except a preloaded one for the URL we are about to play.
+    // Doing this first means the generation captured below is already the
+    // current one, so the new request's own callbacks can never be treated as
+    // stale.
+    this._stopAndDisposeExcept(url);
+
+    // This token uniquely identifies the new playback request. Every
+    // asynchronous callback below closes over it and bails out once a newer
+    // request has bumped the generation.
+    const generation = this._playbackGeneration;
 
     try {
       const clip = this._getClip(
@@ -210,13 +260,19 @@ export default class Player {
         onBufferProgress,
         lastAllowedPosition,
         lastReportedProgress: initialPosition,
+        generation,
       };
 
-      clip.on('loadprogress', ({ initialPosition, progress }) =>
-        onBufferProgress(initialPosition, progress)
-      );
+      clip.offAll();
+
+      clip.on('loadprogress', ({ initialPosition, progress }) => {
+        if (this._isStale(generation)) return;
+        onBufferProgress(initialPosition, progress);
+      });
 
       clip.once('ended', () => {
+        if (this._isStale(generation)) return;
+
         if (this.nextTrack) {
           let nextTrack = this.nextTrack;
           let currentTrack = this.currentlyPlaying?.track;
@@ -231,9 +287,16 @@ export default class Player {
         this.onPlaybackProgress(1);
       });
 
-      clip.on('bufferchange', (isBuffering) => onBufferChange(isBuffering));
+      clip.on('bufferchange', (isBuffering) => {
+        if (this._isStale(generation)) return;
+        onBufferChange(isBuffering);
+      });
 
       this._playbackPositionInterval = setInterval(() => {
+        // The progress interval belongs to the request that created it: after
+        // a switch it must never report the old track's position.
+        if (this._isStale(generation)) return;
+
         const { duration, currentTime } = clip;
         if (duration === 0 || duration < currentTime) return;
         let progress = currentTime / duration;
@@ -259,6 +322,12 @@ export default class Player {
     }
   }
 
+  // A request is stale as soon as a newer playback request has started (or the
+  // Player was reset). Stale requests must not touch state or emit events.
+  _isStale(generation) {
+    return generation !== this._playbackGeneration;
+  }
+
   _getClip(
     url,
     fileSize,
@@ -275,7 +344,14 @@ export default class Player {
     }
 
     if (this.clips[url]) {
-      return this.clips[url];
+      // A released Clip must never be resurrected. Recreate it so that the
+      // same URL always gets a fresh ClipState, Loader and chunk cache after
+      // a dispose/replay cycle.
+      if (this.clips[url].disposed) {
+        delete this.clips[url];
+      } else {
+        return this.clips[url];
+      }
     }
 
     const clip = new Clip({
@@ -306,8 +382,13 @@ export default class Player {
   stopAll() {
     this.currentlyPlaying = null;
     this._clearIntervals();
+
+    // Stop playback and cancel in-flight requests for every Clip, but keep the
+    // instances themselves in the cache. Actual release happens through
+    // `_dispose`/`disposeAll`; the new playback flow additionally calls
+    // `_stopAndDisposeExcept` so stale Clips cannot be reused.
     Object.keys(this.clips).forEach((k) => {
-      this.clips[k].offAll('loadprogress');
+      this.clips[k].offAll();
       this.clips[k].stop();
     });
   }
@@ -357,14 +438,21 @@ export default class Player {
     const newPosition = (clip.currentTime + seconds) / clip.duration;
 
     if (newPosition < 0) {
+      // Seeking before the start switches to the previous track. The current
+      // clip is stopped by that request, so there is nothing left to reposition.
       this.stopAll();
       this.onPreviousTrack();
+      return Promise.resolve();
     } else if (newPosition >= 1 && this.nextTrack) {
       const nextTrack = this.nextTrack;
       this.nextTrack = null;
 
-      this.playTrack(nextTrack);
+      // playTrack disposes the current clip and starts a fresh request for the
+      // queued track; repositioning the released clip afterwards would be
+      // invalid, so the switch owns the result.
+      const switchPromise = this.playTrack(nextTrack);
       this.onNextTrack(currentTrack, nextTrack);
+      return switchPromise || Promise.resolve();
     }
 
     return clip.setCurrentPosition(newPosition);
@@ -418,17 +506,26 @@ export default class Player {
   _dispose(url) {
     if (url && this.currentlyPlaying?.url === url) {
       this.currentlyPlaying = null;
+      // Releasing the active Clip ends its request chain: any callback that
+      // was queued before this point must be considered stale.
+      this._playbackGeneration += 1;
       this._clearIntervals();
     }
 
     if (!this.clips[url]) return;
 
-    this.clips[url].offAll('loadprogress');
+    // Remove every listener before disposing so no late event can escape the
+    // Clip during teardown.
+    this.clips[url].offAll();
     this.clips[url].dispose();
     delete this.clips[url];
   }
 
   disposeAll(urls = []) {
+    // A full teardown invalidates every request that was ever started on this
+    // Player.
+    this._playbackGeneration += 1;
+    this._clearIntervals();
     Object.keys(this.clips).forEach((k) => this._dispose(k));
   }
 

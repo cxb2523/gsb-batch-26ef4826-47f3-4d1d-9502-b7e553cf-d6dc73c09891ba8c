@@ -55,7 +55,16 @@ export default class FetchJob {
         const uint8Array = new Uint8Array(response.data);
         return this._createChunk(uint8Array, this._chunkIndex);
       })
+      .then((chunk) => {
+        // The request may have been cancelled while the chunk was being
+        // decoded (decoding is not abortable). A late chunk must never be
+        // handed back to the Loader, otherwise it could be written into a
+        // cache/ClipState that no longer belongs to this request.
+        if (this._cancelled) return null;
+        return chunk;
+      })
       .catch((error) => {
+        if (this._cancelled || error === SLEEP_CANCELLED) return null;
         if (error instanceof CanceledError) return;
         const timedOut = error.code === 'ECONNABORTED';
         const networkError = error.message === 'Network Error';

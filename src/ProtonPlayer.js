@@ -7,6 +7,7 @@ import Player from './Player';
 import ProtonPlayerError from './ProtonPlayerError';
 import initializeiOSAudioEngine from './utils/initializeiOSAudioEngine';
 import { debug } from './utils/logger';
+import noop from './utils/noop';
 
 initializeiOSAudioEngine();
 
@@ -44,6 +45,11 @@ export default class ProtonPlayer extends EventEmitter {
     }
 
     this.state = PlaybackState.UNINITIALIZED;
+
+    // Identifies the most recent playback request. A new playTrack/play/jump/
+    // skip increments this token; promise resolutions from an older request
+    // are ignored so the public state can only ever reflect the current track.
+    this._playbackRequestId = 0;
 
     this.player = new Player({
       onPlaybackEnded: () => {
@@ -98,10 +104,25 @@ export default class ProtonPlayer extends EventEmitter {
 
     this.reset();
     this.player.reset();
-    return this.player.playTrack(track).then(() => {
-      this.state = PlaybackState.PLAYING;
-      this._fire('state_changed', this.state);
-    });
+
+    // This is now the only valid playback request. Any promise belonging to an
+    // earlier request resolves against a stale id and is ignored.
+    const requestId = (this._playbackRequestId += 1);
+
+    return this.player
+      .playTrack(track)
+      .then(() => {
+        if (requestId !== this._playbackRequestId) return;
+        this.state = PlaybackState.PLAYING;
+        this._fire('state_changed', this.state);
+      })
+      .catch((err) => {
+        // Swallow rejections of superseded requests (e.g. a cancelled
+        // preload). Genuine errors of the current request are still surfaced
+        // through the Player's 'error' event.
+        if (requestId !== this._playbackRequestId) return;
+        throw err;
+      });
   }
 
   play(playlist, index = 0) {
@@ -116,10 +137,19 @@ export default class ProtonPlayer extends EventEmitter {
     const [nextTrack] = this.playlist.forward();
     this.player.playNext(nextTrack);
 
-    return this.player.playTrack(this.playlist.current()).then(() => {
-      this.state = PlaybackState.PLAYING;
-      this._fire('state_changed', this.state);
-    });
+    const requestId = (this._playbackRequestId += 1);
+
+    return this.player
+      .playTrack(this.playlist.current())
+      .then(() => {
+        if (requestId !== this._playbackRequestId) return;
+        this.state = PlaybackState.PLAYING;
+        this._fire('state_changed', this.state);
+      })
+      .catch((err) => {
+        if (requestId !== this._playbackRequestId) return;
+        throw err;
+      });
   }
 
   toggle() {
@@ -158,8 +188,12 @@ export default class ProtonPlayer extends EventEmitter {
     const [nextTrack, playlist] = this.playlist.forward();
     this.playlist = playlist;
 
+    // Every track switch starts a new valid request and invalidates promises
+    // still pending from the previous one.
+    this._playbackRequestId += 1;
+
     if (nextTrack) {
-      this.player.playTrack(nextTrack);
+      this.player.playTrack(nextTrack).catch(noop);
 
       const [followingTrack] = this.playlist.forward();
       if (followingTrack) {
@@ -177,8 +211,10 @@ export default class ProtonPlayer extends EventEmitter {
     this.playlist = this.playlist.move(index);
     const currentTrack = this.playlist.current();
 
+    this._playbackRequestId += 1;
+
     if (currentTrack) {
-      this.player.playTrack(currentTrack);
+      this.player.playTrack(currentTrack).catch(noop);
 
       const [followingTrack] = this.playlist.forward();
       if (followingTrack) {
@@ -197,7 +233,8 @@ export default class ProtonPlayer extends EventEmitter {
     const [previousTrack, playlist] = this.playlist.back();
 
     this.playlist = playlist;
-    this.player.playTrack(previousTrack);
+    this._playbackRequestId += 1;
+    this.player.playTrack(previousTrack).catch(noop);
     this.player.playNext(currentTrack);
   }
 
@@ -264,6 +301,8 @@ export default class ProtonPlayer extends EventEmitter {
   reset() {
     debug('ProtonPlayer#reset');
 
+    // Resetting invalidates every outstanding request promise.
+    this._playbackRequestId += 1;
     this.playlist = new Cursor([]);
     this.player.disposeAll();
   }

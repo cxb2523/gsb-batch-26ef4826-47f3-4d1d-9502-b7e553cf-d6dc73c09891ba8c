@@ -18,6 +18,11 @@ import isFrameHeader from './utils/isFrameHeader';
 
 const DELAY_BETWEEN_FETCHES = 400; // milliseconds
 
+// Sentinel used to settle pending `buffer()` promises when their loading
+// session has been cancelled. It is intentionally swallowed by callers
+// (Clip/Player) instead of being surfaced as a playback error.
+export const LOAD_CANCELLED = Symbol('LOAD_CANCELLED');
+
 export default class Loader extends EventEmitter {
   constructor(chunkSize, url, clipState, audioMetadata = {}) {
     super();
@@ -41,6 +46,14 @@ export default class Loader extends EventEmitter {
         ? FetchStrategy.LAZY
         : FetchStrategy.GREEDY;
     this._cancelled = false;
+
+    // Loading sessions are numbered. Every `buffer()` call starts a new
+    // generation (after a `cancel()`) and every asynchronous callback captures
+    // the generation it belongs to. Responses arriving after a cancellation
+    // carry a stale generation and are dropped before they can touch the
+    // ClipState or emit any event.
+    this._generation = 0;
+    this._waiters = [];
 
     this._clipState.on('chunkIndexManuallyChanged', (newIndex) => {
       this.cancel();
@@ -68,12 +81,26 @@ export default class Loader extends EventEmitter {
 
   cancel() {
     this._cancelled = true;
+
+    // Invalidate every in-flight request belonging to the current generation.
+    this._generation += 1;
+
     this._sleep && this._sleep.cancel();
     Object.keys(this._jobs).forEach((chunkIndex) => {
       this._jobs[chunkIndex].cancel();
       delete this._jobs[chunkIndex];
     });
     this._loadStarted = false;
+
+    // Anything waiting on `buffer()` is released. Cancellation is a normal
+    // outcome (a track switch, a pause, a dispose), not an error, so waiters
+    // are resolved rather than rejected: this guarantees a cancelled load can
+    // never surface as an unhandled rejection even if a caller forgot to
+    // attach a handler. The LOAD_CANCELLED sentinel lets callers that care
+    // distinguish cancellation from a genuine completion.
+    const waiters = this._waiters;
+    this._waiters = [];
+    waiters.forEach(({ resolve }) => resolve(LOAD_CANCELLED));
   }
 
   _getRange(chunkIndex) {
@@ -88,7 +115,9 @@ export default class Loader extends EventEmitter {
       this._initialChunk = initialChunk;
       this._canPlayThrough = false;
       this._preloadOnly = preloadOnly;
+      // A fresh buffer run starts a brand-new loading session.
       this._cancelled = false;
+      this._generation += 1;
 
       this._cursor = createFetchCursor({
         index: initialChunk,
@@ -103,13 +132,31 @@ export default class Loader extends EventEmitter {
       if (ready) {
         resolve();
       } else {
-        this.once(preloadOnly ? 'canPlayThrough' : 'load', resolve);
-        this.once('loaderror', reject);
+        this._waiters.push({ resolve, reject, preloadOnly });
       }
     });
   }
 
-  _checkCanplaythrough() {
+  _settleWaiters(eventName) {
+    const waiters = this._waiters;
+    this._waiters = [];
+    waiters.forEach(({ resolve, reject, preloadOnly }) => {
+      if (eventName === 'loaderror') {
+        reject(this._lastError);
+      } else if (eventName === 'load') {
+        // A full load implies the preload condition has been met as well.
+        resolve();
+      } else if (eventName === 'canPlayThrough' && preloadOnly) {
+        resolve();
+      } else {
+        // This waiter is waiting for a different event; keep it pending.
+        this._waiters.push({ resolve, reject, preloadOnly });
+      }
+    });
+  }
+
+  _checkCanplaythrough(generation) {
+    if (this._cancelled || generation !== this._generation) return;
     if (this._canPlayThrough || !this.length) return;
     let loadedChunksCount = 0;
     const preloadBatchSize = Math.min(
@@ -122,6 +169,7 @@ export default class Loader extends EventEmitter {
       if (++loadedChunksCount >= preloadBatchSize) {
         this._canPlayThrough = true;
         this._fire('canPlayThrough');
+        this._settleWaiters('canPlayThrough');
         debug('Can play through 1');
         break;
       }
@@ -160,7 +208,7 @@ export default class Loader extends EventEmitter {
     }
   }
 
-  _createChunk(uint8Array, index) {
+  _createChunk(uint8Array, index, generation) {
     if (!uint8Array || !Number.isInteger(index)) {
       debug('Loader#_createChunk: Invalid arguments. Resolving with null.');
       return Promise.resolve(null);
@@ -180,15 +228,24 @@ export default class Loader extends EventEmitter {
     if (useMediaSource()) {
       return Promise.resolve(chunk);
     } else {
-      return decodeChunk(chunk, clip);
+      return decodeChunk(chunk, clip).then((decodedChunk) => {
+        // Decoding is not abortable: make sure a chunk that finished
+        // decoding after a cancellation cannot enter the ClipState.
+        if (this._cancelled || generation !== this._generation) {
+          return null;
+        }
+        return decodedChunk;
+      });
     }
   }
 
-  _onData(chunk) {
+  _onData(chunk, generation) {
+    if (this._cancelled || generation !== this._generation) return;
+
     this._chunks[chunk.index] = chunk;
 
     if (!this._canPlayThrough) {
-      this._checkCanplaythrough();
+      this._checkCanplaythrough(generation);
     }
     if (chunk.raw.length === this._chunkSize + 1 && chunk.duration > 0) {
       this._chunksDuration += chunk.duration;
@@ -196,22 +253,28 @@ export default class Loader extends EventEmitter {
     }
   }
 
-  _onProgress(chunkLength, total) {
+  _onProgress(chunkLength, total, generation) {
+    if (this._cancelled || generation !== this._generation) return;
+
     this.buffered += chunkLength;
     this.length = total;
     this._fire('loadprogress', { buffered: this.buffered, total });
   }
 
-  _onLoad() {
+  _onLoad(generation) {
+    if (this._cancelled || generation !== this._generation) return;
+
     const firstChunk = this._chunks[this._initialChunk];
     if (firstChunk && !this.loaded) {
       if (!this._canPlayThrough) {
         this._canPlayThrough = true;
         this._fire('canPlayThrough');
+        this._settleWaiters('canPlayThrough');
         debug('Can play through 2');
       }
       this.loaded = true;
       this._fire('load');
+      this._settleWaiters('load');
     }
   }
 
@@ -219,11 +282,15 @@ export default class Loader extends EventEmitter {
     this._cursor = this._cursor.seek(this._clipState.chunkIndex);
   }
 
-  _fetchNextChunks() {
-    if (this._cancelled) return Promise.resolve();
+  _fetchNextChunks(generation = this._generation) {
+    if (this._cancelled || generation !== this._generation) {
+      return Promise.resolve();
+    }
 
     const startTime = Date.now();
-    const nextChunks = this._cursor.chunks().map(this._fetchChunk.bind(this));
+    const nextChunks = this._cursor
+      .chunks()
+      .map((chunkIndex) => this._fetchChunk(chunkIndex, generation));
 
     if (nextChunks.length === 0) {
       return Promise.resolve();
@@ -236,13 +303,17 @@ export default class Loader extends EventEmitter {
     return Promise.all(nextChunks)
       .then(() => this._sleep.wait())
       .then(() => this._seekFetchCursor())
-      .then(() => this._fetchNextChunks())
+      .then(() => this._fetchNextChunks(generation))
       .catch((err) => {
         if (err !== SLEEP_CANCELLED) throw err;
       });
   }
 
-  _fetchChunk(chunkIndex) {
+  _fetchChunk(chunkIndex, generation = this._generation) {
+    if (this._cancelled || generation !== this._generation) {
+      return Promise.resolve();
+    }
+
     if (!!this._clipState.chunks[chunkIndex]) {
       return Promise.resolve();
     }
@@ -250,7 +321,7 @@ export default class Loader extends EventEmitter {
     const { start, end } = this._getRange(chunkIndex);
     const job = new FetchJob(
       this._url,
-      this._createChunk.bind(this),
+      (uint8Array, index) => this._createChunk(uint8Array, index, generation),
       chunkIndex,
       start,
       end
@@ -259,7 +330,14 @@ export default class Loader extends EventEmitter {
     return job
       .fetch()
       .then((chunk) => {
-        if (!chunk) return;
+        // A late response (cancellation raced with the network/decode) must
+        // never write back to the cache or emit an event.
+        if (this._cancelled || generation !== this._generation || !chunk) {
+          if (this._jobs[chunkIndex] === job) {
+            delete this._jobs[chunkIndex];
+          }
+          return Promise.resolve();
+        }
 
         if (this._jobs[chunk.index]) {
           delete this._jobs[chunk.index];
@@ -269,20 +347,28 @@ export default class Loader extends EventEmitter {
           return Promise.resolve();
         }
 
-        this._onData(chunk);
-        this._onProgress(chunk.raw.length, this._fileSize);
+        this._onData(chunk, generation);
+        this._onProgress(chunk.raw.length, this._fileSize, generation);
 
         const isLastChunk = chunk.index === this._clipState.totalChunksCount - 1;
         if (isLastChunk) {
-          this._onLoad();
+          this._onLoad(generation);
         }
 
         return Promise.resolve();
       })
       .catch((err = {}) => {
-        err.url = this.url;
+        // A cancelled session never reports errors: its requests were
+        // deliberately aborted and must not surface as loader errors.
+        if (this._cancelled || generation !== this._generation) {
+          return Promise.resolve();
+        }
+
+        err.url = this._url;
         err.customCode = 'COULD_NOT_LOAD';
+        this._lastError = err;
         this._fire('loaderror', err);
+        this._settleWaiters('loaderror');
         this._loadStarted = false;
       });
   }
@@ -316,8 +402,8 @@ const checkDecodedAudio = (chunk) => () =>
 //
 // With this in mind, this error handler detects this specific `null` failure
 // case and realigns the chunk to the first frame header it is able to decode
-// from. Then, during playback, chunks are stitched together in a manner
-// that respects this realignment so that we never attempt to decode partial
+// from. Then, during playback, chunks are stitched together in a manner that
+// respects this realignment so that we never attempt to decode partial
 // or incomplete frames.
 const attemptDecodeRecovery = (chunk, clip) => (err) => {
   if (err) {

@@ -1,7 +1,7 @@
 import ClipState, { CHUNK_SIZE } from './ClipState';
 import EventEmitter from './EventEmitter';
 import getContext from './getContext';
-import Loader from './Loader';
+import Loader, { LOAD_CANCELLED } from './Loader';
 import ProtonPlayerError from './ProtonPlayerError';
 import { slice } from './utils/buffer';
 import { debug, warn } from './utils/logger';
@@ -48,12 +48,20 @@ export default class Clip extends EventEmitter {
     this.loaded = false;
     this._playbackState = PLAYBACK_STATE.STOPPED;
     this.ended = false;
+    // Once a Clip is disposed it must never be used again. The Player checks
+    // this flag before returning cached Clips so that the same URL is always
+    // recreated rather than resurrecting a released instance.
+    this._disposed = false;
     this.url = url;
     this.volume = volume;
     this._silenceChunks = silenceChunks;
     this._lastPlayedChunk = null;
     this._tickTimeout = null;
     this._mediaSourceTimeout = null;
+
+    // Loader used when buffering starts from a non-zero position. It is kept
+    // as a member so it can be cancelled when the Clip is stopped/disposed.
+    this._initialChunkLoader = null;
 
     this._lastContextTimeAtStart = null;
     this._scheduledEndTime = null;
@@ -75,11 +83,14 @@ export default class Clip extends EventEmitter {
       this._preBuffering = true;
       const initialChunkClipState = new ClipState(CHUNK_SIZE);
       const initialChunkLoader = new Loader(CHUNK_SIZE, this.url, initialChunkClipState);
+      this._initialChunkLoader = initialChunkLoader;
       initialChunkLoader.on('loaderror', (err) => {
+        if (this._disposed) return;
         this._preBuffering = false;
         this._fire('loaderror', err);
       });
       initialChunkLoader.on('load', () => {
+        if (this._disposed) return;
         this._preBuffering = false;
         this._initLoader(initialChunkLoader.audioMetadata);
       });
@@ -90,14 +101,18 @@ export default class Clip extends EventEmitter {
   }
 
   _initLoader(audioMetadata) {
+    if (this._disposed) return;
+
     this._loader = new Loader(CHUNK_SIZE, this.url, this._clipState, audioMetadata);
     this._loader.on('canPlayThrough', () => {
+      if (this._disposed) return;
       if (this._buffering && !this._preBuffering) {
         this._preBuffered = true;
       }
       this._fire('canPlayThrough');
     });
     this._loader.on('loadprogress', ({ buffered, total }) => {
+      if (this._disposed) return;
       const bufferedWithOffset = buffered + this._initialByte;
       this._fire('loadprogress', {
         total,
@@ -106,12 +121,29 @@ export default class Clip extends EventEmitter {
         progress: bufferedWithOffset / total,
       });
     });
-    this._loader.on('playbackerror', (error) => this._fire('playbackerror', error));
-    this._loader.on('loaderror', (error) => this._fire('loaderror', error));
-    this._loader.on('load', () => this._fire('load'));
+    this._loader.on('playbackerror', (error) => {
+      if (this._disposed) return;
+      this._fire('playbackerror', error);
+    });
+    this._loader.on('loaderror', (error) => {
+      if (this._disposed) return;
+      this._fire('loaderror', error);
+    });
+    this._loader.on('load', () => {
+      if (this._disposed) return;
+      this._fire('load');
+    });
+  }
+
+  get disposed() {
+    return this._disposed;
   }
 
   preBuffer(isRetrying = false) {
+    if (this._disposed) {
+      return Promise.reject(new ProtonPlayerError('Clip has been disposed'));
+    }
+
     if (
       this._preBuffered ||
       this._buffered ||
@@ -124,7 +156,13 @@ export default class Clip extends EventEmitter {
 
     if (this._preBuffering || this._buffering || !this._loader) {
       return new Promise((resolve, reject) => {
-        setTimeout(() => this.preBuffer(true).then(resolve).catch(reject), 1);
+        setTimeout(() => {
+          if (this._disposed) {
+            reject(new ProtonPlayerError('Clip has been disposed'));
+            return;
+          }
+          this.preBuffer(true).then(resolve).catch(reject);
+        }, 1);
       });
     }
 
@@ -132,9 +170,11 @@ export default class Clip extends EventEmitter {
     const preloadOnly = true;
     return this._loader
       .buffer(preloadOnly, this._initialChunk)
-      .then(() => {
+      .then((result) => {
         this._preBuffering = false;
-        this._preBuffered = true;
+        // A cancellation resolves (does not reject) with this sentinel; the
+        // Clip must not treat it as a completed preload.
+        this._preBuffered = result !== LOAD_CANCELLED;
       })
       .catch((err) => {
         this._preBuffering = false;
@@ -144,6 +184,10 @@ export default class Clip extends EventEmitter {
   }
 
   buffer(isRetrying = false) {
+    if (this._disposed) {
+      return Promise.reject(new ProtonPlayerError('Clip has been disposed'));
+    }
+
     if (isRetrying && this._shouldStopBuffering) {
       return Promise.reject(new ProtonPlayerError('Clip was paused or disposed'));
     }
@@ -156,7 +200,13 @@ export default class Clip extends EventEmitter {
 
     if (this._preBuffering || this._buffering || !this._loader) {
       return new Promise((resolve, reject) => {
-        setTimeout(() => this.buffer(true).then(resolve).catch(reject), 1);
+        setTimeout(() => {
+          if (this._disposed) {
+            reject(new ProtonPlayerError('Clip has been disposed'));
+            return;
+          }
+          this.buffer(true).then(resolve).catch(reject);
+        }, 1);
       });
     }
 
@@ -165,9 +215,11 @@ export default class Clip extends EventEmitter {
     const preloadOnly = false;
     return this._loader
       .buffer(preloadOnly, this._initialChunk)
-      .then(() => {
+      .then((result) => {
         this._buffering = false;
-        this._buffered = true;
+        // Cancelled buffers resolve with the sentinel and must not be marked
+        // as fully buffered.
+        this._buffered = result !== LOAD_CANCELLED;
       })
       .catch((err) => {
         this._buffering = false;
@@ -190,6 +242,11 @@ export default class Clip extends EventEmitter {
   }
 
   dispose() {
+    // Idempotent: disposing an already disposed Clip is a no-op so that
+    // racing teardown paths (stopAll, _dispose, reset) cannot double-release
+    // audio resources.
+    if (this._disposed) return;
+
     this.stop();
     this._preBuffering = false;
     this._preBuffered = false;
@@ -197,10 +254,37 @@ export default class Clip extends EventEmitter {
     this._buffered = false;
     this.loaded = false;
     this._clipState.reset();
-    this._fire('dispose');
+
+    if (this._initialChunkLoader) {
+      this._initialChunkLoader.cancel();
+      this._initialChunkLoader = null;
+    }
+
+    this._disposed = true;
+
+    // Drop every listener first so the 'dispose' notification itself is the
+    // last event this Clip ever emits. Afterwards nothing (not even a late
+    // loader callback that escaped cancellation) can reach a consumer.
+    const listeners = this.callbacks;
+    this.callbacks = {};
+    if (listeners.dispose) {
+      listeners.dispose.slice().forEach((cb) => cb());
+    }
+  }
+
+  // Central guard: a disposed Clip is permanently silent. All internal event
+  // emissions pass through here, so late callbacks are contained even if a
+  // listener was somehow re-registered.
+  _fire(eventName, data) {
+    if (this._disposed && eventName !== 'dispose') return;
+    super._fire(eventName, data);
   }
 
   play() {
+    if (this._disposed) {
+      return Promise.reject(new ProtonPlayerError('Clip has been disposed'));
+    }
+
     if (this._playbackState === PLAYBACK_STATE.PLAYING) {
       const message = `clip.play() was called on a clip that was already playing (${this.url})`;
       warn(message);
@@ -235,6 +319,10 @@ export default class Clip extends EventEmitter {
   }
 
   resume() {
+    if (this._disposed) {
+      return Promise.reject(new ProtonPlayerError('Clip has been disposed'));
+    }
+
     let promise;
     if (this._useMediaSource) {
       this._audioElement.volume = this.volume;
@@ -262,26 +350,36 @@ export default class Clip extends EventEmitter {
   stop() {
     this._shouldStopBuffering = true;
 
-    if (this._useMediaSource) {
-      this._stopUsingMediaSource();
-    } else {
-      this._stopUsingAudioContext();
+    if (!this._disposed) {
+      if (this._useMediaSource) {
+        this._stopUsingMediaSource();
+      } else {
+        this._stopUsingAudioContext();
+      }
     }
 
     if (this._loader) {
       this._loader.cancel();
     }
 
+    if (this._initialChunkLoader) {
+      this._initialChunkLoader.cancel();
+    }
+
     this._preBuffering = false;
     this._buffering = false;
     this._playbackState = PLAYBACK_STATE.STOPPED;
-    this._fire('stop');
+
+    if (!this._disposed) {
+      this._fire('stop');
+    }
 
     return this;
   }
 
   playbackEnded() {
     debug('Clip#playbackEnded');
+    if (this._disposed) return;
     if (this._playbackState === PLAYBACK_STATE.PLAYING) {
       this._playbackState = PLAYBACK_STATE.STOPPED;
       this.ended = true;
@@ -290,6 +388,9 @@ export default class Clip extends EventEmitter {
   }
 
   setCurrentPosition(position = 0, lastAllowedPosition = 1) {
+    if (this._disposed) {
+      return Promise.reject(new ProtonPlayerError('Clip has been disposed'));
+    }
     if (this._useMediaSource) {
       this._stopUsingMediaSource();
     } else {
@@ -329,7 +430,7 @@ export default class Clip extends EventEmitter {
   }
 
   get currentTime() {
-    if (this._playbackState !== PLAYBACK_STATE.PLAYING) {
+    if (this._disposed || this._playbackState !== PLAYBACK_STATE.PLAYING) {
       return 0;
     }
 

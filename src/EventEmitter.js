@@ -4,6 +4,14 @@ export default class EventEmitter {
   }
 
   offAll(eventName) {
+    // When no event name is provided, every listener on the emitter is removed.
+    // This is used when a Clip is disposed so that no stale listener can ever
+    // observe events from it afterwards.
+    if (eventName === undefined) {
+      this.callbacks = {};
+      return;
+    }
+
     if (this.callbacks[eventName]) {
       this.callbacks[eventName] = [];
     }
