@@ -1,0 +1,127 @@
+import './player-skip.css';
+
+const STEP_SECONDS = 10;
+const MERGE_MS = 200;
+const FLASH_MS = 620;
+
+export function initPlayerSkip(deps = {}) {
+  const doc = deps.document || (typeof document !== 'undefined' ? document : null);
+  if (!doc) return () => {};
+
+  const video = () => doc.querySelector('#resourcePlayer');
+  const modal = () => doc.querySelector('#playerModal');
+  const isOpen = () => {
+    const m = modal();
+    return !!m && m.classList.contains('is-open');
+  };
+
+  let pending = 0;
+  let timer = 0;
+  let flashEl = null;
+  let flashTimer = 0;
+
+  function flash(direction) {
+    try {
+      const stage = doc.querySelector('#playerStage');
+      if (!stage) return;
+      if (!flashEl) {
+        flashEl = doc.createElement('div');
+        flashEl.className = 'cf-skip-flash';
+        doc.body.appendChild(flashEl);
+      }
+      flashEl.textContent = direction > 0 ? '10s »' : '« 10s';
+      flashEl.dataset.dir = direction > 0 ? 'fwd' : 'back';
+      const rect = stage.getBoundingClientRect();
+      flashEl.style.top = Math.round(rect.top + rect.height / 2 - 20) + 'px';
+      flashEl.style.left = Math.round(direction > 0 ? rect.left + rect.width * 0.66 : rect.left + rect.width * 0.2) + 'px';
+      flashEl.classList.add('is-on');
+      window.clearTimeout(flashTimer);
+      flashTimer = window.setTimeout(() => flashEl && flashEl.classList.remove('is-on'), FLASH_MS);
+    } catch {  }
+  }
+
+  function apply(delta) {
+    const el = video();
+    if (!el) return;
+    const duration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+    const current = Number.isFinite(el.currentTime) ? el.currentTime : 0;
+    let target = current + delta;
+    if (duration) target = Math.min(duration - 0.25, target);
+    target = Math.max(0, target);
+    if (Math.abs(target - current) < 0.05) return;
+    const wasPlaying = !el.paused;
+    try {
+      el.classList.add('is-seeking');
+      if (typeof el.fastSeek === 'function') el.fastSeek(target);
+      else el.currentTime = target;
+      if (wasPlaying && el.paused) {
+        const playing = el.play();
+        if (playing && typeof playing.catch === 'function') playing.catch(() => {});
+      }
+    } catch {  }
+    window.setTimeout(() => {
+      try { el.classList.remove('is-seeking'); } catch {  }
+    }, 260);
+  }
+
+  function step(delta) {
+    if (!isOpen()) return false;
+    const el = video();
+    if (!el) return false;
+    pending += delta;
+    if (timer) return true;
+    timer = window.setTimeout(() => {
+      const total = pending;
+      pending = 0;
+      timer = 0;
+      if (!total) return;
+      apply(total);
+      flash(total > 0 ? 1 : -1);
+    }, MERGE_MS);
+    return true;
+  }
+
+  function onKey(event) {
+    if (!isOpen()) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(input|textarea|select)$/i.test(target.tagName || ''))) return;
+    const key = event.key;
+    let delta = 0;
+    if (key === 'ArrowLeft' || key === 'j' || key === 'J') delta = -STEP_SECONDS;
+    else if (key === 'ArrowRight' || key === 'l' || key === 'L') delta = STEP_SECONDS;
+    if (!delta) return;
+    if (!step(delta)) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function onDoubleClick(event) {
+    if (!isOpen()) return;
+    const stage = doc.querySelector('#playerStage');
+    if (!stage || !stage.contains(event.target)) return;
+    const rect = stage.getBoundingClientRect();
+    if (!rect.width) return;
+    const ratio = (event.clientX - rect.left) / rect.width;
+    let delta = 0;
+    if (ratio <= 0.3) delta = -STEP_SECONDS;
+    else if (ratio >= 0.7) delta = STEP_SECONDS;
+    if (!delta) return;
+    event.preventDefault();
+    event.stopPropagation();
+    step(delta);
+  }
+
+  doc.addEventListener('keydown', onKey, true);
+  doc.addEventListener('dblclick', onDoubleClick, true);
+
+  return function dispose() {
+    doc.removeEventListener('keydown', onKey, true);
+    doc.removeEventListener('dblclick', onDoubleClick, true);
+    window.clearTimeout(timer);
+    window.clearTimeout(flashTimer);
+    try { flashEl?.remove(); } catch {  }
+  };
+}
+
+export default initPlayerSkip;
