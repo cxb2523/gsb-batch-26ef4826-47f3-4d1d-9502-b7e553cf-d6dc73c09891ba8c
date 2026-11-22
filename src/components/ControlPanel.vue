@@ -14,8 +14,8 @@
             type="checkbox"
             name="pyramids"
             id="pyramids"
-            v-model="pyramidsVisible"
-            @click="togglePyramids"
+            :checked="store.pyramidsVisible"
+            @change="store.togglePyramids()"
           />
         </p>
         <p class="flex items-center justify-between">
@@ -24,8 +24,8 @@
             type="checkbox"
             name="axis-lines"
             id="axis-lines"
-            v-model="axisLinesVisible"
-            @click="toggleAxisLines"
+            :checked="store.axisLinesVisible"
+            @change="store.toggleAxisLines()"
           />
         </p>
       </div>
@@ -78,34 +78,9 @@ export default {
     const store = useThreeStore();
     return { store };
   },
-  data() {
-    return {
-      axisLinesVisible: true,
-      pyramidsVisible: true,
-    };
-  },
   methods: {
     resetCameraPosition() {
-      this.store.setCameraPosition({ x: 0, y: 0, z: 500 });
-      this.store.resetCameraRotation();
-    },
-    toggleAxisLines() {
-      if (this.axisLinesVisible) {
-        this.store.hideAxisLines();
-        this.axisLinesVisible = false;
-      } else {
-        this.store.showAxisLines();
-        this.axisLinesVisible = true;
-      }
-    },
-    togglePyramids() {
-      if (this.pyramidsVisible) {
-        this.store.hidePyramids();
-        this.pyramidsVisible = false;
-      } else {
-        this.store.showPyramids();
-        this.pyramidsVisible = true;
-      }
+      this.store.resetCamera();
     },
   },
 };

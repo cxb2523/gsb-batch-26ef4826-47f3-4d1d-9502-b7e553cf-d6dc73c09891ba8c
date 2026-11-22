@@ -14,8 +14,7 @@ import {
   LineBasicMaterial,
   BufferGeometry,
   Vector3,
-  Line,
-  Float32BufferAttribute
+  Line
 } from 'three'
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js'
 
@@ -23,12 +22,23 @@ export const useThreeStore = defineStore('three', {
   state: () => ({
     width: 0,
     height: 0,
+
+    // --- Three.js objects (non-reactive) ---
     camera: null,
     controls: null,
     scene: null,
     renderer: null,
+    container: null,
     axisLines: [],
     pyramids: [],
+
+    // --- Render loop / listener bookkeeping ---
+    animationFrameId: null,
+
+    // --- UI-facing state: the single source of truth for visibility ---
+    pyramidsVisible: true,
+    axisLinesVisible: true,
+
     cameraPosition: { x: 0, y: 0, z: 0 }
   }),
 
@@ -78,14 +88,42 @@ export const useThreeStore = defineStore('three', {
       this.controls.keys = [65, 83, 68]
     },
 
+    /**
+     * Re-render whenever the controls report a change. Bound once per init
+     * and removed on dispose so repeated init never stacks listeners.
+     */
+    onControlsChange() {
+      this.renderer.render(this.scene, this.camera)
+    },
+
+    /**
+     * Keep camera aspect ratio, renderer size and the controls' screen
+     * metrics in sync with the container. Bound once per init.
+     */
+    onWindowResize() {
+      if (!this.container || !this.renderer || !this.camera || !this.controls) {
+        return
+      }
+      this.resize({
+        width: this.container.offsetWidth,
+        height: this.container.offsetHeight
+      })
+    },
+
     updateControls() {
-      this.controls.update()
+      if (this.controls) {
+        this.controls.update()
+      }
     },
 
     initializeScene() {
       this.scene = markRaw(new Scene())
       this.scene.background = new Color(0xcccccc)
       this.scene.fog = new FogExp2(0xcccccc, 0.002)
+
+      // Fresh arrays on every (re)init so stale objects never accumulate.
+      this.pyramids = []
+      this.axisLines = []
 
       var geometry = markRaw(new CylinderGeometry(0, 10, 30, 4, 1))
       var material = markRaw(new MeshPhongMaterial({
@@ -102,7 +140,11 @@ export const useThreeStore = defineStore('three', {
         mesh.matrixAutoUpdate = false
         this.pyramids.push(mesh)
       }
-      this.scene.add(...this.pyramids)
+      // Reconcile with the visibility flags: the scene must always match
+      // the store's visible flags, even after a re-initialization.
+      if (this.pyramidsVisible) {
+        this.scene.add(...this.pyramids)
+      }
 
       // lights
       var lightA = markRaw(new DirectionalLight(0xffffff))
@@ -149,16 +191,22 @@ export const useThreeStore = defineStore('three', {
       var lineC = markRaw(new Line(geometryD, materialD))
       this.axisLines.push(lineC)
 
-      this.scene.add(...this.axisLines)
+      if (this.axisLinesVisible) {
+        this.scene.add(...this.axisLines)
+      }
     },
 
     resize({ width, height }) {
+      if (!this.camera || !this.renderer || !this.controls) {
+        return
+      }
       this.width = width
       this.height = height
       this.camera.aspect = width / height
       this.camera.updateProjectionMatrix()
       this.renderer.setSize(width, height)
       this.controls.handleResize()
+      this.controls.update()
       this.renderer.render(this.scene, this.camera)
     },
 
@@ -169,36 +217,168 @@ export const useThreeStore = defineStore('three', {
       }
     },
 
-    resetCameraRotation() {
-      if (this.camera) {
-        this.camera.rotation.set(0, 0, 0)
-        this.camera.quaternion.set(0, 0, 0, 1)
-        this.camera.up.set(0, 1, 0)
-        this.controls.target.set(0, 0, 0)
+    /**
+     * Reset the camera to its initial pose. Position, rotation, up vector
+     * and the controls' target are all written first; the controls are then
+     * synchronized and the scene redrawn. Without this synchronization the
+     * controls keep stale internal state and the first drag snaps the view
+     * back to the old orientation.
+     */
+    resetCamera() {
+      if (!this.camera || !this.controls) {
+        return
+      }
+
+      this.camera.position.set(0, 0, 500)
+      this.camera.rotation.set(0, 0, 0)
+      this.camera.quaternion.set(0, 0, 0, 1)
+      this.camera.up.set(0, 1, 0)
+      this.controls.target.set(0, 0, 0)
+
+      // Synchronize internal controls state with the new camera pose,
+      // then force an immediate repaint so the next drag starts from here.
+      this.controls.update()
+      this.renderer.render(this.scene, this.camera)
+
+      this.cameraPosition = {
+        x: Math.round(this.camera.position.x * 100) / 100,
+        y: Math.round(this.camera.position.y * 100) / 100,
+        z: Math.round(this.camera.position.z * 100) / 100
       }
     },
 
-    hideAxisLines() {
-      this.scene.remove(...this.axisLines)
-      this.renderer.render(this.scene, this.camera)
+    /**
+     * Add/remove a group of objects based on a desired visibility flag.
+     * The scene graph itself is the authority for what is currently shown:
+     * repeated calls with the same flag never double-add or accidentally
+     * remove anything.
+     */
+    applyObjectVisibility(objects, visible) {
+      if (!this.scene) {
+        return
+      }
+      for (const object of objects) {
+        const isInScene = object.parent === this.scene
+        if (visible && !isInScene) {
+          this.scene.add(object)
+        } else if (!visible && isInScene) {
+          this.scene.remove(object)
+        }
+      }
+      if (this.renderer && this.camera) {
+        this.renderer.render(this.scene, this.camera)
+      }
     },
 
-    showAxisLines() {
-      this.scene.add(...this.axisLines)
-      this.renderer.render(this.scene, this.camera)
+    setPyramidsVisible(visible) {
+      this.pyramidsVisible = visible
+      this.applyObjectVisibility(this.pyramids, visible)
     },
 
-    hidePyramids() {
-      this.scene.remove(...this.pyramids)
-      this.renderer.render(this.scene, this.camera)
+    togglePyramids() {
+      this.setPyramidsVisible(!this.pyramidsVisible)
     },
 
-    showPyramids() {
-      this.scene.add(...this.pyramids)
-      this.renderer.render(this.scene, this.camera)
+    setAxisLinesVisible(visible) {
+      this.axisLinesVisible = visible
+      this.applyObjectVisibility(this.axisLines, visible)
+    },
+
+    toggleAxisLines() {
+      this.setAxisLinesVisible(!this.axisLinesVisible)
+    },
+
+    /**
+     * Single rAF-driven loop. Re-calling startLoop while a loop is already
+     * queued is a no-op, so repeated init can never stack render loops.
+     */
+    startLoop() {
+      if (this.animationFrameId !== null) {
+        return
+      }
+      this.animationFrameId = window.requestAnimationFrame(this.tick)
+    },
+
+    stopLoop() {
+      if (this.animationFrameId !== null) {
+        window.cancelAnimationFrame(this.animationFrameId)
+        this.animationFrameId = null
+      }
+    },
+
+    tick() {
+      // Only keep looping while a live renderer/controls pair exists.
+      if (!this.renderer || !this.controls) {
+        this.animationFrameId = null
+        return
+      }
+
+      this.controls.update()
+
+      // Update reactive camera position for real-time display
+      if (this.camera) {
+        this.cameraPosition = {
+          x: Math.round(this.camera.position.x * 100) / 100,
+          y: Math.round(this.camera.position.y * 100) / 100,
+          z: Math.round(this.camera.position.z * 100) / 100
+        }
+      }
+
+      this.animationFrameId = window.requestAnimationFrame(this.tick)
+    },
+
+    /**
+     * Tear down everything init created: cancel the queued animation frame,
+     * detach the controls change and window resize listeners, release
+     * renderer/controls resources and remove the canvas from the DOM.
+     * Safe to call more than once and before any init has run.
+     */
+    dispose() {
+      this.stopLoop()
+
+      if (this.controls) {
+        this.controls.removeEventListener('change', this.onControlsChange)
+        window.removeEventListener('resize', this.onWindowResize, true)
+        this.controls.dispose()
+      }
+
+      if (this.scene) {
+        this.scene.traverse((object) => {
+          if (object.geometry) {
+            object.geometry.dispose()
+          }
+          if (object.material) {
+            const materials = Array.isArray(object.material)
+              ? object.material
+              : [object.material]
+            materials.forEach((material) => material.dispose())
+          }
+        })
+      }
+
+      if (this.renderer) {
+        const canvas = this.renderer.domElement
+        if (canvas && canvas.parentNode) {
+          canvas.parentNode.removeChild(canvas)
+        }
+        this.renderer.dispose()
+      }
+
+      this.camera = null
+      this.controls = null
+      this.scene = null
+      this.renderer = null
+      this.container = null
+      this.axisLines = []
+      this.pyramids = []
+      this.animationFrameId = null
     },
 
     async init({ width, height, el }) {
+      // Re-initializing must not stack loops, listeners or canvases.
+      this.dispose()
+
+      this.container = markRaw(el)
       this.setViewportSize({ width, height })
       this.initializeRenderer(el)
       this.initializeCamera()
@@ -208,27 +388,12 @@ export const useThreeStore = defineStore('three', {
       // Initial scene rendering
       this.renderer.render(this.scene, this.camera)
 
-      // Add an event listener that will re-render
-      // the scene when the controls are changed
-      this.controls.addEventListener('change', () => {
-        this.renderer.render(this.scene, this.camera)
-      })
-    },
+      // Re-render when the controls change. Same function reference is used
+      // on dispose, so the listener can always be detached again.
+      this.controls.addEventListener('change', this.onControlsChange)
+      window.addEventListener('resize', this.onWindowResize, true)
 
-    animate() {
-      window.requestAnimationFrame(() => {
-        this.animate()
-        this.controls.update()
-
-        // Update reactive camera position for real-time display
-        if (this.camera) {
-          this.cameraPosition = {
-            x: Math.round(this.camera.position.x * 100) / 100,
-            y: Math.round(this.camera.position.y * 100) / 100,
-            z: Math.round(this.camera.position.z * 100) / 100
-          }
-        }
-      })
+      this.startLoop()
     }
   }
 })

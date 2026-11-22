@@ -14,25 +14,20 @@ export default {
   mounted() {
     const store = useThreeStore();
 
-    store
-      .init({
-        width: this.$el.offsetWidth,
-        height: this.$el.offsetHeight,
-        el: this.$el,
-      })
-      .then(() => {
-        store.animate();
-        window.addEventListener(
-          "resize",
-          () => {
-            store.resize({
-              width: this.$el.offsetWidth,
-              height: this.$el.offsetHeight,
-            });
-          },
-          true
-        );
-      });
+    // The store owns the render loop, controls change listener and window
+    // resize listener; the view only tells it when to start and stop.
+    store.init({
+      width: this.$el.offsetWidth,
+      height: this.$el.offsetHeight,
+      el: this.$el,
+    });
+  },
+  beforeUnmount() {
+    const store = useThreeStore();
+
+    // Cancel the queued animation frame, detach listeners and release
+    // renderer/controls resources so leaving the view leaves nothing behind.
+    store.dispose();
   },
 };
 </script>
