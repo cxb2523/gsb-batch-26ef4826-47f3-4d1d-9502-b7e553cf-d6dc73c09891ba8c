@@ -1,0 +1,18 @@
+直播音画延迟 · 安装说明
+
+电脑端 Chrome / Edge：推荐使用 ZIP 安装
+1. 解压下载的整合包，再把里面的 BilibiliLiveDelay-v版本号.zip 解压到一个准备长期保留的文件夹。
+2. Chrome 116 或更高版本：在地址栏打开 chrome://extensions
+   Edge：在地址栏打开 edge://extensions
+3. 开启「开发者模式」，点击「加载已解压的扩展程序」，选择能直接看到 manifest.json 的那一层文件夹。
+4. 在浏览器工具栏的扩展菜单中找到「Live Audio Sync · 直播音画延迟」，可将它固定以便使用。安装后请保留扩展文件夹。
+
+什么时候可以使用整合包里的 CRX？
+• Linux 版 Google Chrome 支持手动安装商店外的 CRX。
+• 由组织管理的 Windows 或 macOS 版 Chrome 可以由管理员通过企业策略部署 CRX。
+• 其他明确支持本地 CRX 安装的浏览器，请按该浏览器的说明操作。
+
+在个人 Windows 或 Mac 上，即使 CRX 已由项目签名，Chrome 仍可能将它禁用，并提示“该扩展程序未列在 Chrome 应用商店中”。遇到这条提示，请按上面的 ZIP 步骤安装。
+
+以后下载新版，继续使用这个地址：
+https://download.aurxs.dev/BilibiliLiveDelay.zip

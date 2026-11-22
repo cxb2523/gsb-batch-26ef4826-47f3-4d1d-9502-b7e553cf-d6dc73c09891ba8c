@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Live Audio Sync · 延迟播放</title><link rel="stylesheet" href="viewer.css"></head>
+<body>
+  <header><div><strong>Live Audio Sync · 音画延迟</strong><p id="title">正在连接捕获标签页…</p></div><button id="fullscreen">全屏</button></header>
+  <main id="stage">
+    <video id="video" playsinline preload="auto"></video>
+    <div id="overlay" role="status"><p id="status">正在准备音画缓冲…</p><button id="play" hidden>播放声音与画面</button></div>
+  </main>
+  <footer id="viewer-footer">
+    <span id="detail">实际输出尺寸与帧率将在缓冲就绪后显示</span>
+    <div id="quick-controls" hidden>
+      <div class="delay-bar" role="group" aria-label="微调延迟">
+        <button data-step="-0.5" aria-label="减少 0.5 秒">−0.5</button>
+        <button data-step="-0.1" aria-label="减少 0.1 秒">−0.1</button>
+        <button id="delay-toggle" aria-expanded="false" aria-controls="quick-settings" title="延迟与画质"><strong id="delay-value"></strong> 秒</button>
+        <button data-step="0.1" aria-label="增加 0.1 秒">+0.1</button>
+        <button data-step="0.5" aria-label="增加 0.5 秒">+0.5</button>
+      </div>
+      <div id="quick-settings" hidden>
+        <label for="delay-slider">目标延迟</label>
+        <input id="delay-slider" type="range" min="0" max="60" step="0.1">
+        <div class="range-ends" aria-hidden="true"><span>0 秒</span><span>60 秒</span></div>
+        <div class="quality-row"><label for="quality">画质</label><select id="quality"></select></div>
+      </div>
+      <div id="control-error" role="alert" hidden></div>
+    </div>
+  </footer>
+  <script type="module" src="viewer.js"></script>
+</body></html>

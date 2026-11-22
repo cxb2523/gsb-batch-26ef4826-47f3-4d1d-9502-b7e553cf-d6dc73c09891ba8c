@@ -1,0 +1,14 @@
+{
+  "name": "bilibili-live-delay-download",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild _worker.js --bundle --minify --format=esm --loader:.txt=text --outfile=dist/_worker.js"
+  },
+  "dependencies": {
+    "fflate": "0.8.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}
