@@ -124,11 +124,22 @@ syngen.tool.bitree.prototype = {
         }
       }
 
+      // Bounding-box intersection is inclusive at the edges, so an item at
+      // exactly `radius` can survive node pruning and must be filtered here.
+      if (result && isFinite(radius) && distance(result) >= radius) {
+        result = undefined
+      }
+
       return result
     }
 
     let result = this.nodes[index].find(query, radius)
-    let minDistance = result ? distance(result) : Infinity
+
+    if (result === query) {
+      result = undefined
+    }
+
+    let minDistance = result ? distance(result) : radius
 
     for (const node of this.nodes) {
       if (node === this.nodes[index]) {
@@ -137,7 +148,7 @@ syngen.tool.bitree.prototype = {
 
       const item = node.find(query, minDistance)
 
-      if (!item) {
+      if (!item || item === query) {
         continue
       }
 
@@ -147,6 +158,12 @@ syngen.tool.bitree.prototype = {
         minDistance = d
         result = item
       }
+    }
+
+    // Bounding-box intersection is inclusive at the edges, so an item at
+    // exactly `radius` can survive node pruning and must be filtered here.
+    if (result && isFinite(radius) && distance(result) >= radius) {
+      result = undefined
     }
 
     return result
@@ -209,23 +226,40 @@ syngen.tool.bitree.prototype = {
   },
   /**
    * Removes `item` from the tree, if it exists.
+   * The item is first removed from this node's direct list.
+   * If it is not held directly, then every child node is searched so removal
+   * never silently fails when its index does not match where it is stored.
+   * Only one stored copy is removed per call.
    * @instance
    * @param {Object} item
    */
   remove: function (item) {
-    if (this.nodes.length) {
-      const index = this.getIndex(item)
-      this.nodes[index].remove(item)
-      return this
-    }
-
+    this._remove(item)
+    return this
+  },
+  /**
+   * Removes one stored copy of `item` from this node or its descendants.
+   * Returns whether a copy was found and removed.
+   * @instance
+   * @param {Object} item
+   * @private
+   * @returns {Boolean}
+   */
+  _remove: function (item) {
     const index = this.items.indexOf(item)
 
     if (index != -1) {
       this.items.splice(index, 1)
+      return true
     }
 
-    return this
+    for (const node of this.nodes) {
+      if (node._remove(item)) {
+        return true
+      }
+    }
+
+    return false
   },
   /**
    * Retrieves all items with values along the line segment starting at `minValue` with length `range`.
@@ -243,14 +277,18 @@ syngen.tool.bitree.prototype = {
 
     for (const item of this.items) {
       if (item[this.dimension] >= minValue && item[this.dimension] <= minValue + range) {
-        items.push(item)
+        if (!items.includes(item)) {
+          items.push(item)
+        }
       }
     }
 
     for (const node of this.nodes) {
-      items.push(
-        ...node.retrieve(minValue, range)
-      )
+      for (const item of node.retrieve(minValue, range)) {
+        if (!items.includes(item)) {
+          items.push(item)
+        }
+      }
     }
 
     return items

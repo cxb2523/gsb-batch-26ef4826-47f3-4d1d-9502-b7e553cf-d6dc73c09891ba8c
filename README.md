@@ -87,3 +87,21 @@ npx gulp build
 ```sh
 npx gulp watch
 ```
+
+### Testing the spatial index trees
+The one-, two-, and three-dimensional spatial index trees
+(`syngen.tool.bitree`, `syngen.tool.quadtree`, and `syngen.tool.octree`)
+ship with dependency-free validation under `test/`.
+
+Run the deterministic and randomized suites with Node (no build step needed):
+```sh
+node test/trees.test.js
+node test/trees.random.test.js
+node test/build.smoke.js
+```
+
+For the browser console, open `test/browser.html`.
+It loads the sources directly and renders the results on the page and in the
+console. Each scenario is also exposed on `window.treeValidation.examples`
+for manual replay. The page can instead load a built bundle by replacing the
+`src/` script tags with `dist/syngen.js` after running `npx gulp dist`.

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>syngen spatial index tree validation</title>
+  <style>
+    body { font-family: monospace; margin: 2rem; }
+    .ok { color: #0a7d23; }
+    .fail { color: #b00020; font-weight: bold; }
+    h1 { font-size: 1.1rem; }
+    pre { background: #f4f4f4; padding: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>syngen quadtree / octree / bitree validation</h1>
+  <p>
+    Open the browser console to inspect the trees, or call
+    <code>window.treeValidation.examples</code> to replay any scenario by hand.
+    Results also render below.
+  </p>
+  <pre id="output">running…</pre>
+
+  <!--
+    Loads the framework sources in the same order as the Gulp `dist` task.
+    Point these at a built dist/syngen.js instead, if one is available:
+      <script src="../dist/syngen.js"></script>
+  -->
+  <script src="../src/syngen.js"></script>
+  <script src="../src/syngen/const.js"></script>
+  <script src="../src/syngen/fn.js"></script>
+  <script src="../src/syngen/tool/bitree.js"></script>
+  <script src="../src/syngen/tool/quadtree.js"></script>
+  <script src="../src/syngen/tool/octree.js"></script>
+
+  <script>
+  (() => {
+    'use strict'
+
+    const results = []
+    const examples = {}
+
+    function check(name, fn) {
+      try {
+        fn()
+        results.push(`ok   - ${name}`)
+      } catch (error) {
+        results.push(`FAIL - ${name}: ${error.message}`)
+      }
+    }
+
+    function assert(condition, message) {
+      if (!condition) {
+        throw new Error(message || 'assertion failed')
+      }
+    }
+
+    function uniqueCount(items, target) {
+      return items.filter((item) => item === target).length
+    }
+
+    // -- 1. Queries after a split traverse every child ---------------------
+
+    examples.splitThenQuery = function () {
+      const tree = syngen.tool.quadtree.create({
+        maxItems: 2, x: 0, y: 0, width: 100, height: 100,
+      })
+
+      const items = [
+        {id: 'sw1', x: 10, y: 10},
+        {id: 'sw2', x: 20, y: 20},
+        {id: 'ne', x: 80, y: 80},
+        {id: 'se', x: 90, y: 10},
+        {id: 'nw', x: 10, y: 90},
+      ]
+
+      items.forEach((item) => tree.insert(item))
+
+      check('quadtree: parent releases items after splitting', () => {
+        assert(tree.nodes.length === 4, 'expected four child nodes')
+        assert(tree.items.length === 0, 'parent must not retain pushed items')
+      })
+
+      check('quadtree: retrieve reaches every child without duplicates', () => {
+        const found = tree.retrieve({x: 0, y: 0, width: 100, height: 100})
+        assert(found.length === items.length, `expected ${items.length}, got ${found.length}`)
+        items.forEach((item) => assert(uniqueCount(found, item) === 1, 'duplicate item in retrieve'))
+      })
+
+      check('quadtree: filter traverses every child using node center/radius', () => {
+        const found = tree.filter(() => true)
+        assert(found.length === items.length, `expected ${items.length}, got ${found.length}`)
+        // The node bounds are exposed just like the octree's.
+        tree.filter((center, radius) => {
+          assert(typeof center.x === 'number' && typeof radius === 'number',
+            'filterNode must receive center and radius')
+          return true
+        })
+      })
+
+      return tree
+    }
+
+    // -- 2. Removal follows an item across children ------------------------
+
+    examples.crossChildRemoval = function () {
+      const tree = syngen.tool.octree.create({
+        maxItems: 2, x: 0, y: 0, z: 0, width: 100, height: 100, depth: 100,
+      })
+
+      const moving = {id: 'moving', x: 10, y: 10, z: 10}
+      const items = [
+        {x: 80, y: 80, z: 10},
+        moving,
+        {x: 10, y: 10, z: 80},
+        {x: 80, y: 80, z: 80},
+      ]
+
+      items.forEach((item) => tree.insert(item))
+
+      // Stored in one child at insert time; after moving, its computed index
+      // points at a different child. Removal must descend into the real one.
+      moving.x = 80
+      moving.y = 80
+      moving.z = 80
+      tree.remove(moving)
+
+      check('octree: remove follows the item into its actual storage child', () => {
+        const remaining = tree.retrieve({
+          x: 0, y: 0, z: 0, width: 100, height: 100, depth: 100,
+        })
+        assert(!remaining.includes(moving), 'moved item was not removed')
+        assert(remaining.length === 3, `expected 3 items, got ${remaining.length}`)
+      })
+
+      return tree
+    }
+
+    // -- 3. Repeated insertion: one remove removes one copy, no dupes ------
+
+    examples.duplicateInsertion = function () {
+      const tree = syngen.tool.bitree.create({maxItems: 2, minValue: 0, range: 100})
+      const duplicate = {id: 'dup', value: 20}
+      const other = {id: 'other', value: 80}
+
+      tree.insert(duplicate)
+      tree.insert(duplicate)
+      tree.insert(other)
+
+      check('bitree: duplicate inserts never produce duplicate query results', () => {
+        const found = tree.retrieve(0, 100)
+        assert(found.length === 2, `expected 2 unique results, got ${found.length}`)
+        assert(uniqueCount(found, duplicate) === 1, 'duplicate leaked into query')
+      })
+
+      tree.remove(duplicate)
+
+      check('bitree: a single remove deletes exactly one stored copy', () => {
+        const found = tree.retrieve(0, 100)
+        assert(uniqueCount(found, duplicate) === 1, 'one copy must remain')
+        assert(uniqueCount(found, other) === 1, 'unrelated item must remain')
+      })
+
+      tree.remove(duplicate)
+
+      check('bitree: the second remove deletes the remaining copy', () => {
+        const found = tree.retrieve(0, 100)
+        assert(!found.includes(duplicate), 'duplicate should be gone')
+        assert(found.length === 1 && found[0] === other, 'only the other item remains')
+      })
+
+      return tree
+    }
+
+    // -- 4. Finite-radius find respects its bounds, including edges --------
+
+    examples.finiteRadiusFind = function () {
+      const tree = syngen.tool.bitree.create({maxItems: 2, minValue: 0, range: 100})
+      const at10 = {value: 10}
+      const at20 = {value: 20}
+      const at30 = {value: 30}
+      ;[at10, at20, at30].forEach((item) => tree.insert(item))
+
+      check('bitree: find stays within a finite radius', () => {
+        assert(tree.find(at30, 5) === undefined, 'item 10 away must not match radius 5')
+        assert(tree.find(at30, 10) === undefined, 'distance equal to radius is excluded')
+        assert(tree.find(at30, 10.0001) === at20, 'item just inside the radius matches')
+
+        const probe = {value: 25}
+        assert(tree.find(probe, 5) === undefined, 'boundary distance is excluded for a fresh probe')
+        assert([at20, at30].includes(tree.find(probe, 5.0001)), 'nearest neighbor matches inside radius')
+      })
+
+      const quad = syngen.tool.quadtree.create({maxItems: 2, x: 0, y: 0, width: 100, height: 100})
+      quad.insert({x: 15, y: 10}) // exactly 5 from (10,10)
+      quad.insert({x: 12, y: 10}) // exactly 2 from (10,10)
+      quad.insert({x: 80, y: 80})
+
+      check('quadtree: exact-radius items are excluded across split nodes', () => {
+        const query = {x: 10, y: 10}
+        assert(quad.find(query, 5).x === 12, 'distance-5 item excluded, distance-2 returned')
+        assert(quad.find(query, 2) === undefined, 'distance-2 item excluded at radius 2')
+      })
+
+      return tree
+    }
+
+    // Run every scenario and render the outcome.
+    examples.splitThenQuery()
+    examples.crossChildRemoval()
+    examples.duplicateInsertion()
+    examples.finiteRadiusFind()
+
+    const failed = results.filter((line) => line.startsWith('FAIL')).length
+    results.push('')
+    results.push(`${results.length - 1 - failed} passed, ${failed} failed`)
+
+    const output = document.getElementById('output')
+    output.textContent = results.join('\n')
+    output.classList.add(failed ? 'fail' : 'ok')
+
+    // Mirror to the console and expose the scenario factories for manual replay.
+    results.forEach((line) => console[line.startsWith('FAIL') ? 'error' : 'log'](line))
+    window.treeValidation = {examples, results}
+  })()
+  </script>
+</body>
+</html>

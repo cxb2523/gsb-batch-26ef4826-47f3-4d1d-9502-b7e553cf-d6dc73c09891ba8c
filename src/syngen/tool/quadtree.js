@@ -80,6 +80,13 @@ syngen.tool.quadtree.prototype = {
     this.x = x
     this.y = y
 
+    this.center = {
+      x: this.x + (this.width / 2),
+      y: this.y + (this.height / 2),
+    }
+
+    this.radius = Math.max(this.height, this.width) / syngen.const.unit2
+
     return this
   },
   /**
@@ -92,7 +99,8 @@ syngen.tool.quadtree.prototype = {
   /**
    * Returns the items which satisfy `filterNode` and `filterItem`.
    * @param {Function} filterNode
-   *   Returns `true` if the passed `center` and `radius` describing the node's bounding cube should be traversed.
+   *   Receives this node's bounding `center` and `radius`.
+   *   Returns `true` if the passed `center` and `radius` describing the node's bounding square should be traversed.
    *   Use this as an optimization.
    * @param {Function} filterItem
    *   Returns whether the passed `item` is included in the result set.
@@ -105,14 +113,20 @@ syngen.tool.quadtree.prototype = {
       return items
     }
 
+    const push = (item) => {
+      if (!items.includes(item)) {
+        items.push(item)
+      }
+    }
+
     if (this.items.length) {
       for (const item of this.items) {
         if (filterItem) {
           if (filterItem(item)) {
-            items.push(item)
+            push(item)
           }
         } else {
-          items.push(item)
+          push(item)
         }
       }
     } else if (this.nodes.length) {
@@ -153,11 +167,12 @@ syngen.tool.quadtree.prototype = {
 
     const distance = ({x, y}) => ((x - query.x) ** 2) + ((y - query.y) ** 2),
       index = this.getIndex(query),
-      radius2 = ((radius * (Math.sqrt(2) / 2)) ** 2) * 2
+      radius2 = radius * radius
+
+    let result
 
     if (index == -1) {
-      let minDistance = radius2,
-        result
+      let minDistance = radius2
 
       for (const item of this.items) {
         if (item === query) {
@@ -171,30 +186,39 @@ syngen.tool.quadtree.prototype = {
           result = item
         }
       }
+    } else {
+      result = this.nodes[index].find(query, radius)
 
-      return result
+      if (result === query) {
+        result = undefined
+      }
+
+      let minDistance = result ? distance(result) : radius2
+
+      for (const node of this.nodes) {
+        if (node === this.nodes[index]) {
+          continue
+        }
+
+        const item = node.find(query, Math.sqrt(minDistance))
+
+        if (!item || item === query) {
+          continue
+        }
+
+        const d = distance(item)
+
+        if (d < minDistance) {
+          minDistance = d
+          result = item
+        }
+      }
     }
 
-    let result = this.nodes[index].find(query, radius)
-    let minDistance = result ? distance(result) : radius2
-
-    for (const node of this.nodes) {
-      if (node === this.nodes[index]) {
-        continue
-      }
-
-      const item = node.find(query, minDistance)
-
-      if (!item) {
-        continue
-      }
-
-      const d = distance(item)
-
-      if (d < minDistance) {
-        minDistance = d
-        result = item
-      }
+    // Bounding-box intersection is inclusive at the edges, so an item at
+    // exactly `radius` can survive node pruning and must be filtered here.
+    if (result && isFinite(radius) && distance(result) >= radius2) {
+      result = undefined
     }
 
     return result
@@ -273,23 +297,40 @@ syngen.tool.quadtree.prototype = {
   },
   /**
    * Removes `item` from the tree, if it exists.
+   * The item is first removed from this node's direct list.
+   * If it is not held directly, then every child node is searched so removal
+   * never silently fails when its index does not match where it is stored.
+   * Only one stored copy is removed per call.
    * @instance
    * @param {Object} item
    */
   remove: function (item) {
-    if (this.nodes.length) {
-      const index = this.getIndex(item)
-      this.nodes[index].remove(item)
-      return this
-    }
-
+    this._remove(item)
+    return this
+  },
+  /**
+   * Removes one stored copy of `item` from this node or its descendants.
+   * Returns whether a copy was found and removed.
+   * @instance
+   * @param {Object} item
+   * @private
+   * @returns {Boolean}
+   */
+  _remove: function (item) {
     const index = this.items.indexOf(item)
 
     if (index != -1) {
       this.items.splice(index, 1)
+      return true
     }
 
-    return this
+    for (const node of this.nodes) {
+      if (node._remove(item)) {
+        return true
+      }
+    }
+
+    return false
   },
   /**
    * Retrieves all items within the rectangle `rect`.
@@ -321,14 +362,18 @@ syngen.tool.quadtree.prototype = {
         && item.y >= y
         && item.y <= y + height
       ) {
-        items.push(item)
+        if (!items.includes(item)) {
+          items.push(item)
+        }
       }
     }
 
     for (const node of this.nodes) {
-      items.push(
-        ...node.retrieve({height, width, x, y})
-      )
+      for (const item of node.retrieve({height, width, x, y})) {
+        if (!items.includes(item)) {
+          items.push(item)
+        }
+      }
     }
 
     return items
