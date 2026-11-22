@@ -1,21 +1,36 @@
 import { BufferedStreamReader } from './buffered-stream-reader.mjs';
 
+// 100ms allows enough time for the largest 60ms Opus frame to decode before
+// the first AudioBuffer is scheduled.
+const INITIAL_START_DELAY = 100 / 1000;
+
+/* A single streaming playback session.
+ *
+ * Every start() creates a new session with a unique, monotonically increasing
+ * id.  Readers, worker callbacks and scheduled AudioBufferSourceNodes all
+ * capture the id of the session they belong to, so anything that arrives after
+ * a reset/close (late download progress, late decoder messages, late onended
+ * callbacks) is ignored instead of leaking into the next session or reviving
+ * counters that were just cleared.
+ */
 export class AudioStreamPlayer {
   // these shouldn't change once set
   _worker;
   _url;
-  _readBufferSize
+  _readBufferSize;
 
-  // these are reset
-  _sessionId             // used to prevent race conditions between cancel/starts
+  // these are reset for every playback session
+  _sessionId;            // id of the active session, null when closed
+  _lastSessionId = 0;    // source of monotonically increasing session ids
   _audioCtx;             // Created/Closed when this player starts/stops audio
-  _reader;
-  _audioSrcNodes         // Used to fix Safari Bug https://github.com/AnthumChris/fetch-stream-audio/issues/1
-  _totalTimeScheduled    // time scheduled of all AudioBuffers
-  _playStartedAt         // audioContext.currentTime of first sched
+  _reader;               // BufferedStreamReader of the active session
+  _audioSrcNodes;        // Used to fix Safari Bug https://github.com/AnthumChris/fetch-stream-audio/issues/1
+  _totalTimeScheduled;   // time scheduled of all AudioBuffers
+  _playStartedAt;        // audioContext.currentTime of first sched
   _abCreated;            // AudioBuffers created
   _abEnded;              // AudioBuffers played/ended
   _skips;                // audio skipping caused by slow download
+  _downloadStartTime;    // performance.now() at start of session
 
   constructor(url, readBufferSize, decoderName) {
     switch (decoderName) {
@@ -25,7 +40,10 @@ export class AudioStreamPlayer {
     }
 
     this._worker.onerror = event => {
-      this._updateState({ error: event.message });
+      // A worker error is only meaningful for the session that is still open.
+      if (this._sessionId) {
+        this._updateState({ error: event.message });
+      }
     };
     this._worker.onmessage = this._onWorkerMessage.bind(this);
 
@@ -37,11 +55,9 @@ export class AudioStreamPlayer {
     this._reset();
   }
 
+  // Clears all session-scoped state.  Does not perform any cleanup; use
+  // _teardown()/close() for that.
   _reset() {
-    if (this._sessionId) {
-      performance.clearMarks(this._downloadMarkKey);
-    }
-
     this._sessionId = null;
     this._audioCtx = null;
     this._reader = null;
@@ -51,54 +67,128 @@ export class AudioStreamPlayer {
     this._abCreated = 0;
     this._abEnded = 0;
     this._skips = 0;
+    this._downloadStartTime = 0;
   }
 
-  close() {
-    for (let node of this._audioSrcNodes) {
+  // Stops and disconnects every scheduled source node.  Their onended handlers
+  // are removed first so they cannot change the counters of a later session.
+  _stopScheduledAudio() {
+    const nodes = this._audioSrcNodes;
+    this._audioSrcNodes = [];
+
+    for (const node of nodes) {
       node.onended = null;
-      node.disconnect(this._audioCtx.destination);
-      node.stop();
+      try { node.stop(); } catch (e) { /* already stopped */ }
+      try { node.disconnect(); } catch (e) { /* already disconnected */ }
     }
-    if (this._reader) {
-      this._reader.abort();
+  }
+
+  _closeAudioContext() {
+    const audioCtx = this._audioCtx;
+    this._audioCtx = null;
+    if (!audioCtx) return;
+
+    try {
+      const closing = audioCtx.close();
+      if (closing && typeof closing.catch === 'function') {
+        closing.catch(_ => {});
+      }
+    } catch (e) {
+      // context may already be closed
     }
-    if (this._audioCtx) {
-      this._audioCtx.suspend();
-      this._audioCtx.close();
+  }
+
+  // Abort the download, drop scheduled audio, close the AudioContext and clear
+  // every session counter.  Idempotent.
+  _teardown() {
+    const reader = this._reader;
+    this._reader = null;
+    if (reader) {
+      reader.abort();
     }
 
+    this._stopScheduledAudio();
+    this._closeAudioContext();
     this._reset();
   }
 
+  close() {
+    this._teardown();
+  }
+
+  // Returns true when the session started, false when it failed synchronously.
   start() {
-    this._sessionId = performance.now();
-    performance.mark(this._downloadMarkKey);
-    this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
-    const reader = new BufferedStreamReader(new Request(this._url), this._readBufferSize);
-    reader.onRead = this._downloadProgress.bind(this);
-    reader.onBufferFull = this._decode.bind(this);
+    // Starting again without an explicit reset must not inherit the previous
+    // session's reader, schedule time, counters or AudioContext.
+    this._teardown();
 
-    reader.read()
-    .catch(e => {
+    const sessionId = ++this._lastSessionId;
+    this._sessionId = sessionId;
+    this._downloadStartTime = performance.now();
+
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioCtx({ latencyHint: 'interactive' });
+      this._audioCtx = audioCtx;
+
+      // Reset decoder state (buffers, queued flushes, WAV header state) before
+      // any bytes of this session reach the worker.
+      this._worker.postMessage({ reset: true, sessionId });
+
+      const reader = new BufferedStreamReader(new Request(this._url), this._readBufferSize);
+
+      // Capture sessionId so late data from this reader is never mistaken for
+      // data of a newer session.
+      reader.onRead = progress => this._downloadProgress(sessionId, progress);
+      reader.onBufferFull = chunk => this._decode(sessionId, chunk);
+
+      this._reader = reader;
+
+      reader.read()
+      .catch(e => {
+        if (this._sessionId !== sessionId) return;
+        this._updateState({ error: e.toString() });
+      });
+    } catch (e) {
+      // e.g. AudioContext quota exceeded or an invalid URL: fail this session
+      // cleanly instead of leaving a half-started one behind.
       this._updateState({ error: e.toString() });
-    });
+      this._teardown();
+      return false;
+    }
 
-    this._reader = reader;
     this.resume();
+    return true;
   }
 
   pause() {
-    this._audioCtx.suspend().then(_ => this._updateState({ playState: 'paused'}));
+    const audioCtx = this._audioCtx;
+    if (!audioCtx) return;
+    audioCtx.suspend()
+      .then(_ => {
+        if (this._audioCtx === audioCtx) this._updateState({ playState: 'paused' });
+      })
+      .catch(_ => {});
   }
+
   resume() {
-    this._audioCtx.resume().then(_ => this._updateState({ playState: 'playing'}));
+    const audioCtx = this._audioCtx;
+    if (!audioCtx) return;
+    audioCtx.resume()
+      .then(_ => {
+        if (this._audioCtx === audioCtx) this._updateState({ playState: 'playing' });
+      })
+      .catch(_ => {});
   }
 
   _updateState(props) {
-    const abState = !this._abCreated? {} : {
+    // Nothing may touch the UI (or the counters) once a session ended.
+    if (!this._sessionId) return;
+
+    const abState = !this._abCreated ? {} : {
       abCreated: this._abCreated,
       abEnded: this._abEnded,
-      abRemaining: this._abCreated - this._abEnded,
+      abRemaining: Math.max(0, this._abCreated - this._abEnded),
       skips: this._skips
     };
     const state = Object.assign(abState, props);
@@ -107,62 +197,86 @@ export class AudioStreamPlayer {
     }
   }
 
-  _decode({ bytes, done }) {
-    const sessionId = this._sessionId;
+  _decode(sessionId, { bytes }) {
+    if (this._sessionId !== sessionId) return;
+    if (!bytes || !bytes.byteLength) return;
+
     this._worker.postMessage({ decode: bytes.buffer, sessionId }, [bytes.buffer]);
   }
 
-  // prevent race condition by checking sessionId
+  // Prevent race condition by checking sessionId
   _onWorkerMessage(event) {
-    const {decoded, sessionId} = event.data;
-    if (decoded.channelData) {
-      if (!(this._sessionId && this._sessionId === sessionId)) {
-        console.log("race condition detected for closed session");
-        return;
-      }
+    const data = event && event.data;
+    if (!data || !data.decoded || !data.decoded.channelData) return;
 
-      this._schedulePlayback(decoded);
+    const { decoded, sessionId } = data;
+    // Late messages from a previous session are dropped, never adopted.
+    if (!this._sessionId || sessionId !== this._sessionId) {
+      return;
     }
+
+    this._schedulePlayback(decoded, sessionId);
   }
 
-  _downloadProgress({ bytes, totalRead, totalBytes, done }) {
+  _downloadProgress(sessionId, { totalRead, totalBytes }) {
+    if (this._sessionId !== sessionId) return;
+
+    const elapsed = performance.now() - this._downloadStartTime;
     this._updateState({
       bytesRead: totalRead,
       bytesTotal: totalBytes,
-      dlRate: totalRead*8 / (performance.now() - this._getDownloadStartTime())
+      dlRate: elapsed > 0 ? totalRead * 8 / elapsed : 0
     });
-    // console.log(done, (totalRead/totalBytes*100).toFixed(2) );
   }
 
-  get _downloadMarkKey() {
-    return `download-start-${this._sessionId}`;
-  }
-  _getDownloadStartTime() {
-    return performance.getEntriesByName(this._downloadMarkKey)[0].startTime;
-  }
+  _schedulePlayback({ channelData, length, numberOfChannels, sampleRate }, sessionId) {
+    const audioCtx = this._audioCtx;
+    if (this._sessionId !== sessionId || !audioCtx) return;
 
-  _schedulePlayback({channelData, length, numberOfChannels, sampleRate}) {
-    const audioSrc = this._audioCtx.createBufferSource(),
-          audioBuffer = this._audioCtx.createBuffer(numberOfChannels, length, sampleRate);
+    // createBuffer() rejects zero-length buffers, e.g. an empty final decode.
+    if (!length) return;
 
+    const audioSrc = audioCtx.createBufferSource();
+    let audioBuffer;
+    try {
+      audioBuffer = audioCtx.createBuffer(numberOfChannels, length, sampleRate);
+    } catch (e) {
+      // e.g. unsupported sample rate: drop this chunk, keep the session alive.
+      try { audioSrc.disconnect(); } catch (ignored) { /* noop */ }
+      return;
+    }
+
+    let hasEnded = false;
     audioSrc.onended = () => {
-      this._audioSrcNodes.shift();
-      this._abEnded++;
+      if (hasEnded) return;
+      hasEnded = true;
+
+      // The session may have been reset between scheduling and this callback.
+      if (this._sessionId !== sessionId || this._audioCtx !== audioCtx) return;
+
+      const index = this._audioSrcNodes.indexOf(audioSrc);
+      if (index !== -1) {
+        this._audioSrcNodes.splice(index, 1);
+      }
+
+      if (this._abEnded < this._abCreated) {
+        this._abEnded++;
+      }
       this._updateState();
     };
-    this._abCreated++;
-    this._updateState();
 
+    this._abCreated++;
     // adding also ensures onended callback is fired in Safari
     this._audioSrcNodes.push(audioSrc);
+    this._updateState();
 
     // Use performant copyToChannel() if browser supports it
-    for (let c=0; c<numberOfChannels; c++) {
+    for (let c = 0; c < numberOfChannels; c++) {
       if (audioBuffer.copyToChannel) {
         audioBuffer.copyToChannel(channelData[c], c);
       } else {
-        let toChannel = audioBuffer.getChannelData(c);
-        for (let i=0; i<channelData[c].byteLength; i++) {
+        const toChannel = audioBuffer.getChannelData(c);
+        for (let i = 0; i < channelData[c].length; i++) {
           toChannel[i] = channelData[c][i];
         }
       }
@@ -172,32 +286,21 @@ export class AudioStreamPlayer {
     // initialize first play position.  initial clipping/choppiness sometimes occurs and intentional start latency needed
     // read more: https://github.com/WebAudio/web-audio-api/issues/296#issuecomment-257100626
     if (!this._playStartedAt) {
-      /* this clips in Firefox, plays */
-      // const startDelay = audioCtx.baseLatency || (128 / audioCtx.sampleRate);
-
-      /* this doesn't clip in Firefox (256 value), plays */
-      // startDelay = this._audioCtx.baseLatency || (256 / this._audioCtx.sampleRate);
-
-      // 100ms allows enough time for largest 60ms Opus frame to decode
-      startDelay = 100 / 1000;
-
-      /* this could be useful for firefox but outputLatency is about 250ms in FF. too long */
-      // const startDelay = audioCtx.outputLatency || audioCtx.baseLatency || (128 / audioCtx.sampleRate);
-
-      this._playStartedAt = this._audioCtx.currentTime + startDelay;
-      this._updateState({ latency: performance.now() - this._getDownloadStartTime() + startDelay*1000 });
+      startDelay = INITIAL_START_DELAY;
+      this._playStartedAt = audioCtx.currentTime + startDelay;
+      this._updateState({ latency: performance.now() - this._downloadStartTime + startDelay * 1000 });
     }
 
     audioSrc.buffer = audioBuffer;
-    audioSrc.connect(this._audioCtx.destination);
-    
+    audioSrc.connect(audioCtx.destination);
+
     const startAt = this._playStartedAt + this._totalTimeScheduled;
-    if (this._audioCtx.currentTime >= startAt) {
+    if (audioCtx.currentTime >= startAt) {
       this._skips++;
       this._updateState();
     }
     audioSrc.start(startAt);
 
-    this._totalTimeScheduled+= audioBuffer.duration;
+    this._totalTimeScheduled += audioBuffer.duration;
   }
 }

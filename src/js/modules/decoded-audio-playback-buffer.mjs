@@ -80,8 +80,11 @@ export class DecodedAudioPlaybackBuffer {
 
   flush() {
     const bufferPos = this._bufferPos;
-    this._onFlush({ left: this._bufferL.slice(0, bufferPos), right: this._bufferR.slice(0, bufferPos)});
-    this._flushCount++;
+    // Never emit a zero-length buffer: createBuffer(0) throws in the player.
+    if (bufferPos > 0) {
+      this._onFlush({ left: this._bufferL.slice(0, bufferPos), right: this._bufferR.slice(0, bufferPos)});
+      this._flushCount++;
+    }
     this._bufferPos = 0;
   }
 }

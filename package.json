@@ -4,6 +4,7 @@
   "scripts": {
     "dev": "./scripts/dev.sh",
     "build": "./scripts/build.sh",
+    "test": "node --test \"test/*.test.mjs\"",
     "clean": "rm -rf build dist",
     "clean-all": "rm -rf .cache build dist node_modules package-lock.json"
   },

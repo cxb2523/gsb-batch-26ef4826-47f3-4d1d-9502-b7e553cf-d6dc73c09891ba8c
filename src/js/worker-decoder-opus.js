@@ -3,22 +3,58 @@ import { DecodedAudioPlaybackBuffer } from './modules/decoded-audio-playback-buf
 
 const decoder = new OpusStreamDecoder({ onDecode });
 const playbackBuffer = new DecodedAudioPlaybackBuffer({ onFlush });
-let sessionId, flushTimeoutId;
+let sessionId, flushTimeoutId, decodingSessionId;
 
 function evalSessionId(newSessionId) {
-  // detect new session and reset decoder
-  if (sessionId && sessionId === newSessionId) {
+  // detect new session and reset decoder/playback buffer state
+  if (sessionId === newSessionId) {
     return;
   }
 
   sessionId = newSessionId;
+
+  // Drop any flush scheduled by the previous session; otherwise its buffered
+  // samples would be posted tagged with the new sessionId and played there.
+  if (flushTimeoutId) {
+    clearTimeout(flushTimeoutId);
+    flushTimeoutId = null;
+  }
+
   playbackBuffer.reset();
 }
 
 self.onmessage = async (evt) => {
-  evalSessionId(evt.data.sessionId);
+  const { decode, reset, sessionId: messageSessionId } = evt.data;
+
+  if (reset) {
+    // Discard all state carried over from the previous session.
+    sessionId = messageSessionId;
+    if (flushTimeoutId) {
+      clearTimeout(flushTimeoutId);
+      flushTimeoutId = null;
+    }
+    playbackBuffer.reset();
+    return;
+  }
+
+  if (!decode) {
+    return;
+  }
+
+  evalSessionId(messageSessionId);
+  const decodeSessionId = messageSessionId;
+
   await decoder.ready;
-  decoder.decode(new Uint8Array(evt.data.decode));
+
+  // A newer session may have started while we were waiting for the decoder.
+  if (sessionId !== decodeSessionId) {
+    return;
+  }
+
+  // Persist until the next decode() call: onDecode runs for the session that
+  // is currently being decoded, even if it fires asynchronously.
+  decodingSessionId = decodeSessionId;
+  decoder.decode(new Uint8Array(decode));
 };
 
 function onDecode({ left, right, samplesDecoded, sampleRate }) {
@@ -28,11 +64,20 @@ function onDecode({ left, right, samplesDecoded, sampleRate }) {
     return;
   }
 
+  // Ignore samples produced for a session that is no longer current.
+  if (!decodingSessionId || decodingSessionId !== sessionId) {
+    return;
+  }
+
   playbackBuffer.add({ left, right});
-  scheduleLastFlush();
+  scheduleLastFlush(decodingSessionId);
 }
 
 function onFlush({ left, right }) {
+  if (!left.length) {
+    return;
+  }
+
   const decoded = {
     channelData: [left, right],
     length: left.length,
@@ -50,9 +95,16 @@ function onFlush({ left, right }) {
 }
 
 // No End of file is signaled from decoder. This ensures last bytes always flush
-function scheduleLastFlush() {
-  clearTimeout(flushTimeoutId);
+function scheduleLastFlush(flushSessionId) {
+  if (flushTimeoutId) {
+    clearTimeout(flushTimeoutId);
+  }
   flushTimeoutId = setTimeout(_ => {
+    flushTimeoutId = null;
+    // Never flush the previous session's leftovers into a newer session.
+    if (flushSessionId !== sessionId) {
+      return;
+    }
     playbackBuffer.flush();
   }, 100);
 }

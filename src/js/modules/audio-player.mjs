@@ -35,11 +35,28 @@ export class AudioPlayer {
   }
 
   start() {
-    this._audio.start();
+    // Clear per-session fields before starting, so a start that fails
+    // synchronously (e.g. AudioContext creation) can still show its error.
     this._ui.setState({
+      latency: null,
+      bytesRead: null,
+      bytesTotal: null,
+      dlRate: null,
+      abCreated: null,
+      abEnded: null,
+      abRemaining: null,
+      skips: null,
+      error: null,
+
       readBuffer: this._readSize,
       decoder: this._decoder
     });
+
+    if (!this._audio.start()) {
+      // The session failed to start (error already pushed to the UI); do not
+      // announce it as started/playing.
+      return;
+    }
     this._onStateChange('started');
     this._onStateChange('playing');
   }
