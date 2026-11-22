@@ -6,6 +6,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Noise-channel drums (kick/snare/hi-hat) now play, stop and export correctly.** The two Game Boy noise channels were created with a gain of 0, so every percussion note was silent in live playback and in offline WAV export; they now use the same audible channel level as the pulse channels.
+- **Stopped playback no longer leaves residual noise nodes.** The APU's node tracking overwrote each channel's `onended` disconnect handler, so per-note gain/source nodes stayed wired into the live graph. The handler is now chained so both the channel cleanup and APU tracking run, and the noise channel tracks every voice and disconnects it on stop/reset.
+- **Noise buffer cache can no longer truncate a longer note.** Cache hits now compare the AudioBuffer's actual length against the note plus its envelope-tail padding; a shorter cached buffer is never reused for a longer note. The kick/snare/hi-hat helpers also request tail-padded buffers.
+- **Stop/replay resets noise-channel session state.** `stopAll()` now resets the noise channels (disconnecting all voices and clearing the buffer cache) so buffers from a stopped session cannot affect the next play or offline render; replay schedules fresh nodes without stacking stopped ones.
+
 ### Changed
 - Hosting moved from Vercel to Cloudflare Workers. Short share links moved from Redis to Workers KV. The MIDI proxy now checks every redirect hop against the SSRF rules.
 - `.html` page URLs and `/v2` now permanently redirect (301) to their clean URLs. `/v2` is removed from the sitemap.

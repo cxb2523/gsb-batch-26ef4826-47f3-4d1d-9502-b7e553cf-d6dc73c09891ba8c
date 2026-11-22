@@ -129,9 +129,12 @@ export class GameBoyAPU {
       this.initChannelState(config.id);
     }
     
-    // Create noise channels - MUTED for now
+    // Create noise channels. These must be audible: the mapper routes drum
+    // tracks here, so a zero gain would silence every kick/snare/hi-hat in
+    // both live playback and offline WAV export. 0.12 matches the pulse
+    // channel level (the channel's own envelopes keep it conservative).
     for (const config of CHANNEL_CONFIG.noise) {
-      const gain = this.createChannelGain(config.id, 0);
+      const gain = this.createChannelGain(config.id, 0.12);
       const channel = new NoiseChannel(this.audioContext, gain, config.mode);
       this.noiseChannels.set(config.id, channel);
       this.initChannelState(config.id);
@@ -254,11 +257,11 @@ export class GameBoyAPU {
   ): void {
     const channel = this.pulseChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.oscillator, result.stopTime);
+    this.trackNode(result.oscillator, result.stopTime, result.gainNode);
   }
-  
+
   /**
    * Schedule a wave channel note.
    */
@@ -271,11 +274,11 @@ export class GameBoyAPU {
   ): void {
     const channel = this.waveChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.oscillator, result.stopTime);
+    this.trackNode(result.oscillator, result.stopTime, result.gainNode);
   }
-  
+
   /**
    * Schedule a noise channel note.
    */
@@ -288,22 +291,44 @@ export class GameBoyAPU {
   ): void {
     const channel = this.noiseChannels.get(channelId);
     if (!channel) return;
-    
+
     const result = channel.playNote(midiNote, duration, velocity, startTime);
-    this.trackNode(result.source, result.stopTime);
+    this.trackNode(result.source, result.stopTime, result.gainNode);
   }
-  
+
   /**
    * Track an audio node for stop functionality.
+   *
+   * The channel already set source.onended to disconnect the source and its
+   * per-note gain node. We must CHAIN onto that handler instead of replacing
+   * it, otherwise the gain node stays connected to the channel output forever
+   * (a leak that leaves stopped-session nodes attached to the live graph).
    */
-  private trackNode(node: OscillatorNode | AudioBufferSourceNode, _stopTime: number): void {
+  private trackNode(
+    node: OscillatorNode | AudioBufferSourceNode,
+    _stopTime: number,
+    gainNode?: GainNode
+  ): void {
     this.activeNodes.add(node);
-    
-    // Auto-remove when the node ends naturally
-    const cleanup = () => {
+
+    const previousOnEnded = node.onended;
+    node.onended = (event: Event) => {
+      // Run the channel's own disconnect cleanup first.
+      if (previousOnEnded) {
+        previousOnEnded.call(node, event);
+      }
+      // Then make sure the per-note gain is detached even if the channel's
+      // handler was absent (defensive; disconnect of an already-detached
+      // node throws, which we ignore).
+      if (gainNode) {
+        try {
+          gainNode.disconnect();
+        } catch {
+          // Already disconnected by the channel handler.
+        }
+      }
       this.activeNodes.delete(node);
     };
-    node.onended = cleanup;
   }
   
   /**
@@ -465,13 +490,13 @@ export class GameBoyAPU {
     }
     this.scheduledNoteCount = 0;
   }
-  
+
   /**
    * Stop all currently playing and scheduled sounds immediately.
    */
   stopAll(): void {
     const now = this.audioContext.currentTime;
-    
+
     // Stop all tracked nodes
     for (const node of this.activeNodes) {
       try {
@@ -481,7 +506,15 @@ export class GameBoyAPU {
       }
     }
     this.activeNodes.clear();
-    
+
+    // Reset the noise channels' own session state: disconnect any voices the
+    // APU may not be tracking (e.g. direct playKick/playSnare calls) and drop
+    // their buffer caches so buffers from the stopped session cannot affect
+    // the next play/export.
+    for (const channel of this.noiseChannels.values()) {
+      channel.reset();
+    }
+
     // Reset channel states
     this.reset();
   }
