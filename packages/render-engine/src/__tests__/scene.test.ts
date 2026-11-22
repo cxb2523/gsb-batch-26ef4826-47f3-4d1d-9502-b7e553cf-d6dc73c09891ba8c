@@ -4,7 +4,7 @@ import { staticValue } from "@cutaway/types";
 import { createClip, createProject, createTrack } from "@cutaway/utils";
 import { createEllipseMask } from "@cutaway/mask-engine";
 import { createColorGrade } from "@cutaway/utils";
-import { resolveScene, sourceTimeFor, transitionOpacity } from "../scene";
+import { resolveScene, sourceTimeFor, transitionOpacity, transitionTailFrames } from "../scene";
 
 function videoContent(mediaId = "m1", speed = 1, sourceInFrame = 0) {
   return {
@@ -490,5 +490,62 @@ describe("resolveScene — transitions", () => {
     const byId = Object.fromEntries(scene.nodes.map((n) => [n.clipId, n.appearance.opacity]));
     expect(byId.out).toBeCloseTo(0.5);
     expect(byId.in).toBeCloseTo(0.5);
+  });
+
+  it("reports the tail window for the outgoing clip through the shared helper", () => {
+    const outgoing = createClip({
+      id: "out",
+      trackId: "t",
+      startFrame: 50,
+      durationFrames: 50,
+      content: videoContent(),
+    });
+    const incoming = (startFrame: number, durationFrames: number): Clip => ({
+      ...createClip({
+        id: "in",
+        trackId: "t",
+        startFrame,
+        durationFrames,
+        content: videoContent(),
+      }),
+      transitionIn: { kind: "crossfade", durationFrames },
+    });
+
+    // Exact cut: the incoming clip's transition length is the tail.
+    expect(transitionTailFrames(outgoing, incoming(100, 12))).toBe(12);
+    // Gap or genuine overlap: not a cut, so no tail.
+    expect(transitionTailFrames(outgoing, incoming(110, 12))).toBe(0);
+    expect(transitionTailFrames(outgoing, incoming(95, 12))).toBe(0);
+    // No next clip at all: nothing to reach back over.
+    expect(transitionTailFrames(outgoing, undefined)).toBe(0);
+  });
+
+  it("keeps the outgoing clip's audio sounding through its transition tail", () => {
+    // Audio on the outgoing clip's track: same cut, same window, same sound.
+    const track = createTrack({ id: "at", kind: "audio", index: 0 });
+    const outgoing = createClip({
+      id: "out",
+      trackId: track.id,
+      startFrame: 0,
+      durationFrames: 10,
+      content: audioContent("a1"),
+    });
+    const incoming: Clip = {
+      ...createClip({
+        id: "in",
+        trackId: track.id,
+        startFrame: 10,
+        durationFrames: 10,
+        content: audioContent("a2"),
+      }),
+      transitionIn: { kind: "crossfade", durationFrames: 4 },
+    };
+    const project = projectWith([track], [outgoing, incoming]);
+
+    // Frame 12 is two into the tail: the outgoing clip still sounds.
+    const soundingOut = resolveScene(project, 12).audio.some((a) => a.mediaId === "a1");
+    expect(soundingOut).toBe(true);
+    // Frame 14 is past the window: the outgoing clip is silent.
+    expect(resolveScene(project, 14).audio.some((a) => a.mediaId === "a1")).toBe(false);
   });
 });

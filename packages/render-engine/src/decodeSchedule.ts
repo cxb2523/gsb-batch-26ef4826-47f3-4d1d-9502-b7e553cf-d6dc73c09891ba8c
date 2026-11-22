@@ -12,6 +12,12 @@
  * asked in. It is pure and derived from the same `resolveScene` the render loop
  * uses, which is what guarantees the schedule matches what the loop actually
  * requests — one entry per request, in the same sequence.
+ *
+ * Because it derives from scene *nodes* rather than clip ranges, the outgoing
+ * clip's transition tail — the frames it is still drawn for past its own end
+ * while the next clip fades in — is planned like any other frame. Those requests
+ * appear in the same order the loop will make them, so the decoder stays in
+ * lockstep across a cut.
  */
 
 import type { Frame, Id, ProjectDocument } from "@cutaway/types";
@@ -30,7 +36,9 @@ export type VideoDecodeSchedule = Map<Id, number[]>;
  * A media that appears on several frames gets one entry per frame, and a media
  * used by two clips at once gets one entry per clip — the schedule mirrors
  * requests, not distinct times, so the consumer can pull exactly one decoded
- * frame per request and stay in lockstep.
+ * frame per request and stay in lockstep. Nothing is de-duplicated: if a clip's
+ * tail and the incoming clip both draw the same source on the same frame, the
+ * loop asks for it twice and so must the schedule.
  */
 export function planVideoDecodeSchedule(
   project: ProjectDocument,

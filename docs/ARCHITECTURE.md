@@ -239,6 +239,17 @@ rendered _past its own end_ (a tail) fading out, so the two overlap across the
 cut. `crossfade` dissolves them; `dip` routes both through black. Preview and
 export share the resolver, so a transition renders identically in both.
 
+Sound follows the same window. `transitionTailFrames()` names the tail length
+once, and both resolvers consume it: the visual resolver draws the outgoing
+clip through it, and `resolveAudioTimeline` keeps that clip _audible_ through it
+too, extending the placement's output/source span rather than cutting it off at
+the clip's own end. A crossfade therefore has both pictures and both sounds
+sounding across the cut — one clip heard during a transition is exactly a clip
+seen during it, and the export's audio stays aligned with the picture there. The
+export decode schedule derives from `resolveScene`'s nodes, so the outgoing
+clip's tail frames are planned as decode requests too, one per rendered frame
+and in the same order the render loop will ask.
+
 ## Other decisions, recorded so they are not silently relitigated
 
 - **Commands, not `setState`.** _(Revised — see "Undo/redo" above.)_ History

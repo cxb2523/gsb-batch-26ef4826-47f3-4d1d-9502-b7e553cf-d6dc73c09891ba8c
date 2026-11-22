@@ -11,8 +11,9 @@
  * Audio mixing lives in the adapters.
  */
 
-import type { Animatable, Clip, Frame, ProjectDocument, Unit } from "@cutaway/types";
+import type { Animatable, Clip, Frame, Id, ProjectDocument, Unit } from "@cutaway/types";
 import { evaluate } from "@cutaway/animation-engine";
+import { transitionTailFrames } from "./scene";
 
 /** The audio-bearing fields shared by audio clips and video clips. */
 interface ClipAudio {
@@ -78,6 +79,14 @@ export interface ResolvedAudioClip {
  * output-relative placements. Frames outside the range are clipped, and a clip
  * that starts before the range has its source in-point advanced accordingly, so
  * exporting a sub-range stays sample-accurate.
+ *
+ * A clip that is followed by a transition at an exact cut keeps sounding past
+ * its own end, through the same tail window the visual resolver draws it in
+ * ({@link transitionTailFrames}). The tail is contiguous in both output and
+ * source time, so it simply extends the placement's end — the source reads on
+ * from where the body left off, exactly as the picture does. Without this the
+ * outgoing side of a crossfade would fall silent at the cut while still on
+ * screen.
  */
 export function resolveAudioTimeline(
   project: ProjectDocument,
@@ -91,50 +100,68 @@ export function resolveAudioTimeline(
     (track) => track.kind === "audio" && track.solo,
   );
 
+  // Group by track and order by start so each clip can see the one that follows
+  // it on the same track — a transition is owned by the incoming clip and
+  // reaches *back* over the outgoing clip's end.
+  const clipsByTrack = new Map<Id, Clip[]>();
+  for (const clip of Object.values(entities.clips)) {
+    const list = clipsByTrack.get(clip.trackId);
+    if (list) list.push(clip);
+    else clipsByTrack.set(clip.trackId, [clip]);
+  }
+  for (const list of clipsByTrack.values()) {
+    list.sort((a, b) => a.startFrame - b.startFrame);
+  }
+
   const resolved: ResolvedAudioClip[] = [];
 
-  for (const clip of Object.values(entities.clips)) {
-    const audio = clipAudioOf(clip);
-    if (!audio) continue;
-    if (clip.hidden || audio.muted) continue;
-
-    const track = entities.tracks[clip.trackId];
+  for (const [trackId, trackClips] of clipsByTrack) {
+    const track = entities.tracks[trackId];
     if (!track) continue;
 
-    if (clip.content.kind === "audio") {
-      // Audio tracks honour solo/mute among themselves.
-      if (hasSoloedAudio ? !track.solo : track.muted) continue;
-    } else {
-      // A video clip lends its embedded audio only when the media actually has
-      // an audio stream, its track is not muted, and no audio track is soloed
-      // (a solo means "isolate that audio").
-      if (hasSoloedAudio || track.muted) continue;
-      if (!entities.media[audio.mediaId]?.metadata.hasAudio) continue;
-    }
+    trackClips.forEach((clip, index) => {
+      const audio = clipAudioOf(clip);
+      if (!audio) return;
+      if (clip.hidden || audio.muted) return;
 
-    const clipStart = clip.startFrame;
-    const clipEnd = clip.startFrame + clip.durationFrames;
+      if (clip.content.kind === "audio") {
+        // Audio tracks honour solo/mute among themselves.
+        if (hasSoloedAudio ? !track.solo : track.muted) return;
+      } else {
+        // A video clip lends its embedded audio only when the media actually has
+        // an audio stream, its track is not muted, and no audio track is soloed
+        // (a solo means "isolate that audio").
+        if (hasSoloedAudio || track.muted) return;
+        if (!entities.media[audio.mediaId]?.metadata.hasAudio) return;
+      }
 
-    // Intersect the clip with the export range.
-    const from = Math.max(clipStart, startFrame);
-    const to = Math.min(clipEnd, endFrame);
-    if (to <= from) continue;
+      const clipStart = clip.startFrame;
+      const clipEnd = clip.startFrame + clip.durationFrames;
+      // The outgoing clip stays audible through the next clip's transition
+      // window when the two meet at an exact cut.
+      const audibleEnd = clipEnd + transitionTailFrames(clip, trackClips[index + 1]);
 
-    // Frames of the clip skipped because the export starts mid-clip; the source
-    // must advance by that much (scaled by speed, as it consumes source faster).
-    const headFrames = from - clipStart;
-    const sourceInSeconds = (audio.sourceInFrame + headFrames * audio.speed) / fps;
+      // Intersect the *audible* span with the export range.
+      const from = Math.max(clipStart, startFrame);
+      const to = Math.min(audibleEnd, endFrame);
+      if (to <= from) return;
 
-    resolved.push({
-      clipId: clip.id,
-      mediaId: audio.mediaId,
-      startSeconds: (from - startFrame) / fps,
-      sourceInSeconds,
-      durationSeconds: (to - from) / fps,
-      speed: audio.speed,
-      gain: evaluate(audio.volume, from) * track.volume,
-      fadeInSeconds: audio.fadeInFrames / fps,
-      fadeOutSeconds: audio.fadeOutFrames / fps,
+      // Frames of the clip skipped because the export starts mid-clip (or
+      // mid-tail); the source must advance by that much, scaled by speed.
+      const headFrames = from - clipStart;
+      const sourceInSeconds = (audio.sourceInFrame + headFrames * audio.speed) / fps;
+
+      resolved.push({
+        clipId: clip.id,
+        mediaId: audio.mediaId,
+        startSeconds: (from - startFrame) / fps,
+        sourceInSeconds,
+        durationSeconds: (to - from) / fps,
+        speed: audio.speed,
+        gain: evaluate(audio.volume, from) * track.volume,
+        fadeInSeconds: audio.fadeInFrames / fps,
+        fadeOutSeconds: audio.fadeOutFrames / fps,
+      });
     });
   }
 

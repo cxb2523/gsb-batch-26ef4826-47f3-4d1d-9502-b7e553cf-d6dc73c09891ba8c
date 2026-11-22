@@ -172,6 +172,41 @@ function isClipActive(clip: Clip, frame: Frame): boolean {
 }
 
 /**
+ * True when an audio-bearing clip is sounding at `frame`: either within its own
+ * range, or in the transition tail the next clip pulls it through.
+ *
+ * The facsimile of {@link transitionOpacity} for sound — audibility rather than
+ * opacity, but over the same window — so a clip heard during a crossfade is
+ * exactly a clip seen during it.
+ */
+function isAudibleAt(clip: Clip, next: Clip | undefined, frame: Frame): boolean {
+  if (isClipActive(clip, frame)) return true;
+  const tailFrames = transitionTailFrames(clip, next);
+  const end = clip.startFrame + clip.durationFrames;
+  return tailFrames > 0 && frame >= end && frame < end + tailFrames;
+}
+
+/**
+ * How many frames past its own end a clip remains visible because the clip that
+ * follows it on the same track transitions in at an exact cut.
+ *
+ * The tail belongs to the *outgoing* clip but is driven by the incoming clip's
+ * `transitionIn`. Zero when there is no transition or the clips do not share an
+ * exact boundary (a gap or an overlap is not a cut).
+ *
+ * Shared by the visual resolver and the audio resolver: video and sound must
+ * agree on how far a clip reaches across the cut, or the export drifts out of
+ * sync exactly where a transition is most visible.
+ */
+export function transitionTailFrames(clip: Clip, next: Clip | undefined): number {
+  const transition = next?.transitionIn;
+  if (!next || !transition || transition.durationFrames <= 0) return 0;
+  const end = clip.startFrame + clip.durationFrames;
+  // Only an exact cut crossfades; a gap or a genuine overlap is not a cut.
+  return next.startFrame === end ? transition.durationFrames : 0;
+}
+
+/**
  * The opacity multiplier for a clip at `frame` under the transition model, or
  * null when the clip is not visible at all.
  *
@@ -199,17 +234,10 @@ export function transitionOpacity(clip: Clip, next: Clip | undefined, frame: Fra
   }
 
   // Outgoing tail: the next clip's transition pulls this one past its end.
-  const nextTransition = next?.transitionIn;
-  if (
-    next &&
-    nextTransition &&
-    nextTransition.durationFrames > 0 &&
-    next.startFrame === end && // only an exact cut crossfades
-    frame >= end &&
-    frame < end + nextTransition.durationFrames
-  ) {
-    const t = (frame - end) / nextTransition.durationFrames;
-    return nextTransition.kind === "dip" ? Math.max(0, 1 - t * 2) : 1 - t;
+  const tailFrames = transitionTailFrames(clip, next);
+  if (tailFrames > 0 && frame >= end && frame < end + tailFrames) {
+    const t = (frame - end) / tailFrames;
+    return next?.transitionIn?.kind === "dip" ? Math.max(0, 1 - t * 2) : 1 - t;
   }
 
   return null;
@@ -379,7 +407,7 @@ export function resolveScene(project: ProjectDocument, frame: Frame): Scene {
 
     trackClips.forEach((clip, index) => {
       if (clip.content.kind === "audio") {
-        if (!isClipActive(clip, frame)) return;
+        if (!isAudibleAt(clip, trackClips[index + 1], frame)) return;
         const audible = hasSoloedAudio ? track.solo : !track.muted;
         if (!audible || clip.hidden) return;
 
