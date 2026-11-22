@@ -37,80 +37,106 @@ if (descElement) {
 	descElement.innerHTML = descElement.innerHTML.replace(urlEx, "<a href='$1'>$1</a>");
 }
 
-// ========== EMSCRIPTEN ==========
+// ========== EMSCRIPTEN / AUDIO LIFECYCLE ==========
 var playing = false;
-var gotError;
+var gotError = false;
 var audioCtx = false;
-var scriptNode;
+var scriptNode = false;
+// guards against overlapping play() calls (e.g. rapid clicks) so that
+// two audio contexts can never be live at the same time
+var isStarting = false;
 
+var disconnectScriptNode = function() {
+	if (!scriptNode) return;
+	try { scriptNode.onaudioprocess = null; } catch (e) {}
+	try { scriptNode.disconnect(); } catch (e) {}
+	scriptNode = false;
+};
+
+// Fully tear down the current audio context and its script processing node.
+// Safe to call repeatedly and when nothing is playing.
 var cleanupStopAudio = function() {
+	disconnectScriptNode();
 	if (audioCtx) {
-		audioCtx.suspend();
-		audioCtx.close();
+		var ctxToClose = audioCtx;
+		audioCtx = false;
+		try { ctxToClose.suspend(); } catch (e) {}
+		try { ctxToClose.close(); } catch (e) {}
 	}
-	audioCtx = false;
-}
+	playing = false;
+	isStarting = false;
+	if (playButton)
+		playButton.classList.remove("playing");
+};
+
+var makeScriptNode = function(stereo) {
+	// buf size, input channels, output channels
+	scriptNode = audioCtx.createScriptProcessor(4096, 0, stereo ? 2 : 1);
+	scriptNode.onaudioprocess = function(evt) {
+		var num_frames = evt.outputBuffer.length;
+		var ptr = stereo ? sporthem_process_stereo(num_frames) : sporthem_process(num_frames);
+		if (!ptr) return;
+		var num_channels = evt.outputBuffer.numberOfChannels;
+		for (var chidx = 0; chidx < num_channels; chidx++) {
+			var ch = evt.outputBuffer.getChannelData(chidx);
+			for (var i = 0; i < num_frames; i++) {
+				ch[i] = HEAPF32[(ptr>>2) + ((num_channels*i)+chidx)]
+			}
+		}
+	}
+	scriptNode.connect(audioCtx.destination);
+};
 
 var initStartAudio = function () {
 	audioCtx = new AudioContext({sampleRate: 44100});
-	// buf size, input channels, outpout channels
-	scriptNode = audioCtx.createScriptProcessor(4096, 0, 1);
-	console.log(scriptNode.bufferSize);
-	scriptNode.onaudioprocess = function(evt) {
-		var num_frames = evt.outputBuffer.length;
-		var ptr = sporthem_process(num_frames);
-		if (!ptr) return;
-		var num_channels = evt.outputBuffer.numberOfChannels;
-		for (var chidx = 0; chidx < num_channels; chidx++) {
-			var ch = evt.outputBuffer.getChannelData(chidx);
-			for (var i = 0; i < num_frames; i++) {
-				ch[i] = HEAPF32[(ptr>>2) + ((num_channels*i)+chidx)]
-			}
-		}
-	}
-	scriptNode.connect(audioCtx.destination);
-}
+	makeScriptNode(false);
+};
 
 var initStartAudioStereo = function () {
 	audioCtx = new AudioContext({sampleRate: 44100});
-	// buf size, input channels, outpout channels
-	scriptNode = audioCtx.createScriptProcessor(4096, 0, 2);
-	console.log(scriptNode.bufferSize);
-	scriptNode.onaudioprocess = function(evt) {
-		var num_frames = evt.outputBuffer.length;
-		var ptr = sporthem_process_stereo(num_frames);
-		if (!ptr) return;
-		var num_channels = evt.outputBuffer.numberOfChannels;
-		for (var chidx = 0; chidx < num_channels; chidx++) {
-			var ch = evt.outputBuffer.getChannelData(chidx);
-			for (var i = 0; i < num_frames; i++) {
-				ch[i] = HEAPF32[(ptr>>2) + ((num_channels*i)+chidx)]
-			}
-		}
-	}
-	scriptNode.connect(audioCtx.destination);
-}
+	makeScriptNode(true);
+};
 
 
 window.masher_stereo = false;
 var play = function () {
+	// a start sequence is already in progress: never stack a second one
+	if (isStarting) return;
+	// completely release any audio context / nodes left from the previous play
 	cleanupStopAudio();
 	gotError = false;
-	playButton.classList.add("playing");
-	sporthem_compile(editor.getValue().replace(/\t/g , " "));
+	isStarting = true;
+	if (playButton)
+		playButton.classList.add("playing");
+	try {
+		sporthem_compile(editor.getValue().replace(/\t/g , " "));
+		// compile errors are reported through Module.printErr
+		if (gotError)
+			throw new Error("sporth compile error");
+		if (editor.getValue().startsWith('# stereo')) {
+			window.masher_stereo = true;
+			initStartAudioStereo();
+		} else {
+			window.masher_stereo = false;
+			initStartAudio();
+		}
+	} catch (err) {
+		// make sure the button and state return to "ready to play"
+		cleanupStopAudio();
+		return;
+	}
+	if (gotError) {
+		cleanupStopAudio();
+		return;
+	}
+	// (re)build sliders from the script that is actually playing and push
+	// their current values into the audio engine
 	parseParams();
-	if (editor.getValue().startsWith('# stereo'))
-		initStartAudioStereo();
-	else
-		initStartAudio();
 	playing = true;
+	isStarting = false;
 };
 var stop = function() {
-	if (playing) {
-		cleanupStopAudio();
-		playing = false;
-		playButton.classList.remove("playing");
-	}
+	cleanupStopAudio();
 };
 var Module = {
 	print: function(text) {
@@ -118,7 +144,9 @@ var Module = {
 	printErr: function(text) {
 		showError(text);
 		gotError = true;
-		playButton.classList.remove("playing");
+		// a compile/runtime error must always leave the app in a clean,
+		// playable state with the button matching the real audio state
+		cleanupStopAudio();
 	},
 	onRuntimeInitialized: function () {
 		cwrap('sporthem_init', 'number')();
@@ -142,7 +170,8 @@ function showError(err) {
 	errorContainer.appendChild(errDiv);
 	tipDiv.classList.remove("on");
 	window.setTimeout(function() {
-		errorContainer.removeChild(errDiv);
+		if (errDiv.parentNode === errorContainer)
+			errorContainer.removeChild(errDiv);
 	}, 3000);
 }
 
@@ -222,6 +251,28 @@ if (url.pathname == "/new" && urlScript != null)
 
 
 // ========== CONTROLS ==========
+var slidersDiv = document.getElementById("sliders");
+var noParamsDiv = document.getElementById("no_params");
+var firstParse = true;
+// live values of the parameter sliders, keyed by parameter name
+var sliderValues = {};
+// re-parse the current editor script, (re)build every parameter slider and
+// push the current slider values into the running audio engine
+function parseParams() {
+	if (!slidersDiv) return;
+	sliderValues = sporthParam_createSliders(slidersDiv, editor.getValue(), sliderValues);
+	sporthParam_setPvalues(editor.getValue(), sliderValues);
+	if (slidersDiv.innerHTML === "")
+		noParamsDiv.className = "";
+	else
+		noParamsDiv.className = "nodisplay";
+	if (firstParse) {
+		firstParse = false;
+		if (Object.keys(sliderValues).length == 0) return;
+		document.body.classList.toggle("paramson");
+		editor.refresh();
+	}
+}
 if (editor) {
 	if (helpButton)
 		helpButton.addEventListener('click', function() {
@@ -241,44 +292,88 @@ if (editor) {
 	stopButton.addEventListener('click', function() {
 		stop();
 	});
-	var slidersDiv = document.getElementById("sliders");
-	var noParamsDiv = document.getElementById("no_params");
-	var firstParse = true;
-	sliderValues = {};
-	function parseParams() {
-		if (!slidersDiv) return;
-		sliderValues = sporthParam_createSliders(slidersDiv, editor.getValue(), sliderValues);
-		sporthParam_setPvalues(editor.getValue(), sliderValues);
-		if (slidersDiv.innerHTML === "")
-			noParamsDiv.className = "";
-		else
-			noParamsDiv.className = "nodisplay";
-		if (firstParse) {
-			firstParse = false;
-			if (Object.keys(sliderValues).length == 0) return;
-			document.body.classList.toggle("paramson");
-			editor.refresh();
-		}
-	}
 }
 
 
-// ========== AUTOSAVE ==========
+// ========== AUTOSAVE (per-patch identity) ==========
+// Each editable context keeps its own draft in localStorage, keyed by its
+// identity:
+//   - a brand new patch ("/new", "/continue")      -> "new"
+//   - an existing patch ("/patch/<id>")            -> "patch:<id>"
+//   - the interactive tutorial ("/learn/...")      -> "learn"
+// Tutorial drafts live under their own key and can never overwrite the
+// drafts of the user's own new or existing patches.
+var DRAFT_STORE_PREFIX = 'AudioMasher_draft_';
+var LEGACY_DRAFT_KEY = 'AudioMasher_last_patch';
+
+function getCurrentDraftKey() {
+	var patchIdElement = document.getElementById('PId');
+	if (patchIdElement && patchIdElement.textContent)
+		return DRAFT_STORE_PREFIX + 'patch:' + patchIdElement.textContent;
+	if (url.pathname === '/new' || url.pathname === '/continue')
+		return DRAFT_STORE_PREFIX + 'new';
+	if (url.pathname === '/learn' || url.pathname.indexOf('/learn/') === 0)
+		return DRAFT_STORE_PREFIX + 'learn';
+	return null;
+}
+function readDraft(key) {
+	if (key === null) return null;
+	return localStorage.getItem(key);
+}
+// Migrate the single legacy draft once, so existing users do not lose their
+// saved work when the per-patch draft storage is introduced.
+(function migrateLegacyDraft() {
+	var legacy = localStorage.getItem(LEGACY_DRAFT_KEY);
+	if (legacy === null) return;
+	var newKey = DRAFT_STORE_PREFIX + 'new';
+	if (localStorage.getItem(newKey) === null)
+		localStorage.setItem(newKey, legacy);
+	localStorage.removeItem(LEGACY_DRAFT_KEY);
+})();
+
 var restoreLink = document.querySelector('.restore_link');
-window.setInterval(autoSave, 10000);
+var currentDraftKey = getCurrentDraftKey();
 var changed = false;
+
 function autoSave() {
+	// only pages with an editor and a draft identity can autosave;
+	// the tutorial writes to its own "learn" key, never to user patch drafts
+	if (!currentDraftKey || !editor) return;
 	if (changed) {
-		localStorage.setItem('AudioMasher_last_patch', editor.getValue());
+		localStorage.setItem(currentDraftKey, editor.getValue());
 		changed = false;
-		restoreLink.classList.remove("on");
+		if (restoreLink)
+			restoreLink.classList.remove("on");
 	}
 }
-if (localStorage.getItem('AudioMasher_last_patch') != null)
+window.setInterval(autoSave, 10000);
+
+// On editor pages the link restores *this* page's own draft in place;
+// on pages without an editor it keeps its original navigation behaviour
+// (the server renders the new-patch page and calls restoreAutosave()).
+if (restoreLink && currentDraftKey && readDraft(currentDraftKey) !== null)
 	restoreLink.classList.add("on");
+if (restoreLink && editor) {
+	restoreLink.addEventListener('click', function(event) {
+		event.preventDefault();
+		restoreAutosave();
+	});
+}
+
 function restoreAutosave() {
-	editor.setValue(localStorage.getItem('AudioMasher_last_patch'));
-	restoreLink.classList.remove("on");
+	if (!editor) return;
+	var draft = readDraft(currentDraftKey);
+	if (draft === null) return;
+	// rebuild sliders from the restored script rather than from any
+	// slider state left over from a previous script
+	sliderValues = {};
+	editor.setValue(draft);
+	// re-parse the restored script so the sliders match its parameters,
+	// and push the (script-derived) slider values into the audio engine
+	parseParams();
+	if (restoreLink)
+		restoreLink.classList.remove("on");
+	changed = false;
 }
 
 
