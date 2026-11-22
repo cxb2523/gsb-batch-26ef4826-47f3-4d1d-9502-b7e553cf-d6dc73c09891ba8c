@@ -271,4 +271,97 @@ json.dump({"penalties": False}, open(os.path.join(_d, "freight.json"), "w"))
 _old = F.Freight(lambda c: None, _d)
 ok(not _old.damage and not _old.late and _old.tickets, "an older save's single penalties switch carries over to damage and late")
 
+# --- place resolving: timeouts, late replies, restarts
+def fresh():
+    """A helper mid-session: truck picked, market built, the game talking."""
+    f = F.Freight(lambda cmds: sent.extend(cmds), tempfile.mkdtemp())
+    f.models = fr.models
+    f.update(pose(45.4215, -75.6972))
+    f.on_hello({"type": "hello", "rr": F.MOD_REQUIRED})
+    f.select_truck("percheron", "xl500_6x4_fifthwheel_m")
+    f.set_market("Ottawa", refresh=True)
+    return f
+
+def answer(f, c, places=()):
+    f.on_places({"type": "places", "id": c["id"], "complete": True, "pending": False, "places": list(places)})
+
+# normal resolve: every query answered, the real places are used
+f = fresh()
+off = next(o for o in f.board()["offers"] if o["fits"])
+sent.clear()
+ok(f.start(off["id"]) == (True, "") and f.state == "resolving", "resolve: job accepted, places being found")
+qs = cmds("places")
+ok(len(qs) == 1 + len(off["stops"]) and len(f.pending) == len(qs), "resolve: one query per point, all of them pending")
+town_pts = [(p["lat"], p["lon"]) for p in f.job["pts"]]
+for c in qs:
+    answer(f, c, [{"id": "x", "name": f"Real place {c['id']}", "lat": c["lat"] + 0.003, "lon": c["lon"] - 0.002, "confidence": 0.9}])
+ok(f.state == "spawning" and all(p.get("real") for p in f.job["pts"]), "resolve: all answered with real places, the truck is spawned")
+ok(not f.pending, "resolve: nothing left pending once every point is found")
+
+# a query that never gets an answer times out on its own: that point keeps the town's coordinates
+f = fresh()
+off = next(o for o in f.board()["offers"] if o["fits"])
+sent.clear()
+f.start(off["id"])
+qs = cmds("places")
+answer(f, qs[0], [{"id": "x", "name": "Depot", "lat": qs[0]["lat"] + 0.002, "lon": qs[0]["lon"], "confidence": 0.9}])
+ok(f.state == "resolving" and f.job["pts"][0].get("real"), "timeout: one answer is not all of them")
+town_pts = [(p["lat"], p["lon"]) for p in f.job["pts"]]
+clock[0] += F.RESOLVE_S + 1
+f.update(pose(45.4215, -75.6972))
+ok(f.state == "spawning" and all(p["resolved"] for p in f.job["pts"]), "timeout: unanswered queries time out and the job goes on")
+ok(all((p["lat"], p["lon"]) == t for p, t in zip(f.job["pts"][1:], town_pts[1:])), "timeout: unanswered points keep the town's own coordinates")
+ok(not f.pending, "timeout: the timed-out queries are forgotten")
+late = {"type": "places", "id": qs[1]["id"], "complete": True, "pending": False,
+        "places": [{"id": "x", "name": "Too late", "lat": 50.0, "lon": -100.0, "confidence": 0.9}]}
+f.on_places(late)
+ok(all((p["lat"], p["lon"]) == t for p, t in zip(f.job["pts"][1:], town_pts[1:])), "timeout: a reply after the timeout changes nothing")
+
+# cancel, then take the same job again at once: the old job's late replies must not touch the new one
+f = fresh()
+off = next(o for o in f.board()["offers"] if o["fits"])
+sent.clear()
+f.start(off["id"])
+old_qs = list(cmds("places"))
+ok(f.cancel()[0] and f.state == "idle" and not f.pending, "cancel: the job's pending queries are forgotten")
+ok(f.on_places({"type": "places", "id": old_qs[0]["id"], "complete": True, "pending": False, "places": []}) is False,
+   "cancel: a late reply is no longer freight's")
+f.update(pose(45.4215, -75.6972))
+sent.clear()
+ok(f.start(off["id"]) == (True, ""), "cancel: the same job can be taken again at once")
+new_qs = cmds("places")
+ok(all(c["id"] not in {c["id"] for c in old_qs} for c in new_qs), "cancel: the new job's queries have fresh ids")
+pts0 = [(p["lat"], p["lon"], p["name"]) for p in f.job["pts"]]
+for c in old_qs:
+    answer(f, c, [{"id": "x", "name": "Stale", "lat": 50.0, "lon": -100.0, "confidence": 0.9}])
+ok(f.state == "resolving" and [(p["lat"], p["lon"], p["name"]) for p in f.job["pts"]] == pts0,
+   "cancel: late replies from the old job do not touch the new one")
+for c in new_qs:
+    answer(f, c)
+ok(f.state == "spawning" and not f.pending, "cancel: the new job resolves on its own queries")
+
+# the game restarts mid-resolve: the unanswered points are asked about again, with a fresh window
+f = fresh()
+off = next(o for o in f.board()["offers"] if o["fits"])
+sent.clear()
+f.start(off["id"])
+q1 = list(cmds("places"))
+answer(f, q1[0], [{"id": "x", "name": "Depot", "lat": q1[0]["lat"] + 0.002, "lon": q1[0]["lon"], "confidence": 0.9}])
+clock[0] += 13                                          # the game goes quiet (it says hello every 5 s)
+sent.clear()
+f.on_hello({"type": "hello", "rr": F.MOD_REQUIRED})
+q2 = cmds("places")
+left = [p for p in f.job["pts"] if not p["resolved"]]
+ok(len(q2) == len(left) and len(q2) == len(q1) - 1, "restart: the points still unresolved are asked about again")
+ok(all(c["id"] not in {c["id"] for c in q1} for c in q2), "restart: ...with fresh query ids")
+ok(f.on_places({"type": "places", "id": q1[1]["id"], "complete": True, "pending": False, "places": []}) is False,
+   "restart: a reply to a pre-restart query is dropped")
+clock[0] += F.RESOLVE_S - 2
+f.update(pose(45.4215, -75.6972))
+ok(f.state == "resolving", "restart: the re-asked queries get a fresh window, no early fallback")
+for c in q2:
+    answer(f, c)
+ok(f.state == "spawning" and not f.pending, "restart: answers to the re-asked queries finish the resolve")
+ok(f.job["pts"][0].get("real") and f.job["pts"][0]["name"] == "Depot", "restart: places found before the restart are kept")
+
 print("\nall freight tests passed")

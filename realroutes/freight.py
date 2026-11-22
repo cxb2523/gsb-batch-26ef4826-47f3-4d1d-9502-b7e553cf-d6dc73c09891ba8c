@@ -138,7 +138,7 @@ class Freight:
         self.events = []
         self.v = 1                           # bumped when the board's contents change, so the console refetches it
         self._q = 0
-        self.pending = {}                    # places request id -> (job id, stop index)
+        self.pending = {}                    # places request id -> (job id, stop index, sent at)
         self._asked_models = 0
         self._hello_at = 0.0
         self.mod_ver = None                  # what the running game's mod says it is (None: not heard yet)
@@ -534,6 +534,7 @@ class Freight:
             return False, why
         cargo = D.CARGO_BY_ID[offer["cargo"]]
         self.summary = None
+        self._drop_pending()                 # nothing from an earlier job may leak into this one
         pts = [dict(offer["from"])] + [dict(s) for s in offer["stops"]]
         for i, p in enumerate(pts):
             p["i"] = i
@@ -554,22 +555,28 @@ class Freight:
     def _ask(self, p, cats):
         self._q += 1
         qid = f"fq{self._q}"
-        self.pending[qid] = (self.job["id"], p["i"])
+        self.pending[qid] = (self.job["id"], p["i"], time.time())
         self.send([{"cmd": "places", "id": qid, "lat": p["lat"], "lon": p["lon"], "radius": 1800, "categories": cats,
                     "limit": 60, "cachedOnly": False}])
+
+    def _drop_pending(self, job_id=None):
+        """Forget place queries still waiting on an answer: the job is over (cancelled, failed, done, superseded)
+        or its queries died with a restarted game. Nothing may accumulate here across jobs."""
+        self.pending = {q: v for q, v in self.pending.items() if job_id is not None and v[0] != job_id}
 
     def on_places(self, m):
         key = self.pending.get(m.get("id"))
         if not key:
             return False
+        jid, i = key[0], key[1]
         if m.get("complete") or not m.get("pending"):
             self.pending.pop(m.get("id"), None)
         j = self.job
-        if not j or j["id"] != key[0] or self.state != "resolving":
-            return True
-        p = j["pts"][key[1]]
+        if not j or j["id"] != jid or self.state != "resolving":
+            return True                               # a late answer to a job that has moved on: swallowed, not used
+        p = j["pts"][i]
         if p["resolved"]:
-            return True
+            return True                               # one point, one answer: a repeat changes nothing
         good = [x for x in m.get("places", []) if x.get("name") and x.get("open") != "permanently_closed"
                 and (x.get("confidence") is None or x["confidence"] >= 0.6)]
         if good:
@@ -581,6 +588,32 @@ class Freight:
             self._spawn()
         return True
 
+    def _resolve_tick(self, now):
+        """While places are being found: every query has its own timeout (an unanswered point falls back to the
+        town's own point), and the phase as a whole has a hard cap, so a job can never wait forever."""
+        j = self.job
+        if not j:
+            return
+        for qid, (jid, i, at) in list(self.pending.items()):
+            if jid == j["id"] and now - at > RESOLVE_S:
+                self.pending.pop(qid, None)
+                j["pts"][i]["resolved"] = True        # no answer in time: the town's own point stands
+        if all(p["resolved"] for p in j["pts"]):
+            self._spawn()
+        elif now - j["resolve_at"] > RESOLVE_S:
+            self._fallback()
+
+    def _reask(self):
+        """The game restarted while places were being found: its answers will never come, so ask again for the
+        points still unresolved and give the new round a fresh window."""
+        j = self.job
+        self._drop_pending(j["id"])
+        j["resolve_at"] = time.time()
+        cargo = D.CARGO_BY_ID[j["cargo_cat"]]
+        for p in j["pts"]:
+            if not p["resolved"]:
+                self._ask(p, cargo["src"] if p["i"] == 0 else cargo["dst"])
+
     def _fallback(self):
         for p in self.job["pts"]:
             p["resolved"] = True
@@ -588,6 +621,7 @@ class Freight:
 
     def _spawn(self):
         j = self.job
+        self._drop_pending(j["id"])                    # resolving is over: no answer is still wanted
         o = j["offer"]
         cargo = D.CARGO_BY_ID[o["cargo"]]
         cands = D.trailer_candidates(cargo, D.family(j["truck"]["model"])) if cargo["needs"] in ("tractor", "drawbar", "light") else []
@@ -670,6 +704,7 @@ class Freight:
 
     def _fail(self, why):
         j = self.job
+        self._drop_pending()
         self.note("bad", why)
         self.send([{"cmd": "notify", "text": why, "secs": 9}, {"cmd": "markers", "stops": []}, {"cmd": "gpsClear"}, {"cmd": "freightClear"}])
         self.state = "idle"
@@ -742,7 +777,9 @@ class Freight:
         if (not self.models or now - self.models_at > 86400) and now - self._asked_models > 60:
             self._asked_models = now
             self.send([{"cmd": "vehicles"}])
-        if restarted and self.job and self.state == "driving":
+        if restarted and self.job and self.state == "resolving":
+            self._reask()
+        elif restarted and self.job and self.state == "driving":
             self._leg_cmds()
         elif restarted and self.job and self.state == "to_pickup":
             self._pickup_cmds()
@@ -754,8 +791,7 @@ class Freight:
         self.pose = m | {"_at": now}
         self._tel(m)
         if self.state == "resolving":
-            if now - self.job["resolve_at"] > RESOLVE_S:
-                self._fallback()
+            self._resolve_tick(now)
             return
         if self.state == "spawning":
             if now - self.job["spawn_at"] > SPAWN_S:
@@ -912,6 +948,7 @@ class Freight:
 
     def _finish(self):
         j = self.job
+        self._drop_pending()
         o = j["offer"]
         s = self._score(j)
         fuel_l = 0.0
@@ -1004,6 +1041,7 @@ class Freight:
         if not self.active():
             return False, "No job to cancel"
         title = self.job["offer"]["title"]
+        self._drop_pending()
         self.send([{"cmd": "markers", "stops": []}, {"cmd": "gpsClear"}, {"cmd": "freightClear"}])
         self.note("warn", f"Cancelled {title}")
         self.state = "idle"
