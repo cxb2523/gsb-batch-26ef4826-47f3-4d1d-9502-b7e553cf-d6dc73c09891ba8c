@@ -45,17 +45,25 @@ describe('encode tasks (what the export worker runs)', () => {
     expect(() => encodeApng([new Uint8Array([1, 2, 3])], { ...frameDelay(12), plays: 0 })).toThrow();
   });
 
-  it('lists every buffer of a task once, even when two frames share one', () => {
+  it('transfers only the buffers the task holds whole: shared or partial views are left to be copied', () => {
     const shared = new Uint8ClampedArray(64);
-    const task: EncodeTask = { kind: 'gif', frames: [shared, shared.subarray(0, 16), new Uint8ClampedArray(8)], options };
-    expect(transferablesOf(task)).toHaveLength(2);
+    const own = new Uint8ClampedArray(8);
+    const task: EncodeTask = { kind: 'gif', frames: [shared, shared.subarray(0, 16), own], options };
+    expect(transferablesOf(task)).toEqual([own.buffer]);
+
+    // a frame that is a window into a bigger buffer: the rest of it may be the caller's, so the buffer is not transferred
+    const big = new Uint8ClampedArray(64);
+    const partial: EncodeTask = { kind: 'gif', frames: [big.subarray(8, 24)], options };
+    expect(transferablesOf(partial)).toEqual([]);
+
+    const both = new Uint8Array(4);
     const zip: EncodeTask = {
       kind: 'zip',
       files: [
-        { name: 'x', data: new Uint8Array(4) },
-        { name: 'y', data: new Uint8Array(4) },
+        { name: 'x', data: both },
+        { name: 'y', data: both.subarray(0, 2) },
       ],
     };
-    expect(transferablesOf(zip)).toHaveLength(2);
+    expect(transferablesOf(zip)).toEqual([]); // y's bytes are inside x's buffer: not transferred twice
   });
 });

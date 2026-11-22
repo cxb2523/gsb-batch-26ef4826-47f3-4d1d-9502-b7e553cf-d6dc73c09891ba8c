@@ -29,10 +29,25 @@ export function runEncodeTask(task: EncodeTask, onProgress?: (fraction: number) 
   }
 }
 
-/** The buffers a task owns, to hand to the worker instead of copying (each one once: two views may share a buffer). */
+/**
+ * The buffers to hand to the worker instead of copying: only those the task has to itself. A buffer that two frames (or files) share is left
+ * out, because transferring it would detach the other view as well, and the caller would then read empty data from it. The same goes for a
+ * frame that is only a window into a larger buffer: the rest of that buffer may well be the caller's. Such buffers are copied by the
+ * structured clone instead, which keeps every view of the caller valid. Each buffer appears once (a duplicate in the transfer list makes the
+ * clone fail), and buffers of a SharedArrayBuffer are never listed (they cannot be transferred).
+ */
 export function transferablesOf(task: EncodeTask): ArrayBuffer[] {
   const views: ArrayBufferView[] = task.kind === 'zip' ? task.files.map((f) => f.data) : task.frames;
-  const seen = new Set<ArrayBuffer>();
-  for (const v of views) if (v.buffer instanceof ArrayBuffer) seen.add(v.buffer);
-  return [...seen];
+  const uses = new Map<ArrayBuffer, number>();
+  for (const v of views) {
+    const buffer = v.buffer;
+    if (buffer instanceof ArrayBuffer) uses.set(buffer, (uses.get(buffer) ?? 0) + 1);
+  }
+  const owned: ArrayBuffer[] = [];
+  for (const [buffer, count] of uses) {
+    // referenced once, and by a view that covers it whole: nobody else can be holding it
+    const whole = views.every((v) => v.buffer !== buffer || (v.byteOffset === 0 && v.byteLength === buffer.byteLength));
+    if (count === 1 && whole) owned.push(buffer);
+  }
+  return owned;
 }

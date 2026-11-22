@@ -42,6 +42,8 @@ export function ExportAnimation() {
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const cancel = useRef(false);
+  /** The export run that owns the progress bar: a run that was cancelled must not write to it any more. */
+  const runToken = useRef<symbol | null>(null);
   /** The encoder that is running in the worker, to stop it with Cancel. */
   const job = useRef<EncodeJob | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -95,23 +97,30 @@ export function ExportAnimation() {
     if (!prepared || !anim || progress !== null) return;
     cancel.current = false;
     setProgress(0);
+    // this run's token: a progress or a result that arrives after Cancel (or after a newer run started) must not touch the window
+    const runId = Symbol('export run');
+    runToken.current = runId;
+    const live = () => runToken.current === runId && !cancel.current;
+    const report = (fraction: number) => {
+      if (live()) setProgress(fraction);
+    };
     const base = (doc.name || 'skeleton').replace(/[^\w-]+/g, '_') + '-' + anim.name.replace(/[^\w-]+/g, '_');
     try {
       if (format === 'webm') {
         const blob = await framesToWebm(
           prepared,
-          (n) => setProgress(n / prepared.count),
+          (n) => report(n / prepared.count),
           () => cancel.current,
         );
-        if (!cancel.current) downloadBlob(blob, `${base}.webm`);
+        if (live()) downloadBlob(blob, `${base}.webm`);
       } else if (format === 'gif') {
         const frames: Uint8ClampedArray[] = [];
-        for (let i = 0; i < prepared.count && !cancel.current; i++) {
+        for (let i = 0; i < prepared.count && live(); i++) {
           frames.push(new Uint8ClampedArray(prepared.frame(i).data));
-          setProgress((i + 1) / prepared.count / 2);
+          report((i + 1) / prepared.count / 2);
           await sleep();
         }
-        if (!cancel.current) {
+        if (live()) {
           // the frames are handed to the worker: the window stays alive while the colors are chosen and the pixels packed
           job.current = encodeInWorker(
             {
@@ -119,47 +128,53 @@ export function ExportAnimation() {
               frames,
               options: { width: prepared.width, height: prepared.height, delayCs: 100 / prepared.fps, transparent: !solid },
             },
-            (f) => setProgress(0.5 + f / 2),
+            (f) => report(0.5 + f / 2),
           );
-          downloadBlob(new Blob([(await job.current.result) as BlobPart], { type: 'image/gif' }), `${base}.gif`);
+          const bytes = await job.current.result;
+          if (live()) downloadBlob(new Blob([bytes as BlobPart], { type: 'image/gif' }), `${base}.gif`);
         }
       } else if (format === 'apng') {
         const frames: Uint8Array[] = [];
-        for (let i = 0; i < prepared.count && !cancel.current; i++) {
+        for (let i = 0; i < prepared.count && live(); i++) {
           frames.push(await frameToPng(prepared.frame(i)));
-          setProgress((i + 1) / prepared.count);
+          report((i + 1) / prepared.count);
         }
-        if (!cancel.current) {
+        if (live()) {
           job.current = encodeInWorker({ kind: 'apng', frames, options: { ...frameDelay(prepared.fps), plays: 0 } });
-          downloadBlob(new Blob([(await job.current.result) as BlobPart], { type: 'image/apng' }), `${base}.png`);
+          const bytes = await job.current.result;
+          if (live()) downloadBlob(new Blob([bytes as BlobPart], { type: 'image/apng' }), `${base}.png`);
         }
       } else if (format === 'jpeg') {
         const files: { name: string; data: Uint8Array }[] = [];
-        for (let i = 0; i < prepared.count && !cancel.current; i++) {
+        for (let i = 0; i < prepared.count && live(); i++) {
           files.push({ name: `${base}_${String(i + 1).padStart(4, '0')}.jpg`, data: await frameToJpeg(prepared.frame(i)) });
-          setProgress((i + 1) / prepared.count);
+          report((i + 1) / prepared.count);
         }
-        if (!cancel.current) {
+        if (live()) {
           job.current = encodeInWorker({ kind: 'zip', files });
-          downloadBlob(new Blob([(await job.current.result) as BlobPart], { type: 'application/zip' }), `${base}-frames.zip`);
+          const bytes = await job.current.result;
+          if (live()) downloadBlob(new Blob([bytes as BlobPart], { type: 'application/zip' }), `${base}-frames.zip`);
         }
       } else {
         const files: { name: string; data: Uint8Array }[] = [];
-        for (let i = 0; i < prepared.count && !cancel.current; i++) {
+        for (let i = 0; i < prepared.count && live(); i++) {
           files.push({ name: `${base}_${String(i + 1).padStart(4, '0')}.png`, data: await frameToPng(prepared.frame(i)) });
-          setProgress((i + 1) / prepared.count);
+          report((i + 1) / prepared.count);
         }
-        if (!cancel.current) {
+        if (live()) {
           job.current = encodeInWorker({ kind: 'zip', files });
-          downloadBlob(new Blob([(await job.current.result) as BlobPart], { type: 'application/zip' }), `${base}-frames.zip`);
+          const bytes = await job.current.result;
+          if (live()) downloadBlob(new Blob([bytes as BlobPart], { type: 'application/zip' }), `${base}-frames.zip`);
         }
       }
-      if (!cancel.current) toast('Animation exported', 'ok');
+      if (live()) toast('Animation exported', 'ok');
     } catch (e) {
       if (!(cancel.current && (e as Error).message === CANCELLED)) toast((e as Error).message, 'error');
     } finally {
-      job.current = null;
-      setProgress(null);
+      if (runToken.current === runId) {
+        job.current = null;
+        setProgress(null);
+      }
     }
   };
 
