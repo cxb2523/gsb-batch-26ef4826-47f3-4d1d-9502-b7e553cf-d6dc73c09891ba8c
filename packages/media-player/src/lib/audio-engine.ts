@@ -19,12 +19,10 @@ export interface CdgAudioEngine {
   dispose(): void;
 }
 
-type SoundTouchNodeConstructor = new (
-  args: {
-    context: BaseAudioContext;
-    outputChannelCount?: 1 | 2;
-  },
-) => SoundTouchNodeLike;
+type SoundTouchNodeConstructor = new (args: {
+  context: BaseAudioContext;
+  outputChannelCount?: 1 | 2;
+}) => SoundTouchNodeLike;
 
 type SoundTouchNodeModule = {
   SoundTouchNode: SoundTouchNodeConstructor & {
@@ -122,6 +120,15 @@ class WorkletAudioEngine implements CdgAudioEngine {
   private workletNode: SoundTouchNodeLike | null = null;
   private initPromise: Promise<void> | null = null;
 
+  /**
+   * Requested parameters are remembered so they can be re-applied once the
+   * worklet graph finishes initializing (control changes may arrive before
+   * the first play call creates the graph).
+   */
+  private volume = 1;
+  private tempo = 1;
+  private pitchSemitones = 0;
+
   constructor({
     media,
     debug = false,
@@ -132,6 +139,9 @@ class WorkletAudioEngine implements CdgAudioEngine {
     this.media = media;
     this.logger = createScopedLogger({ scope: 'audio-engine', debug });
     this.fallback = new NativeAudioEngine({ media, debug });
+
+    this.volume = media.volume;
+    this.tempo = media.playbackRate;
   }
 
   async play(): Promise<void> {
@@ -169,6 +179,7 @@ class WorkletAudioEngine implements CdgAudioEngine {
   }
 
   setVolume({ value }: { value: number }): void {
+    this.volume = value;
     this.media.volume = value;
     if (this.gainNode) {
       this.gainNode.gain.value = value;
@@ -176,6 +187,7 @@ class WorkletAudioEngine implements CdgAudioEngine {
   }
 
   setTempo({ value }: { value: number }): void {
+    this.tempo = value;
     this.media.playbackRate = value;
 
     if (this.workletNode) {
@@ -191,6 +203,7 @@ class WorkletAudioEngine implements CdgAudioEngine {
   }
 
   setPitchSemitones({ value }: { value: number }): void {
+    this.pitchSemitones = value;
     if (this.workletNode) {
       this.workletNode.pitchSemitones.setValueAtTime(
         value,
@@ -295,25 +308,31 @@ class WorkletAudioEngine implements CdgAudioEngine {
         mediaElement.webkitPreservesPitch = false;
       }
 
-      workletNode.playbackRate.setValueAtTime(
-        this.media.playbackRate,
+      workletNode.playbackRate.setValueAtTime(this.tempo, context.currentTime);
+      workletNode.pitch.setValueAtTime(1, context.currentTime);
+      workletNode.pitchSemitones.setValueAtTime(
+        this.pitchSemitones,
         context.currentTime,
       );
-      workletNode.pitch.setValueAtTime(1, context.currentTime);
-      workletNode.pitchSemitones.setValueAtTime(0, context.currentTime);
 
       this.context = context;
       this.sourceNode = sourceNode;
       this.gainNode = gainNode;
       this.workletNode = workletNode;
+
+      // Settings may have been requested before the graph existed; mirror the
+      // latest requested values onto the freshly created nodes.
+      this.media.volume = this.volume;
+      this.media.playbackRate = this.tempo;
+      gainNode.gain.value = this.volume;
       this.logger.debug({ message: 'worklet:initialize-graph:ready' });
     } catch (err) {
       this.logger.debug({
         message: 'worklet:initialize-graph:fallback-native',
         errorValue: err,
       });
-      this.fallback.setVolume({ value: this.media.volume });
-      this.fallback.setPlaybackRate({ value: this.media.playbackRate });
+      this.fallback.setVolume({ value: this.volume });
+      this.fallback.setPlaybackRate({ value: this.tempo });
       void context.close();
     }
   }

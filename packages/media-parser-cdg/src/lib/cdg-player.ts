@@ -101,17 +101,24 @@ export class CDGPlayer {
 
   /**
    * Asynchronously parses and loads CD+G data in chunks to avoid long main-thread blocks.
+   *
+   * `shouldAbort` is polled between chunks; when it reports `true` the parse
+   * stops without mutating instructions or playback state, which lets callers
+   * discard results from superseded load requests.
    */
   async loadAsync({
     data,
     chunkPackets = DEFAULT_ASYNC_PARSE_CHUNK_PACKETS,
+    shouldAbort,
   }: {
     data: ByteLike;
     chunkPackets?: number;
+    shouldAbort?: () => boolean;
   }): Promise<CDGPlayer> {
     const parser = new CDGParser();
     const parsedInstructions: CdgInstructionLike[] = [];
     const packetsPerChunk = resolvePacketsPerChunk({ chunkPackets });
+    const aborted = (): boolean => shouldAbort?.() === true;
     let packetsSinceYield = 0;
 
     for (let offset = 0; offset < data.length; offset += PACKET_SIZE) {
@@ -121,7 +128,14 @@ export class CDGPlayer {
       if (packetsSinceYield >= packetsPerChunk) {
         packetsSinceYield = 0;
         await yieldToEventLoop();
+        if (aborted()) {
+          return this;
+        }
       }
+    }
+
+    if (aborted()) {
+      return this;
     }
 
     this.instructions = parsedInstructions;

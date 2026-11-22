@@ -326,4 +326,82 @@ describe('audio-engine', () => {
     expect(playSpy).toHaveBeenCalledOnce();
     expect(engine.initPromise).not.toBeNull();
   });
+
+  it('re-applies requested settings when the worklet graph initializes later', async () => {
+    const sourceConnect = vi.fn();
+    const gainConnect = vi.fn();
+
+    class MockAudioContext {
+      state: AudioContextState = 'running';
+      currentTime = 5;
+      audioWorklet = {};
+      destination = {} as AudioNode;
+
+      createMediaElementSource = vi.fn(
+        () =>
+          ({
+            connect: sourceConnect,
+            disconnect: vi.fn(),
+          }) as unknown as MediaElementAudioSourceNode,
+      );
+
+      createGain = vi.fn(
+        () =>
+          ({
+            gain: { value: 0 },
+            connect: gainConnect,
+            disconnect: vi.fn(),
+          }) as unknown as GainNode,
+      );
+
+      resume = vi.fn(async () => undefined);
+      close = vi.fn(async () => undefined);
+    }
+
+    vi.stubGlobal(
+      'AudioContext',
+      MockAudioContext as unknown as typeof AudioContext,
+    );
+    vi.stubGlobal(
+      'AudioWorkletNode',
+      class MockAudioWorkletNode {} as unknown as typeof AudioWorkletNode,
+    );
+
+    const audio = document.createElement('audio');
+    const playSpy = vi
+      .spyOn(audio, 'play')
+      .mockResolvedValue(undefined as unknown as void);
+
+    const engine = createAudioEngine({ audio, mode: 'worklet' }) as unknown as {
+      play: () => Promise<void>;
+      setVolume: (args: { value: number }) => void;
+      setTempo: (args: { value: number }) => void;
+      setPitchSemitones: (args: { value: number }) => void;
+      gainNode: { gain: { value: number } } | null;
+      workletNode: {
+        playbackRate: { setValueAtTime: ReturnType<typeof vi.fn> };
+        pitchSemitones: { setValueAtTime: ReturnType<typeof vi.fn> };
+      } | null;
+      dispose: () => void;
+    };
+
+    // Settings arrive before the graph exists (first play initializes it).
+    engine.setVolume({ value: 0.35 });
+    engine.setTempo({ value: 1.4 });
+    engine.setPitchSemitones({ value: -3 });
+
+    await engine.play();
+
+    expect(engine.gainNode?.gain.value).toBeCloseTo(0.35);
+    expect(engine.workletNode).not.toBeNull();
+    expect(
+      engine.workletNode?.playbackRate.setValueAtTime,
+    ).toHaveBeenCalledWith(1.4, 5);
+    expect(
+      engine.workletNode?.pitchSemitones.setValueAtTime,
+    ).toHaveBeenCalledWith(-3, 5);
+    expect(playSpy).toHaveBeenCalledOnce();
+
+    engine.dispose();
+  });
 });

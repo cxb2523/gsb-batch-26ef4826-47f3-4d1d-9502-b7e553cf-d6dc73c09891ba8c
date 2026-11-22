@@ -1689,4 +1689,401 @@ describe('player', () => {
 
     player.dispose();
   });
+
+  describe('load generation semantics', () => {
+    const createTrack = (
+      overrides: Partial<loaderModule.LoadedTrack> & {
+        trackId: string;
+      },
+    ): loaderModule.LoadedTrack => ({
+      sourceSummary: `${overrides.trackId}.zip`,
+      audioBuffer: new ArrayBuffer(8),
+      mediaKind: 'audio',
+      mediaMimeType: 'audio/mpeg',
+      audioMimeType: 'audio/mpeg',
+      hasGraphics: false,
+      cdgBytes: null,
+      metadata: { title: overrides.trackId, artist: 'a', album: 'b' },
+      warnings: [],
+      ...overrides,
+    });
+
+    const createDeferred = <T>(): {
+      promise: Promise<T>;
+      resolve: (value: T) => void;
+      reject: (reason: unknown) => void;
+    } => {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+
+    type DeferredLoaderInput = {
+      kind: 'arrayBuffer';
+      arrayBuffer: ArrayBuffer;
+      trackId?: string;
+    };
+
+    type DeferredTrack = ReturnType<
+      typeof createDeferred<loaderModule.LoadedTrack>
+    >;
+
+    const createHarness = (): {
+      canvas: HTMLCanvasElement;
+      audio: HTMLAudioElement;
+      video: HTMLVideoElement;
+      player: CdgPlayer;
+      deferredByTrackId: Map<string, DeferredTrack>;
+    } => {
+      vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+        () => {
+          const imageData = {
+            data: new Uint8ClampedArray(300 * 216 * 4),
+            width: 300,
+            height: 216,
+          } as unknown as ImageData;
+          return {
+            imageSmoothingEnabled: false,
+            clearRect: () => undefined,
+            drawImage: () => undefined,
+            createImageData: () => imageData,
+            putImageData: () => undefined,
+          } as unknown as CanvasRenderingContext2D;
+        },
+      );
+      vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(
+        () => undefined,
+      );
+      vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(
+        undefined as unknown as void,
+      );
+      // Media readiness is always satisfied so tests focus on load ordering.
+      Object.defineProperty(HTMLMediaElement.prototype, 'readyState', {
+        configurable: true,
+        get: () => HTMLMediaElement.HAVE_ENOUGH_DATA,
+      });
+
+      const canvas = document.createElement('canvas');
+      const audio = document.createElement('audio');
+      const video = document.createElement('video');
+      vi.spyOn(audio, 'load').mockImplementation(() => undefined);
+      vi.spyOn(video, 'load').mockImplementation(() => undefined);
+      vi.spyOn(video, 'canPlayType').mockReturnValue('probably');
+      Object.defineProperty(video, 'videoWidth', {
+        configurable: true,
+        get: () => 1280,
+      });
+      Object.defineProperty(video, 'videoHeight', {
+        configurable: true,
+        get: () => 720,
+      });
+
+      const deferredByTrackId = new Map<string, DeferredTrack>();
+
+      // Each load call parks on a deferred so tests control completion order.
+      const loader = {
+        load: vi.fn(async ({ input }: { input: DeferredLoaderInput }) => {
+          const deferred = createDeferred<loaderModule.LoadedTrack>();
+          deferredByTrackId.set(input.trackId ?? '', deferred);
+          return deferred.promise;
+        }),
+        probe: vi.fn(),
+        cancel: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as loaderModule.CdgLoader;
+
+      const player = createPlayer({
+        options: {
+          canvas,
+          audio,
+          video,
+          loader,
+          loadTransport: 'main-thread',
+        },
+      });
+
+      return { canvas, audio, video, player, deferredByTrackId };
+    };
+
+    const loadInput = ({ trackId }: { trackId: string }) => ({
+      input: {
+        kind: 'arrayBuffer' as const,
+        arrayBuffer: new ArrayBuffer(8),
+        trackId,
+      },
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    });
+
+    it('keeps only the last of out-of-order rapid loads', async () => {
+      const first = createTrack({
+        trackId: 'first',
+        hasGraphics: true,
+        cdgBytes: new Uint8Array(24),
+      });
+      const second = createTrack({
+        trackId: 'second',
+        hasGraphics: true,
+        cdgBytes: new Uint8Array(24),
+      });
+
+      const { audio, player, deferredByTrackId } = createHarness();
+      const createObjectUrlSpy = vi
+        .spyOn(URL, 'createObjectURL')
+        .mockImplementation((blob) => {
+          void blob;
+          return `blob:${createObjectUrlSpy.mock.calls.length}`;
+        });
+      const revokeObjectUrlSpy = vi
+        .spyOn(URL, 'revokeObjectURL')
+        .mockImplementation(() => undefined);
+
+      const firstLoad = player.load(loadInput({ trackId: 'first' }));
+      const secondLoad = player.load(loadInput({ trackId: 'second' }));
+
+      // Second (latest) request wins even though it finishes first.
+      deferredByTrackId.get('second')?.resolve(second);
+      await secondLoad;
+      expect(player.getState().status).toBe('ready');
+      expect(player.getState().trackId).toBe('second');
+      const latestSrc = audio.getAttribute('src');
+
+      // Stale request completing afterwards must be discarded entirely.
+      deferredByTrackId.get('first')?.resolve(first);
+      await firstLoad;
+
+      expect(player.getState().status).toBe('ready');
+      expect(player.getState().trackId).toBe('second');
+      expect(audio.getAttribute('src')).toBe(latestSrc);
+
+      player.dispose();
+      expect(revokeObjectUrlSpy).toHaveBeenCalled();
+    });
+
+    it('revokes the object URL of the track replaced by a newer load', async () => {
+      const first = createTrack({ trackId: 'first' });
+      const second = createTrack({ trackId: 'second' });
+
+      const { audio, player, deferredByTrackId } = createHarness();
+
+      let urlIndex = 0;
+      const created: string[] = [];
+      vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
+        urlIndex += 1;
+        const url = `blob:u${urlIndex}`;
+        created.push(url);
+        return url;
+      });
+      const revoked: string[] = [];
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => {
+        revoked.push(url);
+      });
+
+      const firstLoad = player.load(loadInput({ trackId: 'first' }));
+      deferredByTrackId.get('first')?.resolve(first);
+      await firstLoad;
+      expect(audio.getAttribute('src')).toBe(created[0]);
+
+      const secondLoad = player.load(loadInput({ trackId: 'second' }));
+      deferredByTrackId.get('second')?.resolve(second);
+      await secondLoad;
+
+      expect(revoked).toContain(created[0]);
+      expect(audio.getAttribute('src')).toBe(created[1]);
+
+      player.dispose();
+    });
+
+    it('revokes the bound URL of a superseded in-flight video load', async () => {
+      const videoTrack = createTrack({
+        trackId: 'slow-video',
+        mediaKind: 'video',
+        mediaMimeType: 'video/mp4',
+        audioMimeType: 'video/mp4',
+      });
+      const audioTrack = createTrack({ trackId: 'new-audio' });
+
+      const { audio, video, player, deferredByTrackId } = createHarness();
+
+      // Video never becomes ready, so that load parks waiting on canplay.
+      Object.defineProperty(video, 'readyState', {
+        configurable: true,
+        get: () => 0,
+      });
+
+      let urlIndex = 0;
+      const created: string[] = [];
+      vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
+        urlIndex += 1;
+        const url = `blob:u${urlIndex}`;
+        created.push(url);
+        return url;
+      });
+      const revoked: string[] = [];
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url: string) => {
+        revoked.push(url);
+      });
+
+      const stateChanges: unknown[] = [];
+      const errors: unknown[] = [];
+      player.addEventListener('statechange', () => stateChanges.push(1));
+      player.addEventListener('error', () => errors.push(1));
+
+      const videoLoad = player.load(loadInput({ trackId: 'slow-video' }));
+      deferredByTrackId.get('slow-video')?.resolve(videoTrack);
+      // Let the video load reach its media-readiness wait.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(video.getAttribute('src')).toBe(created[0]);
+
+      // A newer audio load supersedes the waiting video load.
+      const audioLoad = player.load(loadInput({ trackId: 'new-audio' }));
+      deferredByTrackId.get('new-audio')?.resolve(audioTrack);
+      await audioLoad;
+      await videoLoad;
+
+      expect(errors).toHaveLength(0);
+      expect(player.getState().status).toBe('ready');
+      expect(player.getState().trackId).toBe('new-audio');
+      expect(player['activeMedia']).toBe(audio);
+      // The superseded video load's URL is revoked and its element cleared.
+      expect(revoked).toContain(created[0]);
+      expect(video.getAttribute('src')).toBeNull();
+      expect(audio.getAttribute('src')).toBe(created[1]);
+
+      player.dispose();
+    });
+
+    it('ignores loads that resolve after dispose without binding media', async () => {
+      const track = createTrack({
+        trackId: 'late',
+        hasGraphics: true,
+        cdgBytes: new Uint8Array(24),
+      });
+      const { audio, player, deferredByTrackId } = createHarness();
+
+      const createObjectUrlSpy = vi
+        .spyOn(URL, 'createObjectURL')
+        .mockReturnValue('blob:late');
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+
+      const stateChanges: unknown[] = [];
+      const errors: unknown[] = [];
+      player.addEventListener('statechange', () => stateChanges.push(1));
+      player.addEventListener('error', () => errors.push(1));
+
+      const loadPromise = player.load(loadInput({ trackId: 'late' }));
+      const statesBeforeDispose = stateChanges.length;
+
+      player.dispose();
+      const stateCountAtDispose = stateChanges.length;
+      expect(stateCountAtDispose).toBeGreaterThanOrEqual(statesBeforeDispose);
+
+      deferredByTrackId.get('late')?.resolve(track);
+      await loadPromise;
+
+      // No statechange after dispose, no error event, no media binding.
+      expect(stateChanges).toHaveLength(stateCountAtDispose);
+      expect(errors).toHaveLength(0);
+      expect(createObjectUrlSpy).not.toHaveBeenCalled();
+      expect(audio.getAttribute('src')).toBeNull();
+      expect(player.getState().status).not.toBe('ready');
+    });
+
+    it('does not surface stale load errors as player errors', async () => {
+      const second = createTrack({ trackId: 'second' });
+      const { player, deferredByTrackId } = createHarness();
+
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:u');
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+
+      const errors: unknown[] = [];
+      player.addEventListener('error', () => errors.push(1));
+
+      const firstLoad = player.load(loadInput({ trackId: 'first' }));
+      const secondLoad = player.load(loadInput({ trackId: 'second' }));
+
+      deferredByTrackId.get('second')?.resolve(second);
+      await secondLoad;
+
+      const boom = new Error('stale failure');
+      deferredByTrackId.get('first')?.reject(boom);
+      await expect(firstLoad).rejects.toBe(boom);
+
+      expect(player.getState().status).toBe('ready');
+      expect(player.getState().trackId).toBe('second');
+      expect(errors).toHaveLength(0);
+
+      player.dispose();
+    });
+
+    it('only enters error for failures from the current generation', async () => {
+      const { player, deferredByTrackId } = createHarness();
+
+      const errors: unknown[] = [];
+      player.addEventListener('error', () => errors.push(1));
+
+      const loadPromise = player.load(loadInput({ trackId: 'only' }));
+      const boom = new Error('current failure');
+      deferredByTrackId.get('only')?.reject(boom);
+
+      await expect(loadPromise).rejects.toBe(boom);
+      expect(player.getState().status).toBe('error');
+      expect(errors).toHaveLength(1);
+
+      player.dispose();
+    });
+
+    it('replays volume, tempo, and pitch on the new audio engine after audio↔video switch', async () => {
+      const audioTrack = createTrack({ trackId: 'audio-1' });
+      const videoTrack = createTrack({
+        trackId: 'video-1',
+        mediaKind: 'video',
+        mediaMimeType: 'video/mp4',
+        audioMimeType: 'video/mp4',
+      });
+
+      const { audio, video, player, deferredByTrackId } = createHarness();
+
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:u');
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+
+      const audioLoad = player.load(loadInput({ trackId: 'audio-1' }));
+      deferredByTrackId.get('audio-1')?.resolve(audioTrack);
+      await audioLoad;
+
+      player.setVolume({ value: 0.42 });
+      player.setTempo({ value: 1.25 });
+      player.setPitchSemitones({ value: 3 });
+
+      const videoLoad = player.load(loadInput({ trackId: 'video-1' }));
+      deferredByTrackId.get('video-1')?.resolve(videoTrack);
+      await videoLoad;
+
+      expect(player['activeMedia']).toBe(video);
+      // Audio stage must be paused and cleared when video becomes active.
+      expect(audio.getAttribute('src')).toBeNull();
+      // Settings are re-applied to the element that now drives playback.
+      expect(video.volume).toBeCloseTo(0.42);
+      expect(video.playbackRate).toBeCloseTo(1.25);
+
+      const secondAudioLoad = player.load(loadInput({ trackId: 'audio-1' }));
+      deferredByTrackId.get('audio-1')?.resolve(audioTrack);
+      await secondAudioLoad;
+
+      expect(player['activeMedia']).toBe(audio);
+      // Video stage must be paused and cleared when audio becomes active.
+      expect(video.getAttribute('src')).toBeNull();
+      expect(audio.volume).toBeCloseTo(0.42);
+      expect(audio.playbackRate).toBeCloseTo(1.25);
+
+      player.dispose();
+    });
+  });
 });

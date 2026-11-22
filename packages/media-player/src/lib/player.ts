@@ -84,7 +84,11 @@ export interface PlayerStateChangeDetail {
 }
 
 type CdgCorePlayerAsyncLoad = CDGPlayer & {
-  loadAsync?: (args: { data: Uint8Array }) => Promise<CDGPlayer>;
+  loadAsync?: (args: {
+    data: Uint8Array;
+    chunkPackets?: number;
+    shouldAbort?: () => boolean;
+  }) => Promise<CDGPlayer>;
 };
 
 /**
@@ -115,8 +119,20 @@ export class CdgPlayer extends EventTarget {
   private activeMediaKind: LoadedTrackMediaKind = 'audio';
 
   private state: PlayerState = createInitialState();
+  /** Object URL currently committed to the active media element. */
   private currentObjectUrl: string | null = null;
+  /** Object URL created by an in-flight load that has not committed yet. */
+  private pendingObjectUrl: string | null = null;
   private hasGraphicsTrack = false;
+
+  /**
+   * Monotonic token identifying the most recent load request. Any async work
+   * started by an older request is discarded once this value moves on.
+   */
+  private loadGeneration = 0;
+  private disposed = false;
+  /** Callbacks that resolve in-flight media waits when their load is superseded. */
+  private readonly staleLoadWaiters = new Set<() => void>();
 
   /**
    * Creates a player bound to canvas/audio elements and optional strategy overrides.
@@ -193,15 +209,25 @@ export class CdgPlayer extends EventTarget {
   /**
    * Loads track assets and prepares playback for either karaoke (audio+graphics)
    * or audio-only content.
+   *
+   * Last request wins: when a newer `load` supersedes this one before it
+   * commits, the stale result resolves with its `LoadedTrack` but is otherwise
+   * discarded — no state change, no media rebinding, no `error` event.
    */
   async load({
     input,
     loaderOptions,
     autoplay = false,
   }: PlayerLoadOptions): Promise<LoadedTrack> {
-    this.applyState({ status: 'loading' });
+    // Latest request wins: any async work from an earlier generation is
+    // discarded when it completes.
+    const generation = this.beginLoadGeneration();
+    if (!this.disposed) {
+      this.applyState({ status: 'loading' });
+    }
     this.logger.debug({
       message: 'load:start',
+      generation,
       inputKind: input.kind,
       loadTransport: this.loadTransport,
       autoplay,
@@ -261,13 +287,37 @@ export class CdgPlayer extends EventTarget {
         });
       }
 
-      await this.attachLoadedTrack({ loadedTrack });
+      if (!this.isLoadCurrent({ generation })) {
+        this.logger.debug({
+          message: 'load:stale-result-discarded',
+          generation,
+          activeGeneration: this.loadGeneration,
+          trackId: loadedTrack.trackId,
+        });
+        return loadedTrack;
+      }
+
+      const attached = await this.attachLoadedTrack({
+        loadedTrack,
+        generation,
+      });
+      if (!attached || !this.isLoadCurrent({ generation })) {
+        this.logger.debug({
+          message: 'load:stale-result-discarded',
+          generation,
+          activeGeneration: this.loadGeneration,
+          trackId: loadedTrack.trackId,
+          disposed: this.disposed,
+        });
+        return loadedTrack;
+      }
+
       this.applyState({
         status: 'ready',
         trackId: loadedTrack.trackId,
       });
 
-      if (autoplay) {
+      if (autoplay && this.isLoadCurrent({ generation })) {
         await this.play();
       }
 
@@ -278,6 +328,17 @@ export class CdgPlayer extends EventTarget {
 
       return loadedTrack;
     } catch (errorValue: unknown) {
+      if (!this.isLoadCurrent({ generation })) {
+        // A superseded/disposed load must not poison the active request.
+        this.logger.debug({
+          message: 'load:stale-error-ignored',
+          generation,
+          activeGeneration: this.loadGeneration,
+          errorValue,
+        });
+        throw errorValue;
+      }
+
       this.logger.error({ message: 'load:error', errorValue });
       this.applyState({ status: 'error' });
       this.dispatchEvent(new CustomEvent('error', { detail: { errorValue } }));
@@ -289,6 +350,7 @@ export class CdgPlayer extends EventTarget {
    * Starts media playback and, when graphics exist, advances CDG frame playback.
    */
   async play(): Promise<void> {
+    const generation = this.loadGeneration;
     this.logger.debug({
       message: 'play:called',
       currentTime: this.activeMedia.currentTime,
@@ -310,6 +372,13 @@ export class CdgPlayer extends EventTarget {
     } catch (err) {
       this.logger.debug({ message: 'play:error', errorValue: err });
     }
+
+    // A load may have started while playback was being requested; in that case
+    // the newer request owns the observable state.
+    if (!this.isLoadCurrent({ generation })) {
+      return;
+    }
+
     if (this.hasGraphicsTrack) {
       this.cdgPlayer.play();
     }
@@ -425,6 +494,10 @@ export class CdgPlayer extends EventTarget {
    */
   dispose(): void {
     this.logger.debug({ message: 'dispose:start' });
+    this.disposed = true;
+    // Supersede every in-flight load so late results cannot bind media or
+    // emit state notifications after teardown.
+    this.invalidatePendingLoads();
     this.stop();
     this.unbindMediaListeners({ media: this.activeMedia });
     this.releaseObjectUrl();
@@ -444,19 +517,161 @@ export class CdgPlayer extends EventTarget {
     this.logger.debug({ message: 'dispose:done' });
   }
 
+  /**
+   * Marks a new load generation and wakes any media waits owned by older loads.
+   */
+  private beginLoadGeneration(): number {
+    this.loadGeneration += 1;
+    this.invalidatePendingLoads();
+    return this.loadGeneration;
+  }
+
+  /**
+   * Releases waiters that are blocked on media readiness for superseded loads.
+   */
+  private invalidatePendingLoads(): void {
+    if (this.staleLoadWaiters.size === 0) {
+      return;
+    }
+
+    const waiters = [...this.staleLoadWaiters];
+    this.staleLoadWaiters.clear();
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  private isLoadCurrent({ generation }: { generation: number }): boolean {
+    return !this.disposed && generation === this.loadGeneration;
+  }
+
   private async attachLoadedTrack({
     loadedTrack,
+    generation,
   }: {
     loadedTrack: LoadedTrack;
-  }): Promise<void> {
+    generation: number;
+  }): Promise<boolean> {
     const resolvedMediaKind: LoadedTrackMediaKind =
       loadedTrack.mediaKind ?? 'audio';
     const resolvedMediaMimeType =
       loadedTrack.mediaMimeType ?? loadedTrack.audioMimeType;
 
+    if (!this.isLoadCurrent({ generation })) {
+      return false;
+    }
+
     const nextMedia = this.resolveMediaElementForTrack({ loadedTrack });
+
+    if (
+      resolvedMediaKind === 'video' &&
+      !canElementPlayMimeType({
+        media: nextMedia,
+        mimeType: resolvedMediaMimeType,
+      })
+    ) {
+      throw new Error(
+        `This browser cannot play ${resolvedMediaKind} format ${resolvedMediaMimeType}.`,
+      );
+    }
+
+    const hasGraphicsTrack =
+      loadedTrack.hasGraphics && loadedTrack.cdgBytes !== null;
+
+    this.logger.debug({
+      message: 'attach:start',
+      trackId: loadedTrack.trackId,
+      generation,
+      mediaKind: resolvedMediaKind,
+      mediaMimeType: resolvedMediaMimeType,
+      hasGraphics: hasGraphicsTrack,
+      cdgBytes: loadedTrack.cdgBytes?.byteLength ?? 0,
+      audioBytes: loadedTrack.audioBuffer.byteLength,
+    });
+
+    const mediaBlob = new Blob([loadedTrack.audioBuffer], {
+      type: resolvedMediaMimeType,
+    });
+
+    // The outgoing URL stays alive (and keeps playing) until the new track is
+    // fully committed, so a superseded or failing load never strands it.
+    const previousObjectUrl = this.currentObjectUrl;
+    const previousMediaSrc = nextMedia.getAttribute('src');
+    const objectUrl = URL.createObjectURL(mediaBlob);
+    this.pendingObjectUrl = objectUrl;
+
+    const discardPending = (): void => {
+      this.releaseRejectedObjectUrl({
+        url: objectUrl,
+        previousUrl: previousObjectUrl,
+        media: nextMedia,
+        previousMediaSrc,
+      });
+    };
+
+    if (!this.isLoadCurrent({ generation })) {
+      discardPending();
+      return false;
+    }
+
+    nextMedia.pause();
+    nextMedia.src = objectUrl;
+    nextMedia.load();
+
+    if (resolvedMediaKind === 'video') {
+      let ready: boolean;
+      try {
+        ready = await this.waitForMediaCanPlay({
+          media: nextMedia,
+          mediaKind: resolvedMediaKind,
+        });
+      } catch (errorValue) {
+        discardPending();
+        throw errorValue;
+      }
+
+      if (!ready) {
+        discardPending();
+        return false;
+      }
+    }
+
+    // Graphics are parsed last: the async parse polls the generation and bails
+    // out without touching the live instruction stream if superseded.
+    if (hasGraphicsTrack && loadedTrack.cdgBytes) {
+      const corePlayer = this.cdgPlayer as CdgCorePlayerAsyncLoad;
+      if (typeof corePlayer.loadAsync === 'function') {
+        this.logger.debug({ message: 'attach:core-loadAsync' });
+        await corePlayer.loadAsync({
+          data: loadedTrack.cdgBytes,
+          shouldAbort: () => !this.isLoadCurrent({ generation }),
+        });
+      } else {
+        this.logger.debug({ message: 'attach:core-load-sync' });
+        this.cdgPlayer.load({ data: loadedTrack.cdgBytes });
+      }
+    }
+
+    if (!this.isLoadCurrent({ generation })) {
+      this.logger.debug({
+        message: 'attach:stale-aborted',
+        generation,
+        activeGeneration: this.loadGeneration,
+        disposed: this.disposed,
+      });
+      discardPending();
+      return false;
+    }
+
+    // Past this point the load is committed; only now may observable state move.
+    this.pendingObjectUrl = null;
+    this.currentObjectUrl = objectUrl;
+    this.activeMediaKind = resolvedMediaKind;
+    this.hasGraphicsTrack = hasGraphicsTrack;
+
     if (this.activeMedia !== nextMedia) {
       this.unbindMediaListeners({ media: this.activeMedia });
+      this.activeMedia.pause();
       this.activeMedia = nextMedia;
 
       const cachedEngine = this.audioEnginesByMedia.get(this.activeMedia);
@@ -500,73 +715,23 @@ export class CdgPlayer extends EventTarget {
       });
     }
 
-    this.activeMediaKind = resolvedMediaKind;
-    this.releaseObjectUrl();
-    this.logger.debug({
-      message: 'attach:start',
-      trackId: loadedTrack.trackId,
-      mediaKind: resolvedMediaKind,
-      mediaMimeType: resolvedMediaMimeType,
-      hasGraphics: loadedTrack.hasGraphics,
-      cdgBytes: loadedTrack.cdgBytes?.byteLength ?? 0,
-      audioBytes: loadedTrack.audioBuffer.byteLength,
-    });
-
-    this.hasGraphicsTrack =
-      loadedTrack.hasGraphics && loadedTrack.cdgBytes !== null;
-
-    if (this.hasGraphicsTrack && loadedTrack.cdgBytes) {
-      const corePlayer = this.cdgPlayer as CdgCorePlayerAsyncLoad;
-      if (typeof corePlayer.loadAsync === 'function') {
-        this.logger.debug({ message: 'attach:core-loadAsync' });
-        await corePlayer.loadAsync({ data: loadedTrack.cdgBytes });
-      } else {
-        this.logger.debug({ message: 'attach:core-load-sync' });
-        this.cdgPlayer.load({ data: loadedTrack.cdgBytes });
-      }
-
-      this.cdgPlayer.reset().render();
-    } else {
-      this.cdgPlayer.reset().render();
-    }
-
-    const mediaBlob = new Blob([loadedTrack.audioBuffer], {
-      type: resolvedMediaMimeType,
-    });
-
-    if (
-      resolvedMediaKind === 'video' &&
-      !canElementPlayMimeType({
-        media: this.activeMedia,
-        mimeType: resolvedMediaMimeType,
-      })
-    ) {
-      throw new Error(
-        `This browser cannot play ${resolvedMediaKind} format ${resolvedMediaMimeType}.`,
-      );
-    }
-
-    this.currentObjectUrl = URL.createObjectURL(mediaBlob);
-    this.activeMedia.src = this.currentObjectUrl;
-    this.activeMedia.load();
-
+    // Only ever one stage element should carry a source. Clear the element that
+    // is not driving this track so a stale URL/stream cannot keep decoding.
     if (resolvedMediaKind === 'video') {
-      await this.waitForMediaCanPlay({
-        media: this.activeMedia,
-        mediaKind: resolvedMediaKind,
-      });
+      this.deactivateMediaElement({ media: this.audio });
+    } else {
+      this.deactivateMediaElement({ media: this.video });
     }
 
-    if (this.activeMedia === this.audio && this.video) {
-      this.video.pause();
-      this.video.removeAttribute('src');
-      this.video.load();
-    }
+    // Re-apply user-facing settings to the engine that is now in charge. A new
+    // track must not inherit the previous media element's volume/rate/key.
+    this.applyCurrentAudioSettings();
 
-    if (this.activeMedia === this.video) {
-      this.audio.pause();
-      this.audio.removeAttribute('src');
-      this.audio.load();
+    this.cdgPlayer.reset().render();
+
+    // The new track is fully bound; the outgoing URL is now safe to revoke.
+    if (previousObjectUrl && previousObjectUrl !== objectUrl) {
+      this.revokeObjectUrl({ url: previousObjectUrl });
     }
 
     this.logger.debug({
@@ -574,14 +739,112 @@ export class CdgPlayer extends EventTarget {
       mediaKind: this.activeMediaKind,
       objectUrl: this.currentObjectUrl,
     });
+
+    return true;
+  }
+
+  /**
+   * Applies the persisted player controls to the currently active audio engine.
+   */
+  private applyCurrentAudioSettings(): void {
+    this.audioEngine.setVolume({ value: this.state.volume });
+    this.audioEngine.setTempo({ value: this.state.playbackRate });
+    this.audioEngine.setPitchSemitones({ value: this.state.pitchSemitones });
+  }
+
+  /**
+   * Pauses a media element and drops its source so it stops decoding.
+   */
+  private deactivateMediaElement({
+    media,
+  }: {
+    media: HTMLMediaElement | null;
+  }): void {
+    if (!media) {
+      return;
+    }
+
+    media.pause();
+    media.removeAttribute('src');
+    media.load();
+  }
+
+  /**
+   * Revokes an object URL produced by a load that never became active and
+   * restores the media element's previous source, so the committed track stays
+   * playable. Also clears the pending-URL slot when it still points at `url`.
+   */
+  private releaseRejectedObjectUrl({
+    url,
+    previousUrl,
+    media,
+    previousMediaSrc,
+  }: {
+    url: string;
+    previousUrl: string | null;
+    media: HTMLMediaElement;
+    previousMediaSrc: string | null;
+  }): void {
+    if (this.pendingObjectUrl === url) {
+      this.pendingObjectUrl = null;
+    }
+
+    const boundUrl = media.getAttribute('src');
+    if (boundUrl === url || media.src === url) {
+      // Only restore a source that is still the committed URL; anything else
+      // (a stale or already-revoked URL) is cleared rather than re-bound.
+      if (
+        previousMediaSrc &&
+        previousUrl &&
+        previousMediaSrc === previousUrl &&
+        !this.disposed
+      ) {
+        media.src = previousMediaSrc;
+        media.load();
+      } else {
+        media.pause();
+        media.removeAttribute('src');
+        media.load();
+      }
+    }
+
+    this.revokeObjectUrl({ url });
+
+    // Nothing survives teardown: drop the previously committed URL too.
+    if (this.disposed && previousUrl) {
+      this.revokeObjectUrl({ url: previousUrl });
+      if (this.currentObjectUrl === previousUrl) {
+        this.currentObjectUrl = null;
+      }
+    }
+
+    this.logger.debug({
+      message: 'attach:rejected-object-url-released',
+      objectUrl: url,
+      committedUrl: this.currentObjectUrl,
+      previousUrl,
+    });
+  }
+
+  /**
+   * Revokes an object URL. Revoking an already-revoked URL is a no-op, so no
+   * bookkeeping set is needed and no URL reference is retained beyond use.
+   */
+  private revokeObjectUrl({ url }: { url: string }): void {
+    URL.revokeObjectURL(url);
   }
 
   private releaseObjectUrl(): void {
+    if (this.pendingObjectUrl) {
+      this.revokeObjectUrl({ url: this.pendingObjectUrl });
+      this.pendingObjectUrl = null;
+    }
+
     if (!this.currentObjectUrl) {
       return;
     }
 
-    URL.revokeObjectURL(this.currentObjectUrl);
+    this.revokeObjectUrl({ url: this.currentObjectUrl });
     this.currentObjectUrl = null;
   }
 
@@ -612,34 +875,61 @@ export class CdgPlayer extends EventTarget {
   }: {
     media: HTMLMediaElement;
     mediaKind: LoadedTrackMediaKind;
-  }): Promise<void> {
+  }): Promise<boolean> {
     if (mediaKind === 'video' && media instanceof HTMLVideoElement) {
-      await this.waitForVideoMetadata({ video: media });
+      const metadataReady = await this.waitForVideoMetadata({
+        video: media,
+      });
+      if (!metadataReady) {
+        return false;
+      }
+
       if (media.videoWidth <= 0 || media.videoHeight <= 0) {
         throw new Error('Video track could not be decoded by this browser.');
       }
     }
 
     if (media.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-      return;
+      return true;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const onCanPlay = (): void => {
+    return new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      const finish = ({ ready }: { ready: boolean }): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
-        resolve();
+        resolve(ready);
+      };
+
+      const onCanPlay = (): void => {
+        finish({ ready: true });
       };
 
       const onError = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
         reject(new Error(`Unable to load ${mediaKind} media in this browser.`));
       };
 
       const cleanup = (): void => {
+        this.staleLoadWaiters.delete(onAborted);
         media.removeEventListener('canplay', onCanPlay);
         media.removeEventListener('error', onError);
       };
 
+      // Superseded loads unblock immediately instead of hanging on media that
+      // will never be the active source.
+      const onAborted = (): void => {
+        finish({ ready: false });
+      };
+
+      this.staleLoadWaiters.add(onAborted);
       media.addEventListener('canplay', onCanPlay, { once: true });
       media.addEventListener('error', onError, { once: true });
     });
@@ -649,27 +939,46 @@ export class CdgPlayer extends EventTarget {
     video,
   }: {
     video: HTMLVideoElement;
-  }): Promise<void> {
+  }): Promise<boolean> {
     if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
-      return;
+      return true;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const onLoadedMetadata = (): void => {
+    return new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      const finish = ({ ready }: { ready: boolean }): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
-        resolve();
+        resolve(ready);
+      };
+
+      const onLoadedMetadata = (): void => {
+        finish({ ready: true });
       };
 
       const onError = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
         reject(new Error('Unable to read video metadata in this browser.'));
       };
 
       const cleanup = (): void => {
+        this.staleLoadWaiters.delete(onAborted);
         video.removeEventListener('loadedmetadata', onLoadedMetadata);
         video.removeEventListener('error', onError);
       };
 
+      const onAborted = (): void => {
+        finish({ ready: false });
+      };
+
+      this.staleLoadWaiters.add(onAborted);
       video.addEventListener('loadedmetadata', onLoadedMetadata, {
         once: true,
       });
@@ -737,6 +1046,11 @@ export class CdgPlayer extends EventTarget {
   }
 
   private applyState(nextStatePatch: Partial<PlayerState>): void {
+    if (this.disposed) {
+      // Once torn down, no further state notifications may escape.
+      return;
+    }
+
     const previous = this.state;
     const next = { ...previous, ...nextStatePatch };
     this.state = next;
@@ -753,6 +1067,9 @@ export class CdgPlayer extends EventTarget {
   }
 
   private handleTimeUpdate = (): void => {
+    if (this.shouldIgnoreMediaEvents()) {
+      return;
+    }
     const timeMs = asMilliseconds({ seconds: this.activeMedia.currentTime });
     const durationMs = asMilliseconds({ seconds: this.activeMedia.duration });
     // Audio timeline is always tracked; CDG sync is only needed when graphics exist.
@@ -763,6 +1080,9 @@ export class CdgPlayer extends EventTarget {
   };
 
   private handlePlay = (): void => {
+    if (this.shouldIgnoreMediaEvents()) {
+      return;
+    }
     this.logger.debug({
       message: 'handlePlay',
       currentTime: this.activeMedia.currentTime,
@@ -775,6 +1095,9 @@ export class CdgPlayer extends EventTarget {
   };
 
   private handlePause = (): void => {
+    if (this.shouldIgnoreMediaEvents()) {
+      return;
+    }
     this.logger.debug({
       message: 'handlePause',
       currentTime: this.activeMedia.currentTime,
@@ -789,6 +1112,9 @@ export class CdgPlayer extends EventTarget {
   };
 
   private handleEnded = (): void => {
+    if (this.shouldIgnoreMediaEvents()) {
+      return;
+    }
     this.logger.debug({
       message: 'handleEnded',
       currentTime: this.activeMedia.currentTime,
@@ -799,6 +1125,14 @@ export class CdgPlayer extends EventTarget {
     }
     this.applyState({ status: 'ready', currentTimeMs: 0 });
   };
+
+  /**
+   * Media element events raised while a load is rebinding sources (or after
+   * teardown) describe lifecycle bookkeeping, not user playback intent.
+   */
+  private shouldIgnoreMediaEvents(): boolean {
+    return this.disposed || this.state.status === 'loading';
+  }
 }
 
 /**

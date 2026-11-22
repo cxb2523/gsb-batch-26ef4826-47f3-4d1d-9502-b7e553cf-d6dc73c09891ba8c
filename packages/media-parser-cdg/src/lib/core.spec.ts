@@ -325,4 +325,49 @@ describe('CDGPlayer', () => {
     expect(player.instructions).toHaveLength(1);
     expect(player.pc).toBe(0);
   });
+
+  it('aborts an async load without mutating instructions when superseded', async () => {
+    const context = {
+      hOffset: 0,
+      vOffset: 0,
+      keyColor: null,
+      backgroundColor: null,
+      borderColor: null,
+      memoryColor: null,
+      clut: [],
+      pixels: [],
+      buffer: [],
+      canvas: {} as HTMLCanvasElement,
+      ctx: {} as CanvasRenderingContext2D,
+      imageData: {
+        data: new Uint8ClampedArray(0),
+        width: 0,
+        height: 0,
+      } as ImageData,
+      setPixel: () => undefined,
+      getPixel: () => 0,
+      setCLUTEntry: () => undefined,
+      reset: () => undefined,
+      renderFrame: () => undefined,
+    } satisfies CdgRenderContext;
+
+    const player = new CDGPlayer({ context });
+    const existingInstruction = { execute: vi.fn() };
+    player.instructions = [existingInstruction];
+    player.pc = 0;
+
+    let shouldAbort = false;
+    const loadPromise = player.loadAsync({
+      data: new Uint8Array(PACKET_SIZE * 600),
+      chunkPackets: 1,
+      shouldAbort: () => shouldAbort,
+    });
+
+    shouldAbort = true;
+    await loadPromise;
+
+    // The superseded parse must not replace the live instruction stream.
+    expect(player.instructions).toEqual([existingInstruction]);
+    expect(player.pc).toBe(0);
+  });
 });
