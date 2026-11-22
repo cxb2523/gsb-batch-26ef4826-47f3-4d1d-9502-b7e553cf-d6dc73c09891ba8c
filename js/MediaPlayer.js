@@ -23,6 +23,8 @@ var MediaPlayer = {
     this.sidebarEl = document.getElementById("sidebar");
     this.controlsEl = document.getElementById("media-controls");
     this.canvasEl = document.getElementById("visualizer");
+    this.coverEl = document.getElementById("cover");
+    this.displayContainerEl = document.getElementById("display-container");
 
     this.controlOverlay = document.getElementById("control-overlay");
     this.videoEl.controls = false;
@@ -46,14 +48,15 @@ var MediaPlayer = {
       }
     });
 
-    /* Initialize playlist */
+    /* Initialize playlist.
+       The playlist drives the player through exactly two state
+       transitions: an item becomes current (onItemSelected -> setMedia)
+       or the list becomes empty (onItemCleared -> clearMedia). Every
+       visible/resource side effect is funneled through those two paths. */
     this.playlist = new Playlist({
       element: document.getElementById("playlist"),
       onItemSelected: this.setMedia.bind(this),
-      onItemRemoved: () => {},
-      onItemCleared: () => {
-        this.UIEnabled = false;
-      },
+      onItemCleared: this.clearMedia.bind(this),
     });
 
     this.settingsStore = new SettingsStore({
@@ -175,6 +178,11 @@ var MediaPlayer = {
       }
     });
     this.videoEl.addEventListener("timeupdate", function() {
+      // While no media is loaded (or metadata isn't ready yet) duration is
+      // NaN; skip updates so stale/NaN progress and tooltip text can't linger.
+      if (isNaN(this.duration)) {
+        return;
+      }
       MediaPlayer.updateProgressBar();
       MediaPlayer.tooltipEl.textContent = MediaPlayer.getTooltip(this.currentTime);
     });
@@ -192,20 +200,14 @@ var MediaPlayer = {
     });
 
     this.UIEnabled = false;
+    this.mediaObjectURL = null;
     this.changeLoopState(1);
   },
   set UIEnabled(value) {
     if (!value) {
       document.body.classList.add("controls-disabled");
       this.controlsEl.classList.add("disabled");
-      this.headerEl.textContent = "";
-      this.headerEl.title = "";
-      document.title = "Media Player";
-      this.videoEl.hidden = true;
-      this.canvasEl.hidden = false;
-      this.videoEl.src = "";
-      this.pause(true);
-      this.videoEl.currentTime = 0;
+      this.resetView();
     } else {
       document.body.classList.remove("controls-disabled");
       this.controlsEl.classList.remove("disabled");
@@ -213,6 +215,49 @@ var MediaPlayer = {
   },
   get UIEnabled() {
     return !this.controlsEl.classList.contains("disabled");
+  },
+
+  /*
+    Restores the "no media" initial interface: title, document title, cover,
+    progress bar, visualizer placeholder and controls are all reset.
+  */
+  resetView() {
+    this.headerEl.textContent = "";
+    this.headerEl.title = "";
+    document.title = "Media Player";
+
+    this.coverEl.src = "";
+    this.displayContainerEl.className = "";
+
+    this.videoEl.hidden = true;
+    this.canvasEl.hidden = false;
+    this.canvasEl.classList.add("placeholder");
+    this.controlOverlay.className = "";
+
+    this.progressEl.style.width = "";
+    this.tooltipEl.textContent = "";
+    this.progressBar.title = "";
+  },
+
+  /*
+    Empties the player when the playlist becomes empty (last item removed or
+    list cleared). Releases the current media and visualization resources,
+    but keeps the AudioContext (and its MediaElementSource) alive in a
+    suspended state: a MediaElementSource node can only be created once per
+    element, so reusing the context lets a newly dragged-in file play and
+    rebuild the visualization normally.
+  */
+  clearMedia() {
+    this.killContext();
+    this.pause(true);
+    this.releaseMediaObjectURL();
+    this.videoEl.removeAttribute("src");
+    this.videoEl.load();
+    this.videoEl.currentTime = 0;
+    if (this.ctx && this.ctx.state === "running") {
+      this.ctx.suspend();
+    }
+    this.UIEnabled = false;
   },
 
   toggleFullscreen() {
@@ -235,22 +280,49 @@ var MediaPlayer = {
 
   /** Sidebar **/
   uploadFiles(uploadedMedia) {
-    if (!this.ctx) this.initAudioContext();
+    if (!this.ctx) {
+      this.initAudioContext();
+    } else if (this.ctx.state === "suspended") {
+      // The context was suspended when the playlist became empty; new files
+      // are coming in, so wake the analysis chain back up.
+      this.ctx.resume();
+    }
     uploadedMedia = Array.from(uploadedMedia) || [];
 
     return this.playlist.addAll(uploadedMedia);
   },
+  /* Revokes the current media objectURL at most once. */
+  releaseMediaObjectURL() {
+    if (this.mediaObjectURL) {
+      URL.revokeObjectURL(this.mediaObjectURL);
+      this.mediaObjectURL = null;
+    }
+  },
   setMedia(item) {
-    document.querySelector("#display-container")
-      .className = item.type;
+    // Build the new media URL and only then release the previous one, so a
+    // switch (including "current item removed") always has a valid successor
+    // loaded before the old media is torn down.
+    var nextObjectURL = URL.createObjectURL(item.media);
+    this.killContext();
+    this.releaseMediaObjectURL();
+    this.mediaObjectURL = nextObjectURL;
+
+    this.displayContainerEl.className = item.type;
     this.videoEl.hidden = item.type != "video";
     this.canvasEl.hidden = item.type == "video";
-    URL.revokeObjectURL(this.videoEl.src);
-    this.videoEl.src = URL.createObjectURL(item.media);
+    this.videoEl.src = nextObjectURL;
+
+    // The selected item owns the cover objectURL and releases it on destroy;
+    // the player only mirrors it while the item is current.
+    this.coverEl.src = item.pic == null ? "" : item.pic;
+
     this.updateHeader(item.tag);
     // Scroll to the selected item
     this.playlist.element.scrollTo(item.element.offsetTop, 1000);
     this.UIEnabled = true;
+    if (this.ctx && this.ctx.state === "suspended") {
+      this.ctx.resume();
+    }
     this.play(true);
   },
   updateHeader(tag) {
@@ -328,7 +400,12 @@ var MediaPlayer = {
     return this.videoEl.paused;
   },
   play(disableAnimation) {
-    this.videoEl.play();
+    // A rapid switch/clear can abort an in-flight play() (AbortError);
+    // swallow that expected rejection instead of letting it surface.
+    var playPromise = this.videoEl.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch(() => {});
+    }
     if (!this.canvasEl.hidden) {
       this.recordContext();
     }
@@ -357,6 +434,9 @@ var MediaPlayer = {
     }
   },
   fastrewind() {
+    if (!this.UIEnabled) {
+      return;
+    }
     let newTime = this.videoEl.currentTime - 5;
     if (newTime > -2) {
       this.videoEl.currentTime = Math.max(newTime, 0);
@@ -368,6 +448,9 @@ var MediaPlayer = {
     }
   },
   fastforward() {
+    if (!this.UIEnabled) {
+      return;
+    }
     let newTime = this.videoEl.currentTime + 5;
     if (newTime < this.videoEl.duration + 2) {
       this.videoEl.currentTime = Math.min(this.videoEl.duration, newTime);

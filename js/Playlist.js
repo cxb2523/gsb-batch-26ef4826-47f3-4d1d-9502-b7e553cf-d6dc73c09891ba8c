@@ -17,7 +17,6 @@ function hash(audio) {
 */
 function Playlist(params) {
   this.element = params.element;
-  this.coverEl = document.querySelector("img#cover");
   this.shuffle = false;
   this.loop = true;
   this.element.scrollTo = function(y, t) {
@@ -99,11 +98,13 @@ Playlist.prototype = {
     }
   },
   selectPrevious() {
+    if (!this.selectedItem || this.list.length === 0) {
+      return;
+    }
     var item = this.selectedItem;
     var itemIndex = this.list.findIndex(i => i.hash === item.hash);
     var nextItemIndex = (this.list.length+itemIndex-1)%this.list.length;
     var nextItem = this.list[nextItemIndex];
-    item.unselect();
     if (nextItemIndex === this.list.length - 1 && this.shuffle) {
       this.doShuffle();
     }
@@ -111,11 +112,13 @@ Playlist.prototype = {
   },
 
   selectNext() {
+    if (!this.selectedItem || this.list.length === 0) {
+      return;
+    }
     var item = this.selectedItem;
     var itemIndex = this.list.findIndex(i => i.hash === item.hash);
     var nextItemIndex = (itemIndex+1)%this.list.length;
     var nextItem = this.list[nextItemIndex];
-    item.unselect();
     if (nextItemIndex === 0 && this.shuffle) {
       this.doShuffle();
     }
@@ -131,16 +134,44 @@ Playlist.prototype = {
     this.params.onItemSelected(item);
   },
 
+  /*
+    Removing an item drives every side effect through one of two state
+    transitions: either the current item changes (onItemSelected with the
+    successor) or the playlist becomes empty (onItemCleared). The successor
+    is computed while the list is still intact, so a new media can be loaded
+    before the removed item releases its resources.
+  */
   onItemRemoved(item) {
+    var wasSelected = this.selectedItem && this.selectedItem.hash === item.hash;
+    var successor = null;
+
     if (this.list.length === 1) {
+      // Last item: transition to the empty/initial state.
       this.onItemCleared();
-    } else if (this.selectedItem.hash === item.hash) {
-      this.selectNext(item);
+    } else if (wasSelected) {
+      // Current item removed: pick the successor before mutating the list.
+      successor = this.getSuccessor(item);
+      this.onItemSelected(successor);
     }
+
     item.destroy();
     this.list = this.list.filter(i => i.hash !== item.hash);
     this.orderedlist = this.orderedlist.filter(i => i.hash !== item.hash);
     this.hashes = this.hashes.filter(h => h !== item.hash);
+  },
+
+  /*
+    Returns the item that should play after `item` is removed. This mirrors
+    selectNext()'s indexing (the item at the next position takes the removed
+    item's slot once the list is filtered), including the shuffle reshuffle.
+  */
+  getSuccessor(item) {
+    var itemIndex = this.list.findIndex(i => i.hash === item.hash);
+    var nextItemIndex = (itemIndex + 1) % this.list.length;
+    if (nextItemIndex === 0 && this.shuffle) {
+      this.doShuffle();
+    }
+    return this.list[nextItemIndex];
   },
 
   onItemCleared() {
@@ -157,11 +188,19 @@ function PlaylistItem(params) {
   this.onItemSelected = params.playlist.onItemSelected;
   this.onItemRemoved = params.playlist.onItemRemoved;
   this.pic = null;
+  this.destroyed = false;
   var p;
   [this.tag, p] = Utils.readTag(this.media);
   this.createDOM();
   p.then(tag => {
-    if (!tag) return;
+    if (!tag || this.destroyed) {
+      // The item was removed before its tag (and cover objectURL) resolved:
+      // release the cover URL instead of adopting it.
+      if (tag && tag.pic) {
+        URL.revokeObjectURL(tag.pic);
+      }
+      return;
+    }
     this.tag = tag;
     this.pic = tag.pic;
     this.createDOM();
@@ -229,18 +268,22 @@ PlaylistItem.prototype = {
 
   select() {
     this.element.classList.add("playing");
-    this.playlist.coverEl.src = this.pic == null ? "" : this.pic;
   },
 
   unselect() {
     this.element.classList.remove("playing");
-    this.playlist.coverEl.src = "";
   },
 
   destroy() {
+    this.destroyed = true;
     this.element.remove();
+    // Release the embedded cover's objectURL exactly once. Items whose tag
+    // has not resolved yet revoke it in the readTag() promise callback.
+    if (this.pic) {
+      URL.revokeObjectURL(this.pic);
+      this.pic = null;
+    }
     this.media = null;
-    this.playlist.coverEl.src = "";
   }
 };
 
