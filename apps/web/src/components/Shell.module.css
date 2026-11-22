@@ -1,0 +1,402 @@
+.shell { max-width: 1240px; margin: 0 auto; padding: 0 1.25rem 3rem; }
+
+/* Offscreen until keyboard focus: above the drawer (its scrim is 105) so the
+   link stays reachable even while the drawer is open. */
+.skipLink {
+  position: absolute;
+  left: -999px;
+  top: 0;
+  z-index: 120;
+  padding: 0.4rem 0.9rem;
+  background: var(--accent);
+  color: var(--ink-on-accent);
+  border-radius: var(--radius);
+}
+.skipLink:focus { left: 0.5rem; top: 0.5rem; }
+
+/* ---- The ledger strip -----------------------------------------------------
+   The header is the top line of the books: the outfit's name at the left,
+   the player's balances in mono cells to the right, ruled off underneath by
+   the double rule an accountant draws under a heading — one hairline, one
+   brass line fading out. */
+.header {
+  /* Three fixed columns — brand, vitals, account — so the chip can never
+     wrap under the brand when the vitals run wide; the vitals cell wraps
+     internally instead. The phone's visible children are hamburger, brand
+     and mini HUD, which fall into the same three columns. */
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1.25rem;
+  /* Sticky glass: the balances stay on screen however far a page scrolls,
+     over a blurred, translucent slab of the page behind. The negative
+     margins run the slab out to the shell's padding edges so nothing
+     scrolls past in a gap beside it. Also anchors the account dropdown. */
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  margin: 0 -1.25rem;
+  padding: 0.9rem 1.25rem 0.8rem;
+  background: color-mix(in oklab, var(--bg) 76%, transparent);
+  backdrop-filter: blur(16px) saturate(1.3);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  border-bottom: 1px solid var(--line);
+}
+.header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: linear-gradient(90deg, var(--accent) 0%, color-mix(in oklab, var(--accent) 40%, transparent) 35%, transparent 75%);
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+.brand {
+  margin: 0;
+  font: 900 1.75rem/1 var(--font-display);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg);
+  text-shadow: 0 0 28px var(--accent-glow);
+}
+/* Gangster preset: chrome-plated, lit from behind by gold — the badge's
+   lettering at masthead size. `drop-shadow` rather than `text-shadow`
+   because the text is a clipped gradient with a transparent fill. */
+:global([data-theme="gangster"]) .brand {
+  color: transparent;
+  /* Two layers, both clipped to the glyphs: a narrow highlight that sweeps
+     across every few seconds, over the static chrome. Only the sweep's
+     position animates. */
+  background-image:
+    linear-gradient(100deg, transparent 42%, color-mix(in oklab, white 85%, transparent) 50%, transparent 58%),
+    var(--chrome);
+  background-size: 250% 100%, 100% 100%;
+  /* no-repeat is load-bearing: a tiled sweep layer puts a second copy of
+     the band on the glyphs — parked in view as a static highlight, and
+     leaving early on the right while the real one enters on the left. */
+  background-repeat: no-repeat, no-repeat;
+  background-position: 200% 0, 0 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  text-shadow: none;
+  filter: drop-shadow(0 1px 0 color-mix(in oklab, black 80%, transparent)) drop-shadow(0 0 16px var(--accent-glow));
+  animation: sheen 7s linear infinite;
+}
+@keyframes sheen {
+  0%, 70% { background-position: 200% 0, 0 0; }
+  100% { background-position: -100% 0, 0 0; }
+}
+/* An uploaded header logo takes the glow, not the plating. */
+.brand img { filter: drop-shadow(0 0 12px var(--accent-glow)); }
+
+/* Phone-only: unhides at the media query below, where the full hud hides. */
+.hamburger::after { display: none; }
+.hamburger {
+  display: none;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  background: var(--surface-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+.hamburger span {
+  display: block;
+  width: 16px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--fg);
+}
+
+/* The HUD in related pairs — money, combat, pools, progression — icons
+   carrying the identity, dividers carrying the grouping. Centered, not
+   baseline: glyphs and slim pool bars have no baseline to share. */
+.hud { display: flex; gap: 0.9rem; flex-wrap: wrap; align-items: center; justify-content: flex-end; min-width: 0; }
+.hudGroup {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  align-items: center;
+  padding-right: 0.9rem;
+  border-right: 1px solid var(--line);
+}
+.hud .hudGroup:last-child { border-right: 0; padding-right: 0; }
+.stat {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  font: 500 0.86rem/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.stat svg { color: var(--accent); flex: none; filter: drop-shadow(0 0 4px var(--accent-glow)); }
+.statLabel {
+  color: var(--muted);
+  font: 700 0.68rem/1 var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+/* Screen-reader-only label text for icon stats — the standard clip recipe. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The account chip replaces the old "Player" stat and header log-out button:
+   identity plus its menu, where a log-out belongs. */
+.account { position: relative; }
+.accountChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.42rem 0.75rem 0.38rem;
+  background: var(--surface-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--fg);
+  font: 700 0.8rem/1 var(--font-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+.accountChip::after { display: none; }
+.accountChip:hover:not(:disabled) { filter: none; border-color: var(--accent-lo); box-shadow: 0 0 12px var(--accent-soft); }
+.accountDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+.accountMenu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 0.4rem;
+  z-index: 20;
+  padding: 0.4rem;
+  min-width: 10rem;
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+  animation: menuIn var(--dur-fast) var(--ease-out);
+}
+.accountMenu button { width: 100%; }
+@keyframes menuIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+/* Phone-condensed HUD: cash large, rank·location under it. */
+.miniHud { display: none; flex-direction: column; align-items: flex-end; line-height: 1.25; margin-left: auto; }
+.miniCash { font: 500 1rem/1.2 var(--font-mono); font-variant-numeric: tabular-nums; }
+.miniSub { color: var(--muted); font-size: 0.72rem; letter-spacing: 0.02em; }
+
+/* ---- Phone drawer ------------------------------------------------------- */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 105;
+  background: color-mix(in oklab, black 60%, transparent);
+  backdrop-filter: blur(2px);
+}
+.drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 110;
+  width: min(300px, 85vw);
+  padding: 0.75rem;
+  overflow-y: auto;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  box-shadow: var(--shadow-lift);
+  outline: none;
+  animation: drawerIn var(--dur) var(--ease-out);
+}
+@keyframes drawerIn { from { transform: translateX(-100%); } to { transform: none; } }
+.drawerHead {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.4rem 0.5rem 0.8rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0.5rem;
+}
+.drawerAvatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 2px;
+  background: var(--gold-gloss), var(--gold);
+  box-shadow: 0 0 14px var(--accent-glow);
+  color: var(--ink-on-accent);
+  font: 900 1.1rem/1 var(--font-display);
+}
+.drawerWho { display: flex; flex-direction: column; line-height: 1.3; }
+.drawerWho b { font: 800 1rem/1.2 var(--font-display); letter-spacing: 0.06em; text-transform: uppercase; }
+.drawerSub { color: var(--muted); font-size: 0.75rem; }
+.drawerLogout { width: 100%; margin-top: 0.75rem; }
+
+/* ---- The stamp ----------------------------------------------------------
+   Jail is the one state that overrides everything else on the page, so it
+   is stamped on rather than boxed in: a doubled oxblood border, a hair of
+   tilt, the wording in the display face. Fit to its text — a stamp does not
+   span the page. */
+.jailBanner {
+  width: fit-content;
+  max-width: 100%;
+  margin: 1.1rem 0 0;
+  padding: 0.5rem 1rem 0.42rem;
+  border: 2px solid var(--danger);
+  outline: 1px solid var(--danger);
+  outline-offset: 3px;
+  border-radius: 2px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font: 800 0.95rem/1.2 var(--font-display);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  transform: rotate(-0.6deg);
+  transform-origin: left center;
+  animation: stampPulse 2.6s ease-in-out infinite;
+}
+@keyframes stampPulse {
+  0%, 100% { box-shadow: 0 0 0 color-mix(in oklab, var(--danger) 0%, transparent); }
+  50% { box-shadow: 0 0 22px var(--danger-soft); }
+}
+
+/* ---- The nav row: categories left, status line right ------------------- */
+.navRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 0 1rem;
+  border-bottom: 1px solid var(--line);
+}
+/* The row owns the rule; the bar's own is switched off so an active tab's
+   2px underline (margin-bottom: -1px in NavMenu) lands on this one.
+   Priorities: the nav never shrinks (it is the way around the game); the
+   status line takes what is left and clips, rank and town first in line,
+   plugin extras giving way — ellipsised, full text in their tooltips. */
+.navRow > .navSlot { flex: 1 0 auto; border-bottom: 0; }
+/* Below a useful width the line does not clip to nothing: `min-width` makes
+   it wrap under the nav as its own right-aligned row instead. */
+.status {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex: 0 1 auto;
+  min-width: min(24rem, 100%);
+  margin-left: auto;
+  overflow: hidden;
+  padding: 0.35rem 0.25rem 0.3rem;
+  color: var(--muted);
+}
+.statusCore, .statusExtras { display: inline-flex; align-items: center; gap: 0.9rem; }
+.statusCore { flex: none; padding-right: 0.9rem; border-right: 1px solid var(--line); }
+.statusCore:last-child { padding-right: 0; border-right: 0; }
+.statusExtras { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.status .stat { color: var(--fg); }
+.statusExtras .stat { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.clip { display: block; min-width: 0; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.navSlot { }
+.body {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(250px, 1fr);
+  gap: 1.5rem;
+  padding-top: 1.25rem;
+  align-items: start;
+}
+.content { display: grid; gap: 1.25rem; min-width: 0; }
+
+/* Page-load choreography: the page's sections rise into place one after
+   another, top to bottom, fast enough that a player clicking through pages
+   never waits on it. The banner (first child) leads. */
+.content > * { animation: rise var(--dur) var(--ease-out) both; }
+.content > :nth-child(2) { animation-delay: 40ms; }
+.content > :nth-child(3) { animation-delay: 80ms; }
+.content > :nth-child(4) { animation-delay: 120ms; }
+.content > :nth-child(5) { animation-delay: 160ms; }
+.content > :nth-child(n + 6) { animation-delay: 200ms; }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 860px) {
+  .shell { padding: 0 0.9rem 2rem; }
+  .header { margin: 0 -0.9rem; padding: 0.7rem 0.9rem 0.6rem; }
+  .body { grid-template-columns: 1fr; }
+  /* The bar hides; its drawer copy takes over, and the header trades the full
+     HUD and the account chip for the hamburger and the condensed stats. Rank
+     and town already ride the mini HUD, so the status line only stays for
+     plugin countdowns — and only when there are any. */
+  .navSlot { display: none; }
+  .navRow { border-bottom: 0; }
+  .status { display: none; }
+  .status:has(.statusExtras) { display: flex; width: 100%; padding: 0.45rem 0; border-bottom: 1px solid var(--line); }
+  .statusCore { display: none; }
+  .hamburger { display: flex; }
+  .hud { display: none; }
+  .account { display: none; }
+  .miniHud { display: flex; }
+  .brand { font-size: 1.4rem; }
+}
+
+/* Sidebar mode — `data-nav="left"` is stamped on <html> by applyTheme from
+   the admin-picked theme, so the same markup lays out either way and React
+   never knows. The shell becomes a two-column grid whose first column is the
+   nav, running from under the header to the bottom; the conditional jail
+   banner gets its own named row so its absence collapses to nothing. */
+:global([data-nav="left"]) .shell {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  column-gap: 1.5rem;
+  grid-template-areas:
+    "header header"
+    "nav    status"
+    "nav    banner"
+    "nav    body";
+  grid-template-rows: auto auto auto 1fr;
+}
+:global([data-nav="left"]) .header { grid-area: header; }
+/* The row dissolves: the nav takes the sidebar area, the status line its own
+   row under the header, above the page. */
+:global([data-nav="left"]) .navRow { display: contents; }
+:global([data-nav="left"]) .status { grid-area: status; margin-left: 0; padding: 0.7rem 0 0; }
+:global([data-nav="left"]) .jailBanner { grid-area: banner; }
+/* Sticky inside its grid area: a tall accordion scrolls with the page until
+   its column's top edge reaches the viewport's, then rides along. */
+:global([data-nav="left"]) .navSlot {
+  grid-area: nav;
+  align-self: start;
+  position: sticky;
+  top: 1rem;
+  margin-top: 1.25rem;
+}
+:global([data-nav="left"]) .body { grid-area: body; }
+
+/* The sidebar has no room on a phone — the drawer takes over. */
+@media (max-width: 860px) {
+  :global([data-nav="left"]) .shell { display: block; }
+  :global([data-nav="left"]) .navRow { display: flex; }
+  :global([data-nav="left"]) .navSlot { display: none; }
+  :global([data-nav="left"]) .status { padding: 0.45rem 0; }
+}
+

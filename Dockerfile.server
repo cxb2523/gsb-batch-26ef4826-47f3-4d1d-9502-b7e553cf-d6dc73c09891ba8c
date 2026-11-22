@@ -1,0 +1,277 @@
+# syntax=docker/dockerfile:1
+#
+# Server image: API + WebSocket gateway. Built from compiled TypeScript.
+#
+# The builder runs `tsc --build` against @gl3/server, which follows its
+# tsconfig references to @gl3/shared, @gl3/plugin-sdk, @gl3/plugin-ranks,
+# @gl3/plugin-notifications, @gl3/plugin-news, @gl3/plugin-bank,
+# @gl3/plugin-bullets, @gl3/plugin-travel, @gl3/plugin-crimes,
+# @gl3/plugin-mail and @gl3/hello-plugin and emits all
+# twelve dist/ dirs in one step — so no separate `build -w` is needed here
+# (unlike Dockerfile.web, where Vite — not tsc — resolves @gl3/shared and
+# needs dist present before the web build starts).
+#
+# Every project apps/server/tsconfig.json references must be copied in, sources
+# and tsconfig both: tsc reads the referenced tsconfig even for a type-only
+# import and fails with TS5083 if it is missing. @gl3/hello-plugin,
+# @gl3/plugin-ranks, @gl3/plugin-notifications, @gl3/plugin-news,
+# @gl3/plugin-bank, @gl3/plugin-bullets, @gl3/plugin-travel,
+# @gl3/plugin-crimes and @gl3/plugin-mail are also RUNTIME requirements —
+# src/index.ts imports @gl3/hello-plugin statically for the optional-plugin
+# import map, and src/plugins/core-plugins.ts imports @gl3/plugin-ranks,
+# @gl3/plugin-notifications, @gl3/plugin-news, @gl3/plugin-bank,
+# @gl3/plugin-bullets, @gl3/plugin-travel, @gl3/plugin-crimes and
+# @gl3/plugin-mail statically as ported core modules (a dynamic
+# import(pluginId) is deliberately not used for any of them, so the
+# dependency-direction check stays compiler-enforceable). Without all nine in
+# the runtime stage the server cannot boot, even with PLUGIN_IDS empty — core
+# plugins are never optional.
+#
+# Third-party plugins are NOT copied here and do not need to be. Everything
+# below is compiled into the image at build time; a plugin an operator installs
+# later arrives through PLUGIN_PACKAGES + PLUGIN_DIR, resolved at boot out of a
+# mounted volume (see src/plugins/dynamic.ts). That is deliberate: the runtime
+# stage has no sources and no toolchain, so without it adding any plugin would
+# mean rebuilding this image. Recipe:
+#
+#   initContainer: npm i --prefix /data/plugins @acme/plugin-x
+#   volumeMount:   /data/plugins
+#   env:           PLUGIN_DIR=/data/plugins
+#                  PLUGIN_PACKAGES=@acme/plugin-x
+#
+# The volume needs no node binary at runtime — only the installed tree.
+#
+# argon2 ships a linux-x64 musl prebuild, so node:22-alpine needs no
+# build toolchain (no python/make/g++).
+#
+# Schema bootstrap: the server CMD (index.js) does NOT run migrations. For a
+# fresh database, run `node apps/server/dist/db/migrate.js` as a Rancher
+# initContainer before the server starts. The image ships the compiled
+# migrator and the drizzle/ SQL so that entrypoint works from this image
+# alone — no separate migration tooling. Migrations are idempotent (drizzle
+# tracks applied files in the __drizzle_migrations table), so re-running on
+# an already-bootstrapped database is a no-op.
+
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-alpine AS builder
+
+WORKDIR /app
+
+# Copy manifests first for the install layer. Each workspace whose package.json
+# is present here gets linked into node_modules/@gl3/*; a workspace left out is
+# simply absent (the root globs tolerate it), which is how apps/web stays out of
+# this image.
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/plugin-sdk/package.json packages/plugin-sdk/
+COPY packages/plugins/ranks/package.json packages/plugins/ranks/
+COPY packages/plugins/notifications/package.json packages/plugins/notifications/
+COPY packages/plugins/news/package.json packages/plugins/news/
+COPY packages/plugins/bank/package.json packages/plugins/bank/
+COPY packages/plugins/bullets/package.json packages/plugins/bullets/
+COPY packages/plugins/theft/package.json packages/plugins/theft/
+COPY packages/plugins/properties/package.json packages/plugins/properties/
+COPY packages/plugins/casino/package.json packages/plugins/casino/
+COPY packages/plugins/blackjack/package.json packages/plugins/blackjack/
+COPY packages/plugins/travel/package.json packages/plugins/travel/
+COPY packages/plugins/crimes/package.json packages/plugins/crimes/
+COPY packages/plugins/mail/package.json packages/plugins/mail/
+COPY packages/plugins/membership/package.json packages/plugins/membership/
+COPY packages/plugins/gangs/package.json packages/plugins/gangs/
+COPY packages/plugins/inventory/package.json packages/plugins/inventory/
+COPY packages/plugins/combat/package.json packages/plugins/combat/
+COPY packages/plugins/bounties/package.json packages/plugins/bounties/
+COPY packages/plugins/oc/package.json packages/plugins/oc/
+COPY packages/plugins/detectives/package.json packages/plugins/detectives/
+COPY packages/plugins/forum/package.json packages/plugins/forum/
+COPY packages/plugins/mccodes-attributes/package.json packages/plugins/mccodes-attributes/
+COPY packages/plugins/gym/package.json packages/plugins/gym/
+COPY packages/plugins/houses/package.json packages/plugins/houses/
+COPY packages/plugins/education/package.json packages/plugins/education/
+COPY packages/plugins/jobs/package.json packages/plugins/jobs/
+COPY packages/plugins/temple/package.json packages/plugins/temple/
+COPY packages/plugins/progression/package.json packages/plugins/progression/
+COPY apps/server/package.json apps/server/
+COPY examples/hello-plugin/package.json examples/hello-plugin/
+# Scoped registry for marketplace plugins. Inert until a `@gl3-plugins/*`
+# package is actually depended on, but the Dockerfile only copies what it
+# names, so an install added later would silently fall back to npmjs without
+# this line.
+COPY .npmrc ./
+
+RUN npm ci
+
+# Copy the TypeScript sources and tsconfigs that the build reads.
+COPY tsconfig.json tsconfig.base.json ./
+COPY packages/shared/tsconfig.json packages/shared/tsconfig.json
+COPY packages/shared/src packages/shared/src
+COPY packages/plugin-sdk/tsconfig.json packages/plugin-sdk/tsconfig.json
+COPY packages/plugin-sdk/src packages/plugin-sdk/src
+COPY packages/plugins/ranks/tsconfig.json packages/plugins/ranks/tsconfig.json
+COPY packages/plugins/ranks/src packages/plugins/ranks/src
+COPY packages/plugins/notifications/tsconfig.json packages/plugins/notifications/tsconfig.json
+COPY packages/plugins/notifications/src packages/plugins/notifications/src
+COPY packages/plugins/news/tsconfig.json packages/plugins/news/tsconfig.json
+COPY packages/plugins/news/src packages/plugins/news/src
+COPY packages/plugins/bank/tsconfig.json packages/plugins/bank/tsconfig.json
+COPY packages/plugins/bank/src packages/plugins/bank/src
+COPY packages/plugins/bullets/tsconfig.json packages/plugins/bullets/tsconfig.json
+COPY packages/plugins/bullets/src packages/plugins/bullets/src
+COPY packages/plugins/theft/tsconfig.json packages/plugins/theft/tsconfig.json
+COPY packages/plugins/theft/src packages/plugins/theft/src
+COPY packages/plugins/properties/tsconfig.json packages/plugins/properties/tsconfig.json
+COPY packages/plugins/properties/src packages/plugins/properties/src
+COPY packages/plugins/casino/tsconfig.json packages/plugins/casino/tsconfig.json
+COPY packages/plugins/casino/src packages/plugins/casino/src
+COPY packages/plugins/blackjack/tsconfig.json packages/plugins/blackjack/tsconfig.json
+COPY packages/plugins/blackjack/src packages/plugins/blackjack/src
+COPY packages/plugins/travel/tsconfig.json packages/plugins/travel/tsconfig.json
+COPY packages/plugins/travel/src packages/plugins/travel/src
+COPY packages/plugins/crimes/tsconfig.json packages/plugins/crimes/tsconfig.json
+COPY packages/plugins/crimes/src packages/plugins/crimes/src
+COPY packages/plugins/mail/tsconfig.json packages/plugins/mail/tsconfig.json
+COPY packages/plugins/mail/src packages/plugins/mail/src
+COPY packages/plugins/membership/tsconfig.json packages/plugins/membership/tsconfig.json
+COPY packages/plugins/membership/src packages/plugins/membership/src
+COPY packages/plugins/gangs/tsconfig.json packages/plugins/gangs/tsconfig.json
+COPY packages/plugins/gangs/src packages/plugins/gangs/src
+COPY packages/plugins/inventory/tsconfig.json packages/plugins/inventory/tsconfig.json
+COPY packages/plugins/inventory/src packages/plugins/inventory/src
+COPY packages/plugins/combat/tsconfig.json packages/plugins/combat/tsconfig.json
+COPY packages/plugins/combat/src packages/plugins/combat/src
+COPY packages/plugins/bounties/tsconfig.json packages/plugins/bounties/tsconfig.json
+COPY packages/plugins/bounties/src packages/plugins/bounties/src
+COPY packages/plugins/oc/tsconfig.json packages/plugins/oc/tsconfig.json
+COPY packages/plugins/oc/src packages/plugins/oc/src
+COPY packages/plugins/detectives/tsconfig.json packages/plugins/detectives/tsconfig.json
+COPY packages/plugins/detectives/src packages/plugins/detectives/src
+COPY packages/plugins/forum/tsconfig.json packages/plugins/forum/tsconfig.json
+COPY packages/plugins/forum/src packages/plugins/forum/src
+COPY packages/plugins/mccodes-attributes/tsconfig.json packages/plugins/mccodes-attributes/tsconfig.json
+COPY packages/plugins/mccodes-attributes/src packages/plugins/mccodes-attributes/src
+COPY packages/plugins/gym/tsconfig.json packages/plugins/gym/tsconfig.json
+COPY packages/plugins/gym/src packages/plugins/gym/src
+COPY packages/plugins/houses/tsconfig.json packages/plugins/houses/tsconfig.json
+COPY packages/plugins/houses/src packages/plugins/houses/src
+COPY packages/plugins/education/tsconfig.json packages/plugins/education/tsconfig.json
+COPY packages/plugins/education/src packages/plugins/education/src
+COPY packages/plugins/jobs/tsconfig.json packages/plugins/jobs/tsconfig.json
+COPY packages/plugins/jobs/src packages/plugins/jobs/src
+COPY packages/plugins/temple/tsconfig.json packages/plugins/temple/tsconfig.json
+COPY packages/plugins/temple/src packages/plugins/temple/src
+COPY packages/plugins/progression/tsconfig.json packages/plugins/progression/tsconfig.json
+COPY packages/plugins/progression/src packages/plugins/progression/src
+COPY apps/server/tsconfig.json apps/server/tsconfig.json
+COPY apps/server/src apps/server/src
+COPY examples/hello-plugin/tsconfig.json examples/hello-plugin/tsconfig.json
+COPY examples/hello-plugin/src examples/hello-plugin/src
+# Migrations are TS-adjacent SQL, not compiled; copy the source dir so the
+# runtime stage can serve them to the compiled migrator.
+COPY apps/server/drizzle apps/server/drizzle
+
+# Point at the server project directly rather than the root tsconfig.json.
+# The root tsconfig also references apps/web, which is not copied into this
+# image, so building from root fails with TS5083 (Cannot read
+# apps/web/tsconfig.json). The server project's own references pull in shared,
+# plugin-sdk, plugins/ranks, plugins/notifications, plugins/news, plugins/bank,
+# plugins/bullets and hello-plugin, so every dist/ this image needs is produced; `--force` matches
+# `npm run typecheck` (rebuild from scratch, since .dockerignore excluded any
+# cached .tsbuildinfo).
+RUN npx tsc --build --force apps/server/tsconfig.json
+
+# --- runtime stage -----------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Same manifests as the builder, then a production-only install. This recreates
+# the node_modules/@gl3/* workspace symlinks, which is how the runtime resolves
+# `@gl3/shared`, `@gl3/plugin-sdk`, `@gl3/plugin-ranks`, `@gl3/plugin-notifications`,
+# `@gl3/plugin-news`, `@gl3/plugin-bank`, `@gl3/plugin-bullets`,
+# `@gl3/plugin-travel` and `@gl3/hello-plugin` through their package.json
+# exports maps. `@gl3/plugin-travel` is copied here because
+# apps/server/package.json already declares it as a workspace dependency;
+# nothing imports it yet (`src/plugins/core-plugins.ts` does that in Task 4),
+# so its dist/ is present but unused until then.
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/plugin-sdk/package.json packages/plugin-sdk/
+COPY packages/plugins/ranks/package.json packages/plugins/ranks/
+COPY packages/plugins/notifications/package.json packages/plugins/notifications/
+COPY packages/plugins/news/package.json packages/plugins/news/
+COPY packages/plugins/bank/package.json packages/plugins/bank/
+COPY packages/plugins/bullets/package.json packages/plugins/bullets/
+COPY packages/plugins/theft/package.json packages/plugins/theft/
+COPY packages/plugins/properties/package.json packages/plugins/properties/
+COPY packages/plugins/casino/package.json packages/plugins/casino/
+COPY packages/plugins/blackjack/package.json packages/plugins/blackjack/
+COPY packages/plugins/travel/package.json packages/plugins/travel/
+COPY packages/plugins/crimes/package.json packages/plugins/crimes/
+COPY packages/plugins/mail/package.json packages/plugins/mail/
+COPY packages/plugins/membership/package.json packages/plugins/membership/
+COPY packages/plugins/gangs/package.json packages/plugins/gangs/
+COPY packages/plugins/inventory/package.json packages/plugins/inventory/
+COPY packages/plugins/combat/package.json packages/plugins/combat/
+COPY packages/plugins/bounties/package.json packages/plugins/bounties/
+COPY packages/plugins/oc/package.json packages/plugins/oc/
+COPY packages/plugins/detectives/package.json packages/plugins/detectives/
+COPY packages/plugins/forum/package.json packages/plugins/forum/
+COPY packages/plugins/mccodes-attributes/package.json packages/plugins/mccodes-attributes/
+COPY packages/plugins/gym/package.json packages/plugins/gym/
+COPY packages/plugins/houses/package.json packages/plugins/houses/
+COPY packages/plugins/education/package.json packages/plugins/education/
+COPY packages/plugins/jobs/package.json packages/plugins/jobs/
+COPY packages/plugins/temple/package.json packages/plugins/temple/
+COPY packages/plugins/progression/package.json packages/plugins/progression/
+COPY apps/server/package.json apps/server/
+COPY examples/hello-plugin/package.json examples/hello-plugin/
+COPY .npmrc ./
+
+RUN npm ci --omit=dev
+
+# Compiled output from the builder. drizzle/ ships too so the migrator
+# entrypoint (dist/db/migrate.js) can find its SQL — it resolves
+# ../../drizzle relative to dist/db/, i.e. apps/server/drizzle.
+COPY --from=builder /app/packages/shared/dist packages/shared/dist
+COPY --from=builder /app/packages/plugin-sdk/dist packages/plugin-sdk/dist
+COPY --from=builder /app/packages/plugins/ranks/dist packages/plugins/ranks/dist
+COPY --from=builder /app/packages/plugins/notifications/dist packages/plugins/notifications/dist
+COPY --from=builder /app/packages/plugins/news/dist packages/plugins/news/dist
+COPY --from=builder /app/packages/plugins/bank/dist packages/plugins/bank/dist
+COPY --from=builder /app/packages/plugins/bullets/dist packages/plugins/bullets/dist
+COPY --from=builder /app/packages/plugins/theft/dist packages/plugins/theft/dist
+COPY --from=builder /app/packages/plugins/properties/dist packages/plugins/properties/dist
+COPY --from=builder /app/packages/plugins/casino/dist packages/plugins/casino/dist
+COPY --from=builder /app/packages/plugins/blackjack/dist packages/plugins/blackjack/dist
+COPY --from=builder /app/packages/plugins/travel/dist packages/plugins/travel/dist
+COPY --from=builder /app/packages/plugins/crimes/dist packages/plugins/crimes/dist
+COPY --from=builder /app/packages/plugins/mail/dist packages/plugins/mail/dist
+COPY --from=builder /app/packages/plugins/membership/dist packages/plugins/membership/dist
+COPY --from=builder /app/packages/plugins/gangs/dist packages/plugins/gangs/dist
+COPY --from=builder /app/packages/plugins/inventory/dist packages/plugins/inventory/dist
+COPY --from=builder /app/packages/plugins/combat/dist packages/plugins/combat/dist
+COPY --from=builder /app/packages/plugins/bounties/dist packages/plugins/bounties/dist
+COPY --from=builder /app/packages/plugins/oc/dist packages/plugins/oc/dist
+COPY --from=builder /app/packages/plugins/detectives/dist packages/plugins/detectives/dist
+COPY --from=builder /app/packages/plugins/forum/dist packages/plugins/forum/dist
+COPY --from=builder /app/packages/plugins/mccodes-attributes/dist packages/plugins/mccodes-attributes/dist
+COPY --from=builder /app/packages/plugins/gym/dist packages/plugins/gym/dist
+COPY --from=builder /app/packages/plugins/houses/dist packages/plugins/houses/dist
+COPY --from=builder /app/packages/plugins/education/dist packages/plugins/education/dist
+COPY --from=builder /app/packages/plugins/jobs/dist packages/plugins/jobs/dist
+COPY --from=builder /app/packages/plugins/temple/dist packages/plugins/temple/dist
+COPY --from=builder /app/packages/plugins/progression/dist packages/plugins/progression/dist
+COPY --from=builder /app/apps/server/dist apps/server/dist
+COPY --from=builder /app/apps/server/drizzle apps/server/drizzle
+COPY --from=builder /app/examples/hello-plugin/dist examples/hello-plugin/dist
+
+USER node
+EXPOSE 3000
+
+# /health is registered in src/app.ts and covered by test/health.test.ts.
+# wget is present in the alpine base; curl is not.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+
+CMD ["node", "apps/server/dist/index.js"]

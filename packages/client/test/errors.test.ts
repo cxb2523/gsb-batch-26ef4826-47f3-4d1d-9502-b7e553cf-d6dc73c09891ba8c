@@ -1,0 +1,120 @@
+import { describe, expect, it } from "vitest";
+import { ApiError } from "../src/api/apiError.js";
+import { describeError, formatDuration, refusalCooldownSeconds } from "../src/lib/errors.js";
+
+describe("formatDuration", () => {
+  it("renders sub-minute waits in seconds", () => {
+    expect(formatDuration(0)).toBe("0s");
+    expect(formatDuration(45)).toBe("45s");
+    expect(formatDuration(59)).toBe("59s");
+  });
+
+  it("pads the seconds in minute form", () => {
+    expect(formatDuration(60)).toBe("1m 00s");
+    expect(formatDuration(125)).toBe("2m 05s");
+  });
+
+  it("clamps a negative wait rather than rendering '-3s'", () => {
+    expect(formatDuration(-3)).toBe("0s");
+  });
+});
+
+describe("describeError", () => {
+  it("turns a code into a sentence", () => {
+    expect(describeError(new ApiError(401, "invalid_credentials"))).toBe(
+      "Wrong username or password.",
+    );
+  });
+
+  it("names the field and rule when invalid_request carries zod issues", () => {
+    const err = (issues: ApiError["issues"]) => new ApiError(400, "invalid_request", { issues });
+    expect(describeError(err([{ path: "password", message: "String must contain at least 8 character(s)", code: "too_small", minimum: 8 }])))
+      .toBe("Password must be at least 8 characters.");
+    expect(describeError(err([{ path: "username", message: "String must contain at most 30 character(s)", code: "too_big", maximum: 30 }])))
+      .toBe("Username must be at most 30 characters.");
+    expect(describeError(err([{ path: "username", message: "letters, digits, _ and - only", code: "invalid_string" }])))
+      .toBe("Username: letters, digits, _ and - only.");
+    expect(describeError(err([{ path: "email", message: "Invalid email", code: "invalid_string" }])))
+      .toBe("Email: enter a valid email address.");
+    // First issue wins — one sentence, not a wall.
+    expect(describeError(err([
+      { path: "username", message: "letters, digits, _ and - only", code: "invalid_string" },
+      { path: "password", message: "String must contain at least 8 character(s)", code: "too_small", minimum: 8 },
+    ]))).toBe("Username: letters, digits, _ and - only.");
+    // camelCase paths read as words; a pathless issue still gets its message.
+    expect(describeError(err([{ path: "acceptTerms", message: "Required", code: "invalid_type" }])))
+      .toBe("Accept terms: Required.");
+    expect(describeError(err([{ path: "", message: "Unrecognized key", code: "unrecognized_keys" }])))
+      .toBe("Unrecognized key.");
+    // No issues at all: the generic sentence, unchanged.
+    expect(describeError(new ApiError(400, "invalid_request"))).toBe("That request wasn't valid.");
+    expect(describeError(err([]))).toBe("That request wasn't valid.");
+  });
+
+  it("falls back to the raw code so a new server code stays diagnosable", () => {
+    expect(describeError(new ApiError(400, "brand_new_code"))).toBe("brand_new_code");
+  });
+
+  it("uses the server's numbers on the timed codes", () => {
+    expect(describeError(new ApiError(423, "jailed", { remainingSeconds: 90 }))).toBe(
+      "You're in jail for another 1m 30s.",
+    );
+    expect(describeError(new ApiError(429, "on_cooldown", { retryAfter: 12 }))).toBe(
+      "Not ready yet — 12s to go.",
+    );
+    expect(describeError(new ApiError(409, "insufficient_stock", { available: 3 }))).toBe(
+      "Only 3 left in stock here.",
+    );
+  });
+
+  it("falls back to the plain sentence when the number is missing", () => {
+    expect(describeError(new ApiError(423, "jailed"))).toBe("You're in jail.");
+    expect(describeError(new ApiError(429, "on_cooldown"))).toBe("Not ready yet.");
+  });
+
+  it("handles non-ApiError values", () => {
+    expect(describeError(new Error("boom"))).toBe("boom");
+    expect(describeError("boom")).toBe("Something went wrong.");
+    expect(describeError(null)).toBe("Something went wrong.");
+  });
+
+  it("gives every attribute-pool refusal a sentence — the route mints insufficient_<pool> dynamically", () => {
+    for (const code of ["insufficient_energy", "insufficient_will", "insufficient_brave"]) {
+      const message = describeError(new ApiError(409, code));
+      expect(message, code).not.toBe(code);
+      expect(message).toMatch(/[a-z] /);
+    }
+    expect(describeError(new ApiError(409, "insufficient_level"))).not.toBe("insufficient_level");
+  });
+
+  it("refusalCooldownSeconds: server refusal without retryAfter unlocks (0), a 429 adopts the server's number, a transport error leaves the lock alone (null)", () => {
+    expect(refusalCooldownSeconds(new ApiError(409, "insufficient_brave"))).toBe(0);
+    expect(refusalCooldownSeconds(new ApiError(429, "on_cooldown", { retryAfter: 12 }))).toBe(12);
+    expect(refusalCooldownSeconds(new Error("network down"))).toBe(null);
+  });
+
+  it("describes insufficient_stock without naming bullets", () => {
+    const message = describeError(new ApiError(409, "insufficient_stock", { available: 3 }));
+    expect(message).toContain("3");
+    expect(message).not.toContain("bullets");
+  });
+
+  it("names the cap in the bullets limit codes", () => {
+    // The two an ordinary player can hit: a purchase over max_buy, and a
+    // factory owner pricing above max_cost.
+    expect(describeError(new ApiError(400, "quantity_above_max", { maxBuy: 250 })))
+      .toBe("You can buy at most 250 bullets at a time.");
+    expect(describeError(new ApiError(400, "lever_above_cap")))
+      .toBe("That price is above the limit the admin set.");
+  });
+
+  it("describes not_sold_here and no_location", () => {
+    expect(describeError(new ApiError(409, "not_sold_here"))).toBeTruthy();
+    expect(describeError(new ApiError(409, "no_location"))).toBeTruthy();
+  });
+
+  it("has copy for the danger-zone codes", () => {
+    expect(describeError(new ApiError(400, "terms_not_accepted"))).toBe("Accept the Terms of Service and Privacy Policy to register.");
+    expect(describeError(new ApiError(409, "sole_administrator"))).toBe("You're the only administrator — give another player the Administrator role first.");
+  });
+});

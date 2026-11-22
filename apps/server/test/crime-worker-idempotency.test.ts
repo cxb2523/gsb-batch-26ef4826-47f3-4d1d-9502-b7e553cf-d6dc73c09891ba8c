@@ -1,0 +1,225 @@
+import { GameEventSchema } from "@gl3/shared";
+import { and, eq } from "drizzle-orm";
+import { uuidv7 } from "uuidv7";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { GAME_EVENTS_CHANNEL } from "../src/bus/publish.js";
+import { loadConfig } from "../src/config.js";
+import { crimeLog, crimes, playerCrimeSkill, players, playerStats, transactions } from "../src/db/schema/index.js";
+import { seedCrimes } from "../src/db/seed.js";
+import { runPluginJob } from "../src/plugins/jobs.js";
+import crimesPlugin from "@gl3/plugin-crimes";
+import { createRedis, createSubscriber } from "../src/redis.js";
+import { resetDb, testDb } from "./helpers/db.js";
+
+const { db, sql: conn } = testDb();
+const config = loadConfig(process.env);
+const redis = createRedis(config.redisUrl);
+const subscriber = createSubscriber(config.redisUrl);
+
+// runPluginJob drives the real plugin handler in-process (no HTTP, no
+// boot) with the real plugin_job_runs guard — the same shape a BullMQ
+// retry takes.
+const deps = () => ({ db, redis, queues: new Map(), settings: {}, leaderboardPrefix: "idempotency-test" });
+
+let playerId: string;
+let crimeId: string;
+
+beforeEach(async () => {
+  await resetDb(db);
+  await seedCrimes(db, "v2");
+
+  playerId = uuidv7();
+  await db.insert(players).values({ id: playerId, username: `idem-${playerId}` });
+  await db.insert(playerStats).values({ playerId });
+
+  const [crime] = await db.select().from(crimes).where(eq(crimes.name, "Pickpocket"));
+  crimeId = crime!.id;
+
+  // Force a deterministic success so the payout is provably credited exactly
+  // once, rather than depending on a seed happening to roll a hit.
+  await db.insert(playerCrimeSkill).values({ playerId, crimeId, chance: "100.00" });
+});
+
+afterAll(async () => {
+  await conn.end();
+  redis.disconnect();
+  subscriber.disconnect();
+});
+
+describe("plugin commit job idempotency", () => {
+  it("does not double-pay when a BullMQ retry re-runs the same job.id", async () => {
+    await subscriber.subscribe(GAME_EVENTS_CHANNEL);
+    const events: unknown[] = [];
+    subscriber.on("message", (channel, raw) => {
+      if (channel !== GAME_EVENTS_CHANNEL) return;
+      // `game:events` is a global channel shared by every test file running
+      // in parallel — filter on this test's own actor, not just channel
+      // name, so a concurrent file's traffic can't be mistaken for the
+      // events this job caused (see ws.test.ts for the same discipline).
+      const parsed = GameEventSchema.safeParse(JSON.parse(raw));
+      if (parsed.success && parsed.data.actorId === playerId) events.push(parsed.data);
+    });
+
+    const job = {
+      id: "retry-test-job-1",
+      data: { playerId, crimeId, seed: "fixed-seed-for-idempotency-test" },
+    };
+
+    // First attempt: resolves and credits normally.
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    // A BullMQ retry re-runs the whole handler from scratch with the exact
+    // same job.id and the exact same seed — seed-determinism means it rolls
+    // the identical outcome, but the `plugin_job_runs` idempotency guard
+    // (structural, first write inside ctx.transaction) must stop it from
+    // crediting a second time. `crime_log.job_id` is a plain trace column
+    // (migration 0006 dropped its unique index), so the guard is the only
+    // thing standing between a retry and a double credit.
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+
+    const logs = await db.select().from(crimeLog).where(eq(crimeLog.playerId, playerId));
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.jobId).toBe(job.id);
+
+    const ledger = await db.select().from(transactions).where(eq(transactions.playerId, playerId));
+    expect(ledger).toHaveLength(1);
+
+    const [stats] = await db.select().from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(stats?.cash).toBeGreaterThan(0n); // the forced 100% chance guarantees a payout
+    expect(stats?.cash).toBe(ledger[0]?.amount); // credited exactly once, matching the one ledger row
+
+    // Give redis pub/sub a moment to deliver the message.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Spec §2: a retried already-committed job emits ONE event, not two.
+    // Core republished crime.resolved on replay (worker.ts Decision 1); the
+    // plugin framework swallows the replay (JobAlreadyAppliedError aborts the
+    // handler before any publishCore), so only the first run's event arrives.
+    expect(events).toHaveLength(1);
+  });
+});
+
+describe("plugin commit job bullet reward", () => {
+  it("credits the rolled bullets to player_stats exactly once, even on a retry", async () => {
+    // V2 pays `mt_rand(C_bullets, C_maxBullets)` into US_bullets on success
+    // (crimes.inc.php:128). GL3 rolled the figure and reported it in
+    // crime.resolved from the first crime slice on, but never wrote it —
+    // this is the regression test for that credit. Armoured Van is the v2
+    // seed with a live range (1..5); Pickpocket's is 0..0 and proves nothing.
+    const [van] = await db.select().from(crimes).where(eq(crimes.name, "Armoured Van"));
+    await db.insert(playerCrimeSkill).values({ playerId, crimeId: van!.id, chance: "100.00" });
+
+    await subscriber.subscribe(GAME_EVENTS_CHANNEL);
+    const events: Array<{ type: string; bullets?: string }> = [];
+    subscriber.on("message", (channel, raw) => {
+      if (channel !== GAME_EVENTS_CHANNEL) return;
+      const parsed = GameEventSchema.safeParse(JSON.parse(raw));
+      if (parsed.success && parsed.data.actorId === playerId && parsed.data.type === "crime.resolved") {
+        events.push(parsed.data);
+      }
+    });
+
+    const job = {
+      id: "bullet-reward-job-1",
+      data: { playerId, crimeId: van!.id, seed: "fixed-seed-for-bullet-reward-test" },
+    };
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+
+    const [stats] = await db.select({ bullets: playerStats.bullets })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(stats?.bullets).toBeGreaterThanOrEqual(BigInt(van!.minBullets));
+    expect(stats?.bullets).toBeLessThanOrEqual(BigInt(van!.maxBullets));
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The figure the event reports is the figure that landed on the row.
+    expect(events).toHaveLength(1);
+    expect(events[0]?.bullets).toBe(stats?.bullets?.toString());
+  });
+});
+
+describe("plugin commit job vs legacy core rows", () => {
+  // The deleted core worker's queue (`bull:crime`) and the plugin's queue
+  // (`crimes-commit`) number their jobs independently from 1, so a live DB
+  // carries core-era crime_log rows whose job_id values the plugin queue
+  // re-issues. Under the old `crime_log_job_id_unique` index the very first
+  // plugin-era commit collided with core-era job 1, failed all three BullMQ
+  // attempts, and the player saw a claimed cooldown and nothing else.
+  // plugin_job_runs — keyed (plugin_id, job_id) — is the idempotency guard;
+  // crime_log.job_id is a trace column and must tolerate the collision.
+  it("resolves a job whose BullMQ id collides with a core-era crime_log row", async () => {
+    await db.insert(crimeLog).values({
+      id: uuidv7(), playerId, crimeId, success: false, payout: 0n, jobId: "1",
+    });
+
+    const job = { id: "1", data: { playerId, crimeId, seed: "seed-legacy-collision" } };
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+
+    const logs = await db.select().from(crimeLog).where(eq(crimeLog.playerId, playerId));
+    expect(logs).toHaveLength(2); // the core-era row plus this resolution
+
+    // The forced 100% chance means the payout must actually have landed —
+    // proving the job resolved rather than silently swallowing a failure.
+    const ledger = await db.select().from(transactions).where(eq(transactions.playerId, playerId));
+    expect(ledger).toHaveLength(1);
+  });
+});
+
+// Task 6: jail-on-failure and rank-up now live inside the same guarded
+// transaction as the payout — prove a retry can't double-apply either.
+describe("plugin commit job idempotency — jail and rank-up", () => {
+  it("does not double-jail on a retried job that fails and rolls jail", async () => {
+    // Force a guaranteed jail regardless of the RNG seed: 0% success (so the
+    // crime always fails) and a 100% jail chance on that failure.
+    await db.update(playerCrimeSkill).set({ chance: "0.00" })
+      .where(and(eq(playerCrimeSkill.playerId, playerId), eq(playerCrimeSkill.crimeId, crimeId)));
+    await db.update(crimes).set({ jailChancePercent: 100 }).where(eq(crimes.id, crimeId));
+
+    const job = { id: "retry-jail-job-1", data: { playerId, crimeId, seed: "fixed-seed-for-jail-idempotency" } };
+
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    const [firstStats] = await db.select({ jailedUntil: playerStats.jailedUntil })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(firstStats?.jailedUntil).not.toBeNull();
+    const firstUntil = firstStats!.jailedUntil!.getTime();
+
+    // Retry: same job.id, same seed — must NOT re-jail (which would extend
+    // or reset the sentence past what the original attempt set).
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    const [secondStats] = await db.select({ jailedUntil: playerStats.jailedUntil })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(secondStats?.jailedUntil?.getTime()).toBe(firstUntil);
+
+    const logs = await db.select().from(crimeLog).where(eq(crimeLog.playerId, playerId));
+    expect(logs).toHaveLength(1); // one attempt recorded, not two
+  });
+
+  it("does not double-promote or double-pay the rank cash reward on a retried job", async () => {
+    const { seedRanks } = await import("../src/db/seed.js");
+    await seedRanks(db);
+
+    // beforeEach already forced this player's chance on `crimeId` to 100%.
+    // Bump the crime's exp reward so a single successful commit crosses
+    // straight from Associate (0 exp) to Soldier (100 exp, 500 cash reward).
+    await db.update(crimes).set({ expReward: 150n }).where(eq(crimes.id, crimeId));
+
+    const job = { id: "retry-rank-job-1", data: { playerId, crimeId, seed: "fixed-seed-for-rank-idempotency" } };
+
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    const [firstStats] = await db.select({ rankId: playerStats.rankId, cash: playerStats.cash })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(firstStats?.rankId).not.toBeNull(); // promoted past the default null rank
+
+    // Retry: same job.id, same seed — must NOT re-promote or re-pay the
+    // rank's cash reward a second time.
+    await runPluginJob(deps(), crimesPlugin, "commit", job);
+    const [secondStats] = await db.select({ rankId: playerStats.rankId, cash: playerStats.cash })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    expect(secondStats?.rankId).toBe(firstStats?.rankId);
+    expect(secondStats?.cash).toBe(firstStats?.cash);
+
+    // Exactly one rank.reward ledger row (the crime's own payout is a
+    // separate "crime.payout" row) — never doubled by the replay.
+    const rankLedger = await db.select().from(transactions)
+      .where(and(eq(transactions.playerId, playerId), eq(transactions.reason, "rank.reward")));
+    expect(rankLedger).toHaveLength(1);
+  });
+});

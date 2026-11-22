@@ -1,0 +1,1052 @@
+import { eq } from "drizzle-orm";
+import type { FastifyInstance } from "fastify";
+import type { Redis } from "ioredis";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { locations } from "../src/db/schema/content.js";
+import { items } from "../src/db/schema/content.js";
+import { playerItems } from "../src/db/schema/economy.js";
+import { playerStats } from "../src/db/schema/identity.js";
+import { resetDb, testDb } from "./helpers/db.js";
+import { registerVerifiedPlayer } from "./helpers/register.js";
+import { bootTestServer } from "./helpers/server.js";
+import { uuidv7 } from "uuidv7";
+
+const { db, sql: conn } = testDb();
+let app: FastifyInstance;
+let redis: Redis;
+let closeServer: () => Promise<void>;
+let adminToken: string;
+
+beforeEach(async () => {
+  await resetDb(db);
+  if (!app) ({ app, close: closeServer, redis } = await bootTestServer());
+  adminToken = (await registerVerifiedPlayer({ app, redis }, { username: "Founder" })).token;
+});
+
+afterAll(async () => { await closeServer(); await conn.end(); });
+
+const auth = () => ({ authorization: `Bearer ${adminToken}` });
+
+describe("inventory admin", () => {
+  describe("items", () => {
+    it("returns exact stored values for the item editor", async () => {
+      const id = uuidv7();
+      const effects = { damageMin: 3, damageMax: 9, accuracy: 0, backfireChance: 0, dps: 0.5 };
+      await db.insert(items).values({ id, name: "Editor gun", itemType: "weapon", effects });
+      const result = await app.inject({ method: "GET", url: `/api/admin/inventory/items/${id}`, headers: auth() });
+      expect(result.statusCode).toBe(200);
+      expect(result.json()).toEqual({ id, name: "Editor gun", itemType: "weapon", effects });
+      const missing = await app.inject({ method: "GET", url: `/api/admin/inventory/items/${uuidv7()}`, headers: auth() });
+      expect(missing.statusCode).toBe(404);
+      const anonymous = await app.inject({ method: "GET", url: `/api/admin/inventory/items/${id}` });
+      expect(anonymous.statusCode).toBe(401);
+      const member = await registerVerifiedPlayer({ app, redis }, { username: "Member" });
+      const forbidden = await app.inject({ method: "GET", url: `/api/admin/inventory/items/${id}`, headers: { authorization: `Bearer ${member.token}` } });
+      expect(forbidden.statusCode).toBe(403);
+    });
+
+    it("preserves an explicit zero backfire chance when saving the editor", async () => {
+      const create = await app.inject({ method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Safe gun", itemType: "weapon", damageMin: 1, damageMax: 2, backfireChance: 0 } });
+      expect(create.statusCode).toBe(201);
+      const id = create.json().id;
+      const update = await app.inject({ method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, name: "Renamed gun", itemType: "weapon", damageMin: 1, damageMax: 2, backfireChance: "0" } });
+      expect(update.statusCode).toBe(204);
+      const [stored] = await db.select().from(items).where(eq(items.id, id));
+      expect(stored?.effects).toMatchObject({ backfireChance: 0 });
+    });
+
+    it("keeps custom consumable configuration when editing the same effect", async () => {
+      const id = uuidv7();
+      await db.insert(items).values({ id, name: "Custom tonic", itemType: "consumable",
+        effects: { kind: "custom-tonic", duration: 60, bonus: { exp: 12 } } });
+      const update = await app.inject({ method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, name: "Renamed tonic", itemType: "consumable", kind: "custom-tonic", heal: "", energy: "", will: "", brave: "" } });
+      expect(update.statusCode).toBe(204);
+      const [stored] = await db.select().from(items).where(eq(items.id, id));
+      expect(stored?.effects).toEqual({ kind: "custom-tonic", duration: 60, bonus: { exp: 12 } });
+    });
+
+    it("creates a weapon whose effects parse through the combat schema", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Lupara", itemType: "weapon", damageMin: 10, damageMax: 20, accuracy: 65 },
+      });
+      expect(res.statusCode).toBe(201);
+      const id: string = res.json().id;
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.itemType).toBe("weapon");
+      expect(row?.effects).toEqual({
+        damageMin: 10, damageMax: 20, accuracy: 65,
+        bulletsPerShot: 1, critChance: 0, critMultiplier: 1, armorPierce: 0, minRankExp: 0, minLevel: 0,
+      });
+    });
+
+    // The regression this file exists to pin: the form and body schema used to
+    // carry damageMin/damageMax/accuracy only, so the other five weapon stats
+    // were frozen at WeaponEffectsSchema's defaults for anything an admin
+    // created — unreachable from the UI for the life of the item.
+    it("creates a weapon carrying every weapon stat", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Tommy Gun", itemType: "weapon",
+          damageMin: 12, damageMax: 30, accuracy: 40,
+          bulletsPerShot: 6, critChance: 15, critMultiplier: 2.5,
+          armorPierce: 8, minRankExp: 5000, minLevel: 7,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({
+        damageMin: 12, damageMax: 30, accuracy: 40,
+        bulletsPerShot: 6, critChance: 15, critMultiplier: 2.5,
+        armorPierce: 8, minRankExp: 5000, minLevel: 7,
+      });
+    });
+
+    // Both requirement figures are always stored; the boot's progression
+    // model decides which one the equip gate reads. The admin form only
+    // SHOWS the one this boot uses (`when: { progression }`), so the other
+    // arrives blank from the renderer and must read as 0, not as absent.
+    it("stores a blank minLevel as 0 and prunes the exp field from a level boot's weapon form", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Snub", itemType: "weapon", damageMin: 1, damageMax: 2, minLevel: "", minRankExp: "" },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toMatchObject({ minLevel: 0, minRankExp: 0 });
+
+      // The default test boot is the gl3 union — a routed (level) boot.
+      // Admin pages are served (and pruned) by /api/admin/plugins, not the
+      // player manifest.
+      const sections = await app.inject({ method: "GET", url: "/api/admin/plugins", headers: auth() });
+      const inventory = (sections.json().sections as Array<{ pluginId: string; pages: Array<{ id: string; view: unknown }> }>)
+        .find((s) => s.pluginId === "inventory");
+      const page = inventory?.pages.find((p) => p.id === "inventory-admin");
+      expect(page).toBeDefined();
+      const names = new Set<string>();
+      const walk = (node: unknown): void => {
+        if (Array.isArray(node)) { node.forEach(walk); return; }
+        if (typeof node !== "object" || node === null) return;
+        const rec = node as Record<string, unknown>;
+        if (typeof rec["name"] === "string") names.add(rec["name"]);
+        if (typeof rec["key"] === "string") names.add(rec["key"]);
+        Object.values(rec).forEach(walk);
+      };
+      walk(page?.view);
+      expect(names.has("minLevel")).toBe(true);
+      expect(names.has("minRankExp")).toBe(false);
+    });
+
+    // The renderer posts every field in the form, blank ones as "". Left to
+    // `z.coerce.number()` that reads as 0, and accuracy 0 is a weapon that
+    // never hits — the opposite of the "unstated, let combat decide" the
+    // optional field is for.
+    it("treats a blank accuracy as absent rather than zero", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Unstated", itemType: "weapon",
+          damageMin: 5, damageMax: 9, accuracy: "",
+          bulletsPerShot: "", critChance: "", critMultiplier: "",
+          armorPierce: "", minRankExp: "",
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({
+        damageMin: 5, damageMax: 9,
+        bulletsPerShot: 1, critChance: 0, critMultiplier: 1,
+        armorPierce: 0, minRankExp: 0, minLevel: 0,
+      });
+    });
+
+    it("rejects a weapon whose critChance is above 100", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Impossible", itemType: "weapon",
+          damageMin: 1, damageMax: 2, critChance: 101,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a weapon whose critMultiplier is below 1", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Anti-crit", itemType: "weapon",
+          damageMin: 1, damageMax: 2, critMultiplier: 0.5,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // `dps` is what paces the attack cooldown (combat's `cooldownSecondsFor`).
+    // Unreachable from the admin UI, a weapon could only ever be created
+    // unpaced — the same regression the five stats above were added for.
+    it("creates a weapon carrying a fractional dps", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Slow Cannon", itemType: "weapon",
+          damageMin: 10, damageMax: 10, dps: 0.5,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      // 0.5, not 0 and not 1: the coercion must not round a rate of fire.
+      expect(row?.effects).toMatchObject({ dps: 0.5 });
+    });
+
+    it("treats a blank dps as absent, leaving the weapon on the flat cooldown", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Unpaced", itemType: "weapon",
+          damageMin: 5, damageMax: 9, dps: "",
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).not.toHaveProperty("dps");
+    });
+
+    it("rejects a non-positive dps", async () => {
+      // Zero is a division by zero downstream; the route is where it should die.
+      for (const dps of [0, -1]) {
+        const res = await app.inject({
+          method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+          payload: { name: "Frozen", itemType: "weapon", damageMin: 1, damageMax: 2, dps },
+        });
+        expect(res.statusCode).toBe(400);
+      }
+    });
+
+    it("creates an armor item", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Kevlar Vest", itemType: "armor", armor: 30 },
+      });
+      expect(res.statusCode).toBe(201);
+      const id: string = res.json().id;
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.itemType).toBe("armor");
+      expect(row?.effects).toEqual({ armor: 30 });
+    });
+
+    it("creates a consumable item", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Medkit", itemType: "consumable", heal: 25 },
+      });
+      expect(res.statusCode).toBe(201);
+      const id: string = res.json().id;
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.itemType).toBe("consumable");
+      expect(row?.effects).toEqual({ heal: 25 });
+    });
+
+    // The pool delta fields author the built-in `pools` def's config — the
+    // one effect kind whose config had no form field at all, so a UI-authored
+    // pools item shipped `{ kind: "pools" }` with no `pools` key and 400d
+    // `wrong_slot` on its first use.
+    // A misc item carries no effects at all: it exists for another plugin to
+    // read (a key, a token, a quest object) and the inventory plugin never
+    // interprets it — the use route answers wrong_slot and equip refuses.
+    // Without a form arm for it, no such item could be authored.
+    it("creates a misc item with empty effects", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Warehouse Key", itemType: "misc" },
+      });
+      expect(res.statusCode).toBe(201);
+      const id: string = res.json().id;
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.itemType).toBe("misc");
+      expect(row?.effects).toEqual({});
+    });
+
+    it("lists a misc item with every stat cell blank", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Warehouse Key", itemType: "misc" },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({
+        itemType: "misc", damage: "", power: "", armor: "", heal: "", effect: "", pools: "",
+      });
+    });
+
+    it("creates a pools consumable from the delta fields, auto-selecting the kind", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Energy Tonic", itemType: "consumable", heal: "", kind: "", energy: -4, brave: 3 },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({ kind: "pools", pools: { energy: -4, brave: 3 } });
+    });
+
+    // MCCodes' percent fill: a delta written `50%` is stored as-is and the
+    // def resolves it against the pool's max when the item is used.
+    it("stores a percent pool delta verbatim", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Half Tonic", itemType: "consumable", energy: "50%", brave: "-10%", will: "" },
+      });
+      expect(res.statusCode, res.body).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({ kind: "pools", pools: { energy: "50%", brave: "-10%" } });
+    });
+
+    it("stores a percent heal verbatim", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Half Kit", itemType: "consumable", heal: "50%" },
+      });
+      expect(res.statusCode, res.body).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({ heal: "50%" });
+    });
+
+    it("still stores a flat delta typed into the text field as a number", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Tonic", itemType: "consumable", heal: "", energy: "-4", brave: "3" },
+      });
+      expect(res.statusCode, res.body).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({ kind: "pools", pools: { energy: -4, brave: 3 } });
+    });
+
+    it("rejects a zero, malformed or non-positive-heal percent", async () => {
+      for (const payload of [
+        { name: "P1", itemType: "consumable", energy: "0%" },
+        { name: "P2", itemType: "consumable", energy: "1.5%" },
+        { name: "P3", itemType: "consumable", energy: "50 %" },
+        { name: "P4", itemType: "consumable", energy: "half" },
+        { name: "P5", itemType: "consumable", heal: "0%" },
+        { name: "P6", itemType: "consumable", heal: "-20%" },
+      ]) {
+        const res = await app.inject({
+          method: "POST", url: "/api/admin/inventory/items", headers: auth(), payload,
+        });
+        expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+      }
+    });
+
+    it("creates a pools consumable when the kind is stated explicitly", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Willpower Pill", itemType: "consumable", kind: "pools", will: 10 },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.effects).toEqual({ kind: "pools", pools: { will: 10 } });
+    });
+
+    // Mirrors the heal check's reasoning: refuse at authoring time rather
+    // than as the `wrong_slot` the first player to spend the item discovers.
+    it("rejects a pools consumable with no delta", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Empty Vial", itemType: "consumable", kind: "pools" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // The delta fields belong to the built-in `pools` def alone — a
+    // third-party def's config is not expressible through this form.
+    it("rejects pool deltas under a non-pools kind", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Confused Brew", itemType: "consumable", kind: "heal", heal: 10, energy: 2 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // No def reads both: heal is the heal def's config, deltas are pools'.
+    it("rejects a heal figure mixed with pool deltas", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Kitchen Sink", itemType: "consumable", heal: 10, brave: 3 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // The pools def refuses a zero delta as malformed config, so a stated 0
+    // dies here rather than in every player's use attempt. Blank still means
+    // "no delta on this pool".
+    it("rejects a stated zero delta", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Placebo", itemType: "consumable", kind: "pools", energy: 0, brave: 3 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // Melee weapons: `power` in the effects IS the model marker (combat C6),
+    // so the form authors them under its own discriminant "melee" while the
+    // row stores item_type "weapon" — the melee slot's equip gate and
+    // combat's loadWeapon both read the effects, never a distinct type.
+    it("creates a melee weapon stored as item_type weapon with power effects", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Combat Knife", itemType: "melee", power: 12 },
+      });
+      expect(res.statusCode).toBe(201);
+      const [row] = await db.select().from(items).where(eq(items.id, res.json().id));
+      expect(row?.itemType).toBe("weapon");
+      expect(row?.effects).toEqual({ power: 12 });
+    });
+
+    // "" coerces to 0, which is not a positive power — unlike the firearm
+    // optionals there is no meaningful blank here, so it refuses.
+    it("rejects a melee weapon with no power figure", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Pool Noodle", itemType: "melee", power: "" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a weapon with damageMax < damageMin", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Broken", itemType: "weapon", damageMin: 20, damageMax: 10 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    // The listing used to carry one `effects` column holding JSON.stringify of
+    // the jsonb, which the table view rendered as a wall of braces. Every stat
+    // is its own column now, so the table is readable and each cell lines up
+    // with the update form field that sets it.
+    it("lists a weapon as one column per stat, with no JSON blob", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: {
+          name: "Lupara", itemType: "weapon",
+          damageMin: 10, damageMax: 20, accuracy: 65,
+          bulletsPerShot: 2, critChance: 10, critMultiplier: 1.5,
+          armorPierce: 3, minRankExp: 100, dps: 1.5,
+        },
+      });
+      expect(create.statusCode).toBe(201);
+      const id: string = create.json().id;
+
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      expect(list.statusCode).toBe(200);
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual({
+        id,
+        name: "Lupara",
+        itemType: "weapon",
+        damage: "10–20",
+        accuracy: "65",
+        bulletsPerShot: "2",
+        critChance: "10",
+        critMultiplier: "1.5",
+        armorPierce: "3",
+        minRankExp: "100",
+        minLevel: "0",
+        dps: "1.5",
+        // Blank, not "—": a firearm has no power stat at all.
+        power: "",
+        armor: "",
+        heal: "",
+        // The effect kind cell, blank for anything that is not a consumable.
+        effect: "",
+        // Pool deltas — a consumable-only stat, blank here like `heal`.
+        pools: "",
+      });
+      expect(rows[0]).not.toHaveProperty("effects");
+    });
+
+    it("lists an armor item with the weapon stat cells blank", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Kevlar Vest", itemType: "armor", armor: 30 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({
+        itemType: "armor", armor: "30",
+        damage: "", accuracy: "", critMultiplier: "", heal: "",
+      });
+    });
+
+    it("lists a consumable's heal", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Medkit", itemType: "consumable", heal: 25 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({ itemType: "consumable", heal: "25", damage: "", armor: "" });
+    });
+
+    it("lists a pools consumable's deltas in the pools column", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Energy Tonic", itemType: "consumable", energy: -4, brave: 3 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({
+        itemType: "consumable", effect: "pools", heal: "—", pools: "energy -4, brave +3",
+      });
+    });
+
+    it("lists percent figures with their sign and the % kept", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Half Tonic", itemType: "consumable", energy: "50%", brave: "-10%" },
+      });
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Half Kit", itemType: "consumable", heal: "50%" },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows.find((r) => r["name"] === "Half Tonic")).toMatchObject({ pools: "energy +50%, brave -10%" });
+      expect(rows.find((r) => r["name"] === "Half Kit")).toMatchObject({ heal: "50%" });
+    });
+
+    // Em dash, matching heal's own convention: the stat exists for the type
+    // and this item does not state it.
+    it("dashes the pools column of a heal consumable", async () => {
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Medkit", itemType: "consumable", heal: 25 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({ heal: "25", pools: "—" });
+    });
+
+    // A V2-migrated weapon has no accuracy: `itemEffects` had no such column,
+    // and combat fills it from its own setting at fire time. Absent must read
+    // as absent, not as zero — a weapon that states accuracy 0 never hits.
+    it("dashes the accuracy of a weapon that has none", async () => {
+      await db.insert(items).values({
+        id: uuidv7(), name: "Migrated Shiv", itemType: "weapon",
+        effects: {
+          damageMin: 4, damageMax: 6, bulletsPerShot: 1,
+          critChance: 0, critMultiplier: 1, armorPierce: 0, minRankExp: 0,
+        },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({ damage: "4–6", accuracy: "—" });
+    });
+
+    // The regression this pins: statCells ran every weapon row through the
+    // firearm schema, which a melee row — power, no damage range — fails, so
+    // one imported melee item took down the whole admin items table with a
+    // 500. Inserted directly, as the MCCodes migrator would.
+    it("lists a melee weapon's power without failing the firearm columns", async () => {
+      await db.insert(items).values({
+        id: uuidv7(), name: "Imported Katana", itemType: "weapon",
+        effects: { power: 40 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      expect(list.statusCode).toBe(200);
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({
+        name: "Imported Katana", itemType: "weapon", power: "40",
+        damage: "", accuracy: "", dps: "", armor: "", heal: "",
+      });
+    });
+
+    // `items.effects` is jsonb an earlier tool or a hand-edit can leave in a
+    // shape the schema rejects. The listing must say so rather than render
+    // blanks that read like a valid item with no stats.
+    it("marks a known item type whose effects do not parse", async () => {
+      await db.insert(items).values({
+        id: uuidv7(), name: "Broken Gun", itemType: "weapon",
+        effects: { damageMin: 10 },
+      });
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/items", headers: auth() });
+      const rows = list.json().rows as Array<Record<string, string>>;
+      expect(rows[0]).toMatchObject({ name: "Broken Gun", damage: "invalid", accuracy: "" });
+    });
+
+    it("403s a non-admin", async () => {
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Pleb" });
+      const res = await app.inject({
+        method: "GET", url: "/api/admin/inventory/items",
+        headers: { authorization: `Bearer ${p.token}` },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  // Items were create-only, so a seeded item — Rusty Pistol among them — could
+  // never be rebalanced from the admin UI. This is the crimes/ranks update
+  // pattern applied to items.
+  describe("item update", () => {
+    async function makeWeapon(): Promise<string> {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Rusty Pistol", itemType: "weapon", damageMin: 8, damageMax: 18, accuracy: 55 },
+      });
+      expect(res.statusCode).toBe(201);
+      return res.json().id;
+    }
+
+    it("rewrites every weapon stat", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: {
+          id, itemType: "weapon",
+          damageMin: 20, damageMax: 45, accuracy: 80,
+          bulletsPerShot: 3, critChance: 25, critMultiplier: 3,
+          armorPierce: 12, minRankExp: 9000, minLevel: 11,
+        },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toEqual({
+        damageMin: 20, damageMax: 45, accuracy: 80,
+        bulletsPerShot: 3, critChance: 25, critMultiplier: 3,
+        armorPierce: 12, minRankExp: 9000, minLevel: 11,
+      });
+    });
+
+    it("renames an item", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "weapon", name: "Polished Pistol", damageMin: 8, damageMax: 18 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.name).toBe("Polished Pistol");
+    });
+
+    it("leaves the name alone when none is sent", async () => {
+      const id = await makeWeapon();
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "weapon", damageMin: 8, damageMax: 18 },
+      });
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.name).toBe("Rusty Pistol");
+    });
+
+    // Same reason as the blank-accuracy case: the form always posts `name`, so
+    // a blank one must mean "leave it" and not rename the item to "".
+    it("leaves the name alone when a blank one is sent", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "weapon", name: "", damageMin: 8, damageMax: 18 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.name).toBe("Rusty Pistol");
+    });
+
+    it("updates an armor item", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Kevlar Vest", itemType: "armor", armor: 30 },
+      });
+      const id: string = create.json().id;
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "armor", armor: 55 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toEqual({ armor: 55 });
+    });
+
+    it("updates a consumable item", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Medkit", itemType: "consumable", heal: 25 },
+      });
+      const id: string = create.json().id;
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "consumable", heal: 60 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toEqual({ heal: 60 });
+    });
+
+    it("rewrites a consumable's pool deltas", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Energy Tonic", itemType: "consumable", energy: -4, brave: 3 },
+      });
+      const id: string = create.json().id;
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "consumable", kind: "pools", energy: -2, will: 5 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toEqual({ kind: "pools", pools: { energy: -2, will: 5 } });
+    });
+
+    // The form's item select lists every item regardless of type, so an admin
+    // can point the armor form at a weapon. Writing `{ armor: n }` onto a
+    // weapon would leave a row whose item_type and effects disagree, which
+    // readEffects then reports as null and equipping refuses.
+    it("400s writing armor stats onto a weapon", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "armor", armor: 30 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("item_type_mismatch");
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toMatchObject({ damageMin: 8, damageMax: 18 });
+    });
+
+    it("updates a melee weapon's power", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Combat Knife", itemType: "melee", power: 12 },
+      });
+      expect(create.statusCode).toBe(201);
+      const id: string = create.json().id;
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "melee", power: 55 },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.itemType).toBe("weapon");
+      expect(row?.effects).toEqual({ power: 55 });
+    });
+
+    // Melee stores as item_type "weapon", so the mismatch guard must compare
+    // against the STORED type the form value maps to — an armor item is
+    // still refused, same as pointing the armor form at a weapon.
+    it("400s the melee form pointed at an armor item", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Kevlar Vest", itemType: "armor", armor: 30 },
+      });
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id: create.json().id, itemType: "melee", power: 10 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("item_type_mismatch");
+    });
+
+    it("renames a misc item and keeps its effects empty", async () => {
+      const create = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Warehouse Key", itemType: "misc" },
+      });
+      expect(create.statusCode).toBe(201);
+      const id: string = create.json().id;
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "misc", name: "Dock Key" },
+      });
+      expect(res.statusCode).toBe(204);
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.name).toBe("Dock Key");
+      expect(row?.itemType).toBe("misc");
+      expect(row?.effects).toEqual({});
+    });
+
+    it("400s the misc form pointed at a weapon", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "misc", name: "Not A Key" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("item_type_mismatch");
+      const [row] = await db.select().from(items).where(eq(items.id, id));
+      expect(row?.effects).toMatchObject({ damageMin: 8, damageMax: 18 });
+    });
+
+    it("404s an unknown item id", async () => {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id: uuidv7(), itemType: "weapon", damageMin: 1, damageMax: 2 },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe("item_not_found");
+    });
+
+    it("400s damageMax below damageMin", async () => {
+      const id = await makeWeapon();
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update", headers: auth(),
+        payload: { id, itemType: "weapon", damageMin: 30, damageMax: 5 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("403s a non-admin", async () => {
+      const id = await makeWeapon();
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Pleb" });
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items/update",
+        headers: { authorization: `Bearer ${p.token}` },
+        payload: { id, itemType: "weapon", damageMin: 1, damageMax: 2 },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("locations feed", () => {
+    // Feeds the shop form's location select. `GET /api/admin/inventory/shop`
+    // cannot serve that role: it lists existing stock rows, which is empty
+    // exactly when the admin stocks a location for the first time.
+    it("lists all locations as id/name rows", async () => {
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Palermo",
+        travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+      const res = await app.inject({
+        method: "GET", url: "/api/admin/inventory/locations", headers: auth(),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rows).toEqual([{ id: locationId, name: "Palermo" }]);
+    });
+
+    it("403s a non-admin", async () => {
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Pleb" });
+      const res = await app.inject({
+        method: "GET", url: "/api/admin/inventory/locations",
+        headers: { authorization: `Bearer ${p.token}` },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("shop stock", () => {
+    it("stocks the shop and the public listing sees it", async () => {
+      // Seed a location via direct insert
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Palermo",
+        travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+
+      // Create an item via the admin route
+      const itemRes = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Lupara", itemType: "weapon", damageMin: 10, damageMax: 20, accuracy: 65 },
+      });
+      expect(itemRes.statusCode).toBe(201);
+      const itemId: string = itemRes.json().id;
+
+      // Register a player and place them at the seeded location
+      const player = await registerVerifiedPlayer({ app, redis }, { username: "Buyer" });
+      const playerToken = player.token;
+      const buyerId = player.playerId;
+      await db.update(playerStats).set({ locationId }).where(eq(playerStats.playerId, buyerId));
+
+      // First upsert (insert)
+      const stock1 = await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId, price: "500", stock: 10 },
+      });
+      expect(stock1.statusCode).toBe(204);
+
+      // Second upsert (update)
+      const stock2 = await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId, price: "750", stock: 5 },
+      });
+      expect(stock2.statusCode).toBe(204);
+
+      // Drive the PUBLIC shop route for the buyer's location
+      const shop = await app.inject({
+        method: "GET", url: "/api/shop",
+        headers: { authorization: `Bearer ${playerToken}` },
+      });
+      expect(shop.statusCode).toBe(200);
+      const shopItems = shop.json().items as Array<{
+        itemId: string; name: string; price: string; stock: number;
+      }>;
+      expect(shopItems).toHaveLength(1);
+      expect(shopItems[0].itemId).toBe(itemId);
+      expect(shopItems[0].price).toBe("750");
+      expect(shopItems[0].stock).toBe(5);
+    });
+
+    it("lists shop stock with location and item names", async () => {
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Palermo",
+        travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+
+      const itemRes = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Lupara", itemType: "weapon", damageMin: 10, damageMax: 20 },
+      });
+      const itemId: string = itemRes.json().id;
+
+      const stock = await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId, price: "500", stock: 10 },
+      });
+      expect(stock.statusCode).toBe(204);
+
+      const list = await app.inject({ method: "GET", url: "/api/admin/inventory/shop", headers: auth() });
+      expect(list.statusCode).toBe(200);
+      const rows = list.json().rows as Array<{
+        locationId: string; locationName: string;
+        itemId: string; itemName: string;
+        price: string; stock: string;
+      }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].locationId).toBe(locationId);
+      expect(rows[0].locationName).toBe("Palermo");
+      expect(rows[0].itemId).toBe(itemId);
+      expect(rows[0].itemName).toBe("Lupara");
+      expect(rows[0].price).toBe("500");
+      expect(rows[0].stock).toBe("10");
+    });
+
+    it("404s stocking an unknown item", async () => {
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Palermo",
+        travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId: uuidv7(), price: "100", stock: 5 },
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it("404s stocking an unknown location", async () => {
+      const itemRes = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name: "Lupara", itemType: "weapon", damageMin: 10, damageMax: 20 },
+      });
+      const itemId: string = itemRes.json().id;
+
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId: uuidv7(), itemId, price: "100", stock: 5 },
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it("403s a non-admin", async () => {
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Pleb" });
+      const res = await app.inject({
+        method: "GET", url: "/api/admin/inventory/shop",
+        headers: { authorization: `Bearer ${p.token}` },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("deletion", () => {
+    async function createItem(name: string): Promise<string> {
+      const res = await app.inject({
+        method: "POST", url: "/api/admin/inventory/items", headers: auth(),
+        payload: { name, itemType: "weapon", damageMin: 1, damageMax: 2 },
+      });
+      return res.json().id as string;
+    }
+
+    it("deletes an unowned item along with its shop listings", async () => {
+      const itemId = await createItem("Rusty pipe");
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Palermo", travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId, price: "100", stock: 5 },
+      });
+
+      const del = await app.inject({ method: "DELETE", url: `/api/admin/inventory/items/${itemId}`, headers: auth() });
+      expect(del.statusCode).toBe(204);
+      expect(await db.select().from(items).where(eq(items.id, itemId))).toEqual([]);
+      // p_inventory_shop_stock has no FK, so the route must have cleaned it.
+      const shop = await app.inject({ method: "GET", url: "/api/admin/inventory/shop", headers: auth() });
+      expect(shop.json().rows).toEqual([]);
+    });
+
+    it("refuses deleting an item a player owns", async () => {
+      const itemId = await createItem("Heirloom");
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Owner" });
+      await db.insert(playerItems).values({ playerId: p.playerId, itemId, qty: 1 });
+
+      const del = await app.inject({ method: "DELETE", url: `/api/admin/inventory/items/${itemId}`, headers: auth() });
+      expect(del.statusCode).toBe(409);
+      expect(del.json().error).toBe("item_in_use");
+      expect((await db.select().from(items).where(eq(items.id, itemId))).length).toBe(1);
+    });
+
+    it("refuses deleting an item someone has equipped", async () => {
+      const itemId = await createItem("Cursed blade");
+      const p = await registerVerifiedPlayer({ app, redis }, { username: "Wielder" });
+      await db.update(playerStats).set({ weaponItemId: itemId }).where(eq(playerStats.playerId, p.playerId));
+
+      const del = await app.inject({ method: "DELETE", url: `/api/admin/inventory/items/${itemId}`, headers: auth() });
+      expect(del.statusCode).toBe(409);
+      expect(del.json().error).toBe("item_in_use");
+    });
+
+    it("deletes one shop listing by its composite key", async () => {
+      const itemId = await createItem("Snubnose");
+      const locationId = uuidv7();
+      await db.insert(locations).values({
+        id: locationId, name: "Corleone", travelCost: 0n, travelCooldownSeconds: 0,
+        bulletStock: 0, bulletCost: 0n,
+      });
+      await app.inject({
+        method: "POST", url: "/api/admin/inventory/shop", headers: auth(),
+        payload: { locationId, itemId, price: "100", stock: 5 },
+      });
+
+      const del = await app.inject({
+        method: "DELETE", url: `/api/admin/inventory/shop/${locationId}/${itemId}`, headers: auth(),
+      });
+      expect(del.statusCode).toBe(204);
+      const shop = await app.inject({ method: "GET", url: "/api/admin/inventory/shop", headers: auth() });
+      expect(shop.json().rows).toEqual([]);
+      // The item itself survives — only the listing went.
+      expect((await db.select().from(items).where(eq(items.id, itemId))).length).toBe(1);
+    });
+
+    it("404s deleting an unknown item and an unknown shop listing", async () => {
+      const missingItem = await app.inject({
+        method: "DELETE", url: `/api/admin/inventory/items/${uuidv7()}`, headers: auth(),
+      });
+      expect(missingItem.statusCode).toBe(404);
+      const missingStock = await app.inject({
+        method: "DELETE", url: `/api/admin/inventory/shop/${uuidv7()}/${uuidv7()}`, headers: auth(),
+      });
+      expect(missingStock.statusCode).toBe(404);
+    });
+  });
+});

@@ -1,0 +1,173 @@
+import { randomUUID } from "node:crypto";
+import type { PluginManifest } from "@gl3/plugin-sdk";
+import type { FastifyInstance } from "fastify";
+import type { Redis } from "ioredis";
+import { buildApp } from "../../src/app.js";
+import type { FilesystemDriver } from "../../src/assets/fs-driver.js";
+import { loadConfig } from "../../src/config.js";
+import { createDb } from "../../src/db/client.js";
+import { rebuildLeaderboards } from "../../src/game/leaderboard/service.js";
+import { withCorePlugins, bundledPlugins } from "../../src/plugins/core-plugins.js";
+import { loadPlugins, type LoadedPlugins } from "../../src/plugins/loader.js";
+import { loadSettings } from "../../src/settings/load.js";
+import { createRedis, createSubscriber } from "../../src/redis.js";
+import { attachGateway } from "../../src/ws/gateway.js";
+import { testAssetDriver } from "./assets.js";
+
+export async function bootTestServer(
+  options?: { plugins?: readonly PluginManifest[]; profile?: "gl3" | "v2" | "mccodes" | "framework" },
+): Promise<{
+  app: FastifyInstance;
+  close: () => Promise<void>;
+  plugins: LoadedPlugins;
+  assetDriver: FilesystemDriver;
+  /** The same Redis client the app itself uses — exposed so a test can read a
+   * key the app wrote (e.g. an `emailverify:*` verification code) without
+   * opening a second connection. See `registerVerifiedPlayer`. */
+  redis: Redis;
+  /** This boot's private leaderboard namespace — exposed so a test can read
+   * or seed a `<prefix>:<kind>` ZSET directly rather than only through the
+   * HTTP surface. See auth-delete-account.test.ts. */
+  leaderboardPrefix: string;
+}> {
+  // GL3_PROFILE is pinned per call, not inherited: an ambient variable in a
+  // developer's shell must not flip a test file's plugin set.
+  // The default follows production's flagship: the gl3 union (spec §4,
+  // milestone 4). A test that genuinely tests the v2 game's pricing pins
+  // { profile: "v2" } explicitly, with a comment saying why.
+  const config = loadConfig({ ...process.env, NODE_ENV: "test", GL3_PROFILE: options?.profile ?? "gl3" });
+  const { db, sql } = createDb(config.databaseUrl);
+  const redis = createRedis(config.redisUrl);
+
+  // Same problem, same fix, as queueName previously used for the crimes
+  // BullMQ queue (now gone — the crimes worker is a plugin worker, started
+  // and isolated per-call by loadPlugins below): leaderboard:* keys are
+  // global by design in production (one Redis, one game — spec §2.2), but
+  // that means every bootTestServer() call sweeping ITS OWN isolated
+  // Postgres DB into those same shared keys would race every other
+  // concurrently-running file's sweep. A private namespace per call keeps
+  // this server's rebuild, live recordScore writes, and GET
+  // /api/leaderboard/:kind reads all pointed at the same isolated set of
+  // Redis keys nobody else can touch.
+  const leaderboardPrefix = `leaderboard-test-${randomUUID()}`;
+
+  // Same problem, same fix, as leaderboardPrefix above:
+  // /api/auth/register and /api/auth/login are rate-limited per IP via
+  // ratelimit:<name>:<ip> keys in the same shared Redis, and Fastify's
+  // inject() reports the same default 127.0.0.1 for every test file. Without
+  // a private prefix, one file's registrations count against every other
+  // concurrently-running file's bucket and can trip a false 429 that looks
+  // like an auth bug but isn't (see rate-limit-isolation.setup.ts for the
+  // backstop this still leaves for tests that call buildApp() directly).
+  const rateLimitPrefix = `ratelimit-test-${randomUUID()}`;
+
+  // Boot can throw before anything owns these two clients: validatePlugins
+  // rejects a bad manifest set from inside loadPlugins, long before there is
+  // an app to hang an onClose hook on. A file that deliberately asserts a
+  // boot failure (world-hooks.test.ts) would otherwise leak a Postgres pool
+  // and a Redis connection per rejected boot, for the lifetime of the file.
+  const onBootFailure = async (err: unknown): Promise<never> => {
+    // Swallow a cleanup failure: rethrowing it here would mask the boot error
+    // the caller is actually asserting on.
+    await sql.end().catch(() => undefined);
+    // Same drain, same reason, as `close()` below: a boot that failed AFTER
+    // `loadPlugins` built its queues leaves their shared-connection `init()`
+    // in flight, and destroying the client under it raises an unhandled
+    // rejection that fails the run without failing a test.
+    await redis.ping().catch(() => undefined);
+    redis.disconnect();
+    throw err;
+  };
+
+  await rebuildLeaderboards(db, redis, leaderboardPrefix).catch(onBootFailure);
+
+  const loadedTestSettings = await loadSettings(db).catch(onBootFailure);
+
+  // Always run the full boot sequence (validate → migrate → queues/workers)
+  // the same way production does, so a test exercises the real loader path.
+  // `withCorePlugins` is what makes that true: a ported core module is never
+  // optional, so production always loads CORE_PLUGINS alongside whatever
+  // optional manifests it selects, and this boot does the same regardless of
+  // whether the caller passed any of its own. This can no longer be left to
+  // buildApp's own no-`deps.plugins` fallback (see the comment at that seam
+  // in app.ts): that fallback deliberately throws for a CORE_PLUGIN that
+  // declares jobs, of which the crimes plugin is now the first, so a
+  // `bootTestServer()` call must always supply `deps.plugins` itself, not
+  // just when the caller wants extra optional manifests. The random queue
+  // prefix isolates plugin BullMQ queues (including the crimes plugin's)
+  // from each other and from other test files' queues in the same shared
+  // Redis.
+  // Per boot, never the process-wide ASSET_FS_ROOT: storage is the one shared
+  // resource the asset cluster adds, and the leaderboard/rate-limit prefixes
+  // above exist because every other shared resource here has already caused a
+  // cross-talk failure that read as a real regression.
+  const assetDriver = testAssetDriver();
+
+  const loadedPlugins = await loadPlugins(
+    { db, redis, settings: loadedTestSettings, leaderboardPrefix, assetDriver },
+    // v2 boots keep the historical merge (every v2 bundled plugin plus the
+    // caller's extras, via withCorePlugins); every other profile — including
+    // the gl3 default — loads exactly the selection production makes
+    // through bundledPlugins.
+    options?.profile === "v2"
+      ? withCorePlugins(options?.plugins ?? [])
+      : bundledPlugins(options?.profile ?? "gl3", options?.plugins ?? []),
+    `plugin-test-${randomUUID()}-`,
+    config.profile,
+  ).catch(onBootFailure);
+
+  const app = await buildApp(config, {
+    db, redis, leaderboardPrefix, rateLimitPrefix, plugins: loadedPlugins, assetDriver,
+  }).catch(onBootFailure);
+
+  // `attachGateway` only needs `app.server`, which exists before `app.listen` is
+  // called — the WS test's own `beforeAll` performs the actual `listen`.
+  const gatewaySubscriber = createSubscriber(config.redisUrl);
+  const gateway = await attachGateway(app.server, {
+    db, redis, subscriber: gatewaySubscriber, corsOrigins: config.corsOrigins,
+    worldHooks: loadedPlugins.worldHooks, assetDriver, clientIpHeader: config.clientIpHeader,
+    coreHooks: config.profile !== "framework",
+    hasProperties: loadedPlugins.manifests.some((m) => m.id === "properties"),
+  });
+
+  return {
+    app,
+    // Exposed so a file that ALSO drives a plugin job manually (runPluginJob,
+    // for a pinned seed or pinned settings) can pause the matching queue and
+    // stop the live worker started above from racing it. Purely additive —
+    // every other caller destructures `{ app, close }` and is unaffected.
+    plugins: loadedPlugins,
+    // Exposed so an asset test can read the stored bytes back out of the very
+    // driver the server wrote them through.
+    assetDriver,
+    redis,
+    leaderboardPrefix,
+    close: async () => {
+      for (const w of loadedPlugins.workers) await w.close();
+      for (const q of loadedPlugins.queues.values()) await q.close();
+      await gateway.close();
+      await app.close();
+      gatewaySubscriber.disconnect();
+      await sql.end();
+      // Drain before destroying: closing a BullMQ Worker or Queue that was
+      // given a SHARED ioredis client leaves that connection's own `init()`
+      // in flight. `RedisConnection.close()` awaits `initializing` only when
+      // its status is already `ready`, and suppresses a pending one only on a
+      // connection it owns (bullmq redis-connection.js:422-439) — so under a
+      // loaded Redis, where the boot's `INFO` lags, a boot-then-immediately-
+      // close test leaves that command queued. `disconnect()` then flushes it
+      // with "Connection is closed.", and bullmq re-emits that on a connection
+      // whose listeners its own `finally` has already removed: an EventEmitter
+      // throw inside a `.catch`, i.e. an unhandled rejection that fails the
+      // whole vitest run with every test still passing.
+      //
+      // One round trip is enough. Redis answers a connection's commands in
+      // order, so a PING that has come back proves every command queued before
+      // it has too, and `disconnect()` then finds an empty queue. A failing
+      // PING means the connection is already gone, which is the case this is
+      // protecting against anyway.
+      await redis.ping().catch(() => undefined);
+      redis.disconnect();
+    },
+  };
+}

@@ -1,0 +1,567 @@
+import { HookKindSchema, InteriorDeclSchema, PoolSchema, type InteriorDecl } from "@gl3/shared";
+import { z } from "zod";
+import type { AttributePoolDecl } from "./attributes.js";
+import { PluginEventDeclSchema, type PluginEventDecl } from "./events.js";
+import type { FilterPoint, FilterSubscription } from "./filters.js";
+import { PageSchemaSchema, type PageSchema } from "./pages.js";
+import type { PluginRoute } from "./route.js";
+
+export const PLUGIN_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
+export const SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
+
+/**
+ * The plugin API contract version this SDK implements — the number a plugin
+ * declares in its manifest's `apiVersion` field.
+ *
+ * Bumping this is the definition of a breaking SDK change: anything a plugin
+ * compiled against the old surface could have relied on — manifest fields,
+ * `ctx`/`tx` members, filter semantics. Additive changes do NOT bump it; they
+ * ship as ordinary SDK version bumps and every older plugin keeps loading,
+ * which is the whole distinction between the SDK's semver and this contract.
+ * If a v2 ever lands, the loader grows a supported-versions window (v1
+ * deprecated, not dropped) and the boot error below becomes a migration
+ * prompt rather than a refusal.
+ */
+export const PLUGIN_API_VERSION = 1;
+
+export interface PluginMigration {
+  name: string;
+  sql: string;
+}
+
+const MigrationSchema = z.object({ name: z.string().min(1), sql: z.string().min(1) }).strict();
+
+/**
+ * A property type a plugin declares itself the implementer of — V2's
+ * `PR_module` made explicit. The `properties` plugin stores `id` in
+ * `plugin_id`; the loader collects every declaration into a registry so an
+ * admin picks from a list rather than typing a string, and so an unknown
+ * string cannot be bought.
+ *
+ * `id` must equal the declaring plugin's own id, and a plugin may declare at
+ * most one: V2's key is `(PR_location, PR_module)`, one row per module per
+ * town, and a second type would need a discriminator that key does not have.
+ */
+export interface PropertyTypeDecl {
+  id: string;
+  name: string;
+  /** Acquisition price in whole dollars (GL3 money unit, V2's own). V2 hardcoded $1,000,000 → 1_000_000n. */
+  price: bigint;
+  /** What `cost` means for this type, shown next to the owner's input. */
+  leverLabel: string;
+}
+
+const PropertyTypeDeclSchema = z
+  .object({
+    id: z.string().regex(PLUGIN_ID_PATTERN),
+    name: z.string().min(1),
+    price: z.bigint().positive(),
+    leverLabel: z.string().min(1),
+  })
+  .strict();
+
+/**
+ * An image slot a plugin's entities can carry — one declaration per kind of
+ * thing, not per row. `theft` declaring `{ slot: "car", label: "Car image" }`
+ * means every row in its cars table may have art bound to it.
+ *
+ * There is deliberately no `scope` field. The loader derives it from the
+ * declaring plugin's id, so — unlike `PropertyTypeDecl`, whose `id` an author
+ * writes and `definePlugin` must check — it cannot be got wrong, two plugins
+ * cannot collide, and no plugin can declare a slot that binds another's art.
+ */
+export interface AssetSlotDecl {
+  /** Unique within the declaring plugin. Kebab-case, matches `PLUGIN_ID_PATTERN`. */
+  slot: string;
+  /** Shown to the admin next to the upload widget. */
+  label: string;
+  /**
+   * One image for the whole slot rather than one per row.
+   *
+   * Most art hangs off an entity — a car, an item, a town. Some does not: a
+   * jail, a hospital, a casino floor and a bank are PAGES, with no row to bind
+   * a picture to, and without this there is no way to give them one. A
+   * singleton binds against `SINGLETON_ENTITY_ID` so it needs no second table
+   * and no second code path; only the admin widget and the read differ.
+   */
+  singleton?: boolean | undefined;
+  /**
+   * Where the admin art section fetches this slot's bindable rows from, as
+   * `"GET /absolute/path"` returning `{ rows: [{ id, … }] }`.
+   *
+   * Supplying it is what lets a PER-ROW slot be bound from core's central art
+   * section rather than from the plugin's own admin page — which matters
+   * because a plugin need not have one (`gangs` and `oc` do not), and without
+   * this its row art would be declarable and permanently unbindable.
+   *
+   * Must sit under the declaring plugin's own `basePaths`, like every other
+   * view action; the loader's containment pass checks it.
+   */
+  entitySource?: string | undefined;
+  /** Which field of a row the picker shows. The row's id is always `id`. */
+  entityLabelKey?: string | undefined;
+}
+
+/**
+ * A declaration once the loader has stamped the scope on it. This is what
+ * `ctx.assetSlots` serves and what the admin binder validates against; plugin
+ * authors write `AssetSlotDecl` and never this.
+ */
+export interface AssetSlot extends AssetSlotDecl {
+  /** The declaring plugin's id, or `"core"` for core-owned tables. */
+  scope: string;
+}
+
+const AssetSlotDeclSchema = z
+  .object({
+    slot: z.string().regex(PLUGIN_ID_PATTERN, "asset slot must be lowercase kebab-case"),
+    label: z.string().min(1),
+    singleton: z.boolean().optional(),
+    entitySource: z
+      .string()
+      .regex(/^GET \/[a-zA-Z0-9\-_/:]*$/, "entitySource must be `GET /absolute/path`")
+      .optional(),
+    entityLabelKey: z.string().min(1).optional(),
+  })
+  .strict()
+  .refine((decl) => decl.singleton !== true || decl.entitySource === undefined, {
+    message: "a singleton slot has no rows, so it must not declare an entitySource",
+    path: ["entitySource"],
+  })
+  .refine((decl) => decl.entitySource === undefined || decl.entityLabelKey !== undefined, {
+    message: "entitySource needs entityLabelKey, or the picker has nothing to show",
+    path: ["entityLabelKey"],
+  });
+
+/**
+ * A building or NPC this plugin places in every city (spec
+ * 2026-09-17 §2.1). Interacting with it opens `page`, which MUST be one of
+ * this plugin's own player pages — a hook is the plugin's own door, never
+ * another plugin's, and never an admin section. The loader checks `page`
+ * and `signageSlot` against the rest of the manifest; this schema checks
+ * only what a single declaration can know about itself.
+ *
+ * Positions are not declared: core lays every hook out deterministically
+ * along a street (`apps/server/src/world/layout.ts`) so every client agrees
+ * where the garage stands without an asset or an admin.
+ */
+export interface WorldHookDecl {
+  /** Unique within the plugin. Kebab-case, matches `PLUGIN_ID_PATTERN`. */
+  id: string;
+  /**
+   * `building` and `npc` are placed by the default street layout (spec
+   * 2026-09-17 §2.1). `prop` is an interactive object — a parked car — with
+   * a required `footprint` and no sign; it is placed only in an authored
+   * template's parking bays (spec 2026-09-20 §2) and the default layout
+   * skips it entirely.
+   */
+  kind: "building" | "npc" | "prop";
+  /** Sign text or name tag, 1–24 chars. Author-written, never player text. */
+  label: string;
+  /** Id of one of THIS plugin's `pages`. */
+  page: string;
+  /** Client asset-kit key (`garage`, `bank`, `station`, `newsstand`, `npc-suit`, `npc-coat`, …); unknown → client fallback by `kind`. */
+  model: string;
+  /** Metres. Default building {w:12,d:9}, npc {w:1,d:1} — the client kit is 3 m-grid. A prop has no default and must declare one. */
+  footprint?: { w: number; d: number } | undefined;
+  /** Layout order along the street; ties broken by pluginId, then id. */
+  order: number;
+  /** One of this plugin's `providesAssets` slots with `singleton: true`; its bound image is the signage texture. A prop cannot carry one. */
+  signageSlot?: string | undefined;
+  /** Template zone this hook prefers (spec 2026-09-20 §3); ignored by the default street layout. */
+  zone?: string | undefined;
+  /**
+   * A building the player can ENTER (spec 2026-09-20 casino-interior §3): an
+   * interior room with its own bounds, spawn and interaction points. `page`
+   * still opens on interact for web and older clients. Buildings only.
+   */
+  interior?: InteriorDecl | undefined;
+  /**
+   * A property type (any plugin's `providesProperties` id) that must have a
+   * row in a town for this hook to exist there (spec 2026-09-21 town-venues
+   * §2). Absent: the hook is in every town. Checked at boot against the
+   * loaded property registry; cross-plugin references are the norm (the
+   * casino building's venue is blackjack's property, as in V2).
+   */
+  venue?: string | undefined;
+}
+
+/** A declaration once the loader has stamped the owning plugin on it — what `ctx.worldHooks` serves. */
+export interface WorldHook extends WorldHookDecl {
+  pluginId: string;
+}
+
+const WorldHookDeclSchema = z
+  .object({
+    id: z.string().regex(PLUGIN_ID_PATTERN, "world hook id must be lowercase kebab-case"),
+    kind: HookKindSchema,
+    label: z.string().min(1).max(24),
+    page: z.string().min(1),
+    model: z.string().min(1),
+    footprint: z
+      .object({ w: z.number().min(1).max(30), d: z.number().min(1).max(30) })
+      .strict()
+      .optional(),
+    order: z.number().int(),
+    signageSlot: z.string().regex(PLUGIN_ID_PATTERN).optional(),
+    zone: z.string().regex(/^[a-z][a-z0-9-]*$/, "zone must be a lowercase tag").max(24).optional(),
+    interior: InteriorDeclSchema.optional(),
+    venue: z.string().regex(PLUGIN_ID_PATTERN, "venue must be a property type id").optional(),
+  })
+  .strict();
+
+/**
+ * The `entity_id` a singleton slot binds against: the nil UUID, which no
+ * uuidv7 can ever collide with.
+ *
+ * Reusing `entity_assets` rather than adding a second table is the point. A
+ * singleton is the same row shape, the same permission check, the same sweep
+ * and the same cascade; only "which entity" is answered by a constant instead
+ * of by a picker.
+ */
+export const SINGLETON_ENTITY_ID = "00000000-0000-0000-0000-000000000000";
+
+/**
+ * What a plugin author writes. Every collection is optional here and required
+ * on `PluginManifest`; normalising once in `definePlugin` is what stops every
+ * downstream consumer from writing `?? []` under `exactOptionalPropertyTypes`.
+ *
+ */
+export interface PluginManifestInput {
+  id: string;
+  version: string;
+  /**
+   * Which plugin API contract this plugin was written against. Absent means
+   * `PLUGIN_API_VERSION`: everything authored before the field existed is v1
+   * by definition, so no existing plugin — including out-of-repo ones —
+   * breaks when the check ships.
+   *
+   * Declaring a version the loading SDK does not implement is a hard boot
+   * failure with its own message, checked BEFORE the strict manifest parse:
+   * a v2 plugin on a v1 server typically carries manifest fields this schema
+   * has never heard of, and without the pre-check `.strict()` would report
+   * the first of those as an "Unrecognized key" — technically true,
+   * operationally useless (2026-08-24's stale-image `Unrecognized key
+   * 'category'` crash-loop is the failure this field exists to replace).
+   */
+  apiVersion?: number;
+  basePaths: string[];
+  /** Ids of other plugins that must be loaded in the same boot. */
+  requires?: string[];
+  tables?: Record<string, unknown>;
+  migrations?: PluginMigration[];
+  routes?: PluginRoute[];
+  pages?: PageSchema[];
+  adminPages?: PageSchema[];
+  events?: PluginEventDecl[];
+  jobs?: Record<string, unknown>;
+  provides?: FilterPoint<unknown>[];
+  providesProperties?: PropertyTypeDecl[];
+  providesAssets?: AssetSlotDecl[];
+  providesAttributes?: AttributePoolDecl[];
+  worldHooks?: WorldHookDecl[];
+  /**
+   * Claim exp routing for this plugin (C spec §1.2): when present, every
+   * `tx.economy.applyExpAndRankUp` call in the boot diverts to this handler
+   * INSIDE the caller's transaction, and the rank ladder receives nothing —
+   * the economy guard that keeps reward-bearing ranks silent on an MCCodes
+   * profile. At most one plugin may carry it; the server's registry fails
+   * the boot on a second claimant. Presence IS the claim — no separate
+   * boolean.
+   */
+  applyExp?: ExpApplier;
+  filters?: FilterSubscription[];
+}
+
+/**
+ * The exp-routing claimant's handler: applies `expGain` to its own
+ * progression model (levels, grants, events). Runs inside the caller's
+ * transaction under whatever lock that caller holds — same trust shape as
+ * `routes` and `jobs`, and the reason routing is a manifest function rather
+ * than a filter (filters never run inside transactions).
+ */
+export type ExpApplier = (
+  tx: import("./ctx.js").PluginTx,
+  playerId: string,
+  expGain: bigint,
+) => Promise<void>;
+
+/** The normalised manifest every consumer sees: no field is ever `undefined`. */
+export interface PluginManifest {
+  id: string;
+  version: string;
+  /** Declared contract version, defaulted to `PLUGIN_API_VERSION` at parse. */
+  apiVersion: number;
+  basePaths: string[];
+  requires: string[];
+  tables: Record<string, unknown>;
+  migrations: PluginMigration[];
+  routes: PluginRoute[];
+  pages: PageSchema[];
+  adminPages: PageSchema[];
+  events: PluginEventDecl[];
+  jobs: Record<string, unknown>;
+  provides: FilterPoint<unknown>[];
+  providesProperties: PropertyTypeDecl[];
+  providesAssets: AssetSlotDecl[];
+  providesAttributes: AttributePoolDecl[];
+  worldHooks: WorldHookDecl[];
+  applyExp: ExpApplier | null;
+  filters: FilterSubscription[];
+}
+
+/**
+ * The one schema behind both `definePlugin` (typed input, checked at
+ * definition time) and `parsePluginManifest` (untyped value, checked at boot).
+ * The loader re-checks cross-plugin concerns (collisions) it cannot see from
+ * here.
+ *
+ * The function-bearing fields — `routes` and `jobs` — are `z.unknown()`: their
+ * shape is enforced by the TypeScript types, and a zod schema over a function
+ * would only assert `typeof === "function"`. `.strict()` is what rejects
+ * unknown fields.
+ *
+ * Three fields are not function-bearing and so do not follow that rule. `pages`
+ * holds pure data, so `PageSchemaSchema` checks it for real here and a malformed
+ * view node fails at definition time rather than at render. `events` is data
+ * apart from its `payload` schema, and `PluginEventDeclSchema` checks it the
+ * same way. `tables` maps a
+ * plugin's own key to the SQL name of one of its tables — data too, and today
+ * just a string — but its value type is left `unknown` because the plan defers
+ * the final shape (a drizzle-table accessor) to the port that proves it end to
+ * end. Until then `z.record(z.unknown())` checks only that it is an object, and
+ * the loader is what reads the names out of it.
+ *
+ * `provides` and `filters` use `z.custom<T>()` rather than `z.unknown()`. Both
+ * accept every value at runtime — the difference is only that `z.custom` carries
+ * the element type through to `result.data`, which is what the manifest is built
+ * from.
+ *
+ * Neither is validated at runtime, and that is a deferred gap rather than an
+ * impossibility: `FilterPoint` is `{ name: string }` and `FilterSubscription` is
+ * `{ pointName: string; order: number; run: fn }`, all of which zod could check.
+ * Today `filters: [{}]` or `filters: ["nonsense"]` passes `.strict()` here and
+ * crashes later at `subscription.run is not a function`. Until that is closed,
+ * the TypeScript types are the only guarantee on these two fields.
+ */
+const InputSchema = z
+  .object({
+    id: z.string().regex(PLUGIN_ID_PATTERN, "plugin id must be lowercase kebab-case"),
+    version: z.string().regex(SEMVER_PATTERN, "version must be semver x.y.z"),
+    // The number's RANGE is checked here; its VALUE against the SDK is
+    // checked before this schema runs (see `assertSupportedApiVersion`), so a
+    // mismatch reports the contract rather than whichever v2-only field
+    // `.strict()` happened to hit first.
+    apiVersion: z.number().int().min(1).optional(),
+    basePaths: z
+      .array(
+        z
+          .string()
+          .regex(/^\/api\/[a-z0-9-]+(\/[a-z0-9-]+)*$/, "basePath must look like /api/<name>"),
+      )
+      .min(1),
+    tables: z.record(z.unknown()).optional(),
+    // Cross-plugin dependencies, checked against the FINAL boot set by the
+    // loader (validate.ts) — this schema can only see one manifest at a time.
+    // Ids (not package names) because that is what PLUGIN_IDS and every boot
+    // error already speak.
+    requires: z
+      .array(z.string().regex(PLUGIN_ID_PATTERN, "required plugin id must be lowercase kebab-case"))
+      .optional(),
+    migrations: z.array(MigrationSchema).optional(),
+    routes: z.array(z.custom<PluginRoute>()).optional(),
+    pages: z.array(PageSchemaSchema).optional(),
+    adminPages: z
+      .array(
+        PageSchemaSchema.refine((p) => p.path === "/admin" || p.path.startsWith("/admin/"), {
+          message: "admin page path must start with /admin/",
+          path: ["path"],
+        }),
+      )
+      .optional(),
+    events: z.array(PluginEventDeclSchema).optional(),
+    jobs: z.record(z.unknown()).optional(),
+    provides: z.array(z.custom<FilterPoint<unknown>>()).optional(),
+    providesProperties: z.array(PropertyTypeDeclSchema).optional(),
+    providesAssets: z.array(AssetSlotDeclSchema).optional(),
+    providesAttributes: z
+      .array(
+        z.object({
+          pool: PoolSchema,
+          defaultMax: z.number().int().positive(),
+          // Fractional allowed: MCCodes' brave regenerates 10% of max + 0.5.
+          regenAmount: z.number().nonnegative(),
+          regenPercent: z.number().int().min(0).max(100).optional(),
+          memberMultiplier: z.number().min(1).optional(),
+          regenIntervalSeconds: z.number().int().positive(),
+        }),
+      )
+      .optional(),
+    worldHooks: z.array(WorldHookDeclSchema).optional(),
+    // Function-bearing, so a z.custom placeholder like routes — the type is
+    // enforced by `PluginManifestInput`, the runtime shape by the loader.
+    applyExp: z.custom<ExpApplier>().optional(),
+    filters: z.array(z.custom<FilterSubscription>()).optional(),
+  })
+  .strict()
+  // Migration names must be unique *within* a plugin, and nothing downstream can
+  // recover this. The runner claims each `(plugin_id, name)` with
+  // `onConflictDoNothing()`, which cannot tell "already applied on a previous
+  // boot" from "declared twice in this very call": the first copy applies, the
+  // second's insert conflicts, and its DDL is silently skipped. Boot succeeds and
+  // the omission surfaces much later as `relation "p_foo_bar" does not exist`.
+  //
+  // Checked here rather than in the loader's validation pass because it is an
+  // intra-manifest invariant — like the id, version and basePath patterns above,
+  // it needs no knowledge of any other plugin, which is what that pass exists for.
+  // Refining at definition time also catches it for every consumer, not only the
+  // boot path.
+  .superRefine((manifest, ctx) => {
+    const seen = new Set<string>();
+    manifest.migrations?.forEach((migration, index) => {
+      if (seen.has(migration.name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          // The thrown message is assembled as
+          // `invalid plugin manifest for "<id>" — migrations.<i>: <message>`, so
+          // the plugin is already named by the wrapper; repeating it here would
+          // only stutter.
+          path: ["migrations", index],
+          message: `duplicate migration name "${migration.name}"`,
+        });
+      }
+      seen.add(migration.name);
+    });
+    if (manifest.providesProperties !== undefined) {
+      if (manifest.providesProperties.length > 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["providesProperties"],
+          message: "a plugin may declare at most one property type",
+        });
+      }
+      manifest.providesProperties.forEach((decl, index) => {
+        if (decl.id !== manifest.id) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["providesProperties", index, "id"],
+            message: `must equal the plugin's own id ("${manifest.id}")`,
+          });
+        }
+      });
+    }
+    if (manifest.requires?.includes(manifest.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["requires"],
+        message: "a plugin cannot require itself",
+      });
+    }
+  });
+
+/**
+ * The id to blame in a validation failure. A manifest that fails to parse may
+ * not be an object at all — it can arrive from a plugin loaded as plain JS or
+ * from JSON — so reading `.id` off it needs a guard: without one the author
+ * gets a TypeError instead of a message naming the manifest that is broken.
+ */
+function describeId(input: unknown): string {
+  if (typeof input === "object" && input !== null && "id" in input) {
+    const { id } = input;
+    if (typeof id === "string") return id;
+  }
+  return "<unknown>";
+}
+
+/**
+ * The contract check runs before `InputSchema.safeParse`, not inside it,
+ * because the ordering IS the feature. A plugin written against a newer API
+ * version typically also carries manifest fields this schema has never heard
+ * of, and `.strict()` would report the first of those as an "Unrecognized
+ * key" — technically true, operationally useless. Reading the one number off
+ * the raw object first turns that into a version mismatch that names both
+ * sides and the remedy.
+ *
+ * Only a well-formed integer ≥ 1 claims a version. Anything else — a string,
+ * a fraction, zero — is a malformed field and belongs to the schema's own
+ * error, which names it like any other.
+ */
+function assertSupportedApiVersion(input: unknown): void {
+  if (typeof input !== "object" || input === null) return;
+  const declared = (input as { apiVersion?: unknown }).apiVersion;
+  if (
+    typeof declared !== "number" ||
+    !Number.isInteger(declared) ||
+    declared < 1 ||
+    declared === PLUGIN_API_VERSION
+  ) {
+    return;
+  }
+  throw new Error(
+    `invalid plugin manifest for "${describeId(input)}" — apiVersion: plugin declares ${declared} ` +
+      `but this build of @gl3/plugin-sdk implements ${PLUGIN_API_VERSION}; install a plugin ` +
+      `release built for apiVersion ${PLUGIN_API_VERSION}, or update the server`,
+  );
+}
+
+/**
+ * Validates an UNTYPED value as a manifest — the entry point for a plugin
+ * whose shape the compiler never saw.
+ *
+ * `definePlugin` gets its guarantee twice over: the author writes a
+ * `PluginManifestInput` and `tsc` checks it. A plugin loaded through
+ * `PLUGIN_PACKAGES` gets it once, here, because it arrives as the default
+ * export of a prebuilt package resolved at runtime — `import()` returns
+ * `any`-shaped module namespace and nothing has checked it. This is the parse
+ * that replaces the compile-time check the static import map used to provide
+ * (see `apps/server/src/plugins/dynamic.ts`).
+ *
+ * `InputSchema` is reused rather than a second "normalised" schema written,
+ * because every field it makes optional also accepts a present valid value —
+ * so an already-normalised manifest parses clean, and one schema stays the
+ * single source of truth for both paths.
+ */
+export function parsePluginManifest(input: unknown): PluginManifest {
+  assertSupportedApiVersion(input);
+  const result = InputSchema.safeParse(input);
+  if (!result.success) {
+    const detail = result.error.issues
+      .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+      .join("; ");
+    throw new Error(`invalid plugin manifest for "${describeId(input)}" — ${detail}`);
+  }
+  // Built from `result.data`, never from `input`: the parser's output is what
+  // carries any `.default()`, `.transform()` or coercion the field schemas
+  // grow later, and reading `input` here would silently discard all of it.
+  const parsed = result.data;
+  return {
+    id: parsed.id,
+    version: parsed.version,
+    apiVersion: parsed.apiVersion ?? PLUGIN_API_VERSION,
+    basePaths: parsed.basePaths,
+    requires: parsed.requires ?? [],
+    tables: parsed.tables ?? {},
+    migrations: parsed.migrations ?? [],
+    routes: parsed.routes ?? [],
+    pages: parsed.pages ?? [],
+    adminPages: parsed.adminPages ?? [],
+    events: parsed.events ?? [],
+    jobs: parsed.jobs ?? {},
+    provides: parsed.provides ?? [],
+    providesProperties: parsed.providesProperties ?? [],
+    providesAssets: parsed.providesAssets ?? [],
+    providesAttributes: parsed.providesAttributes ?? [],
+    worldHooks: parsed.worldHooks ?? [],
+    applyExp: parsed.applyExp ?? null,
+    filters: parsed.filters ?? [],
+  };
+}
+
+/**
+ * Validated at definition time rather than only at boot, so a malformed
+ * manifest fails on `import` with the plugin's own id in the message. The
+ * loader re-checks cross-plugin concerns (collisions) it cannot see from here.
+ */
+export function definePlugin(input: PluginManifestInput): PluginManifest {
+  return parsePluginManifest(input);
+}

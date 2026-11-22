@@ -1,0 +1,116 @@
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { useMe, useGameEvents } from "@gl3/client";
+import { Shell } from "./components/Shell.js";
+import { Loading } from "./components/ui.js";
+import { Admin } from "./pages/Admin.js";
+import { Bank } from "./pages/Bank.js";
+import { Forgot } from "./pages/Forgot.js";
+import { Forum } from "./pages/Forum.js";
+import { ForumTopic } from "./pages/ForumTopic.js";
+import { Shop } from "./pages/Shop.js";
+import { Dashboard } from "./pages/Dashboard.js";
+import { Inventory } from "./pages/Inventory.js";
+import { Leaderboards } from "./pages/Leaderboards.js";
+import { Legal } from "./pages/Legal.js";
+import { Login } from "./pages/Login.js";
+import { Mail } from "./pages/Mail.js";
+import { MailThread } from "./pages/MailThread.js";
+import { News } from "./pages/News.js";
+import { NotFound } from "./pages/NotFound.js";
+import { Notifications } from "./pages/Notifications.js";
+import { Players } from "./pages/Players.js";
+import { PlayerProfile } from "./pages/PlayerProfile.js";
+import { Profile } from "./pages/Profile.js";
+import { Ranks } from "./pages/Ranks.js";
+import { Reset } from "./pages/Reset.js";
+import { Rounds } from "./pages/Rounds.js";
+import { Stats } from "./pages/Stats.js";
+import { Verify } from "./pages/Verify.js";
+import { Challenge } from "./pages/Challenge.js";
+import { PluginPage } from "./plugins/PluginPage.js";
+
+export function App(): JSX.Element {
+  const me = useMe();
+  // Keyed on playerId (not just "are we logged in") so the effect tears down
+  // and reconnects — fetching a fresh ticket — the moment login/logout
+  // changes who we are, rather than only ever connecting once at mount.
+  // It lives above the router so navigation never drops the socket.
+  useGameEvents(me.data?.playerId);
+
+  return (
+    // Session query updates are urgent. Keep navigation at the same priority
+    // so signing out cannot overtake the account-deletion redirect and replace
+    // its confirmation state with the generic login redirect.
+    <BrowserRouter useTransitions={false}>
+      {me.isLoading ? <Loading /> : <Routes>
+        {/* Recovery and legal pages remain accessible with an active session. */}
+        <Route path="/forgot" element={<Forgot />} />
+        <Route path="/reset" element={<Reset />} />
+        <Route path="/terms" element={<Legal doc="terms" />} />
+        <Route path="/privacy" element={<Legal doc="privacy" />} />
+        <Route path="/login" element={<Login />} />
+        {me.isSuccess ? (
+          <>
+            {/*
+              A sibling of the Shell group, not nested in it: `GET /api/auth/me`
+              is gate-exempt, so an unverified player is still `me.isSuccess`
+              here and lands in this branch — this is the one page they can
+              reach without the gameplay layout (nav, HUD, event feed) around
+              it. Every other authed route 403s `email_unverified`, which the
+              api client (api/client.ts) catches and bounces here with a full
+              reload.
+            */}
+            <Route path="/verify" element={<Verify />} />
+            {/* Same standing as /verify: the anti-bot challenge gate 409s the
+                gameplay chrome's own mutations, so the page lives outside
+                Shell — see pages/Challenge.tsx. */}
+            <Route path="/challenge" element={<Challenge />} />
+            <Route element={<Shell />}>
+              <Route index element={<Dashboard />} />
+              {/* The gameplay pages (crimes, combat, bounties, detectives,
+                  heists, casino, gang, bullets, travel, jail, hospital) are
+                  plugin-declared pages rendered through /plugins/:pageId with
+                  hand-written overrides — see plugins/overrides.ts. They exist
+                  exactly when their plugin (or, for jail/hospital, the full
+                  profile) is loaded, so a framework boot has neither the
+                  routes nor the nav entries. */}
+              <Route path="bank" element={<Bank />} />
+              <Route path="shop" element={<Shop />} />
+              <Route path="inventory" element={<Inventory />} />
+              <Route path="ranks" element={<Ranks />} />
+              <Route path="leaderboards" element={<Leaderboards />} />
+              <Route path="rounds" element={<Rounds />} />
+              <Route path="stats" element={<Stats />} />
+              <Route path="mail" element={<Mail />} />
+              <Route path="mail/:threadId" element={<MailThread />} />
+              <Route path="forum" element={<Forum />} />
+              <Route path="forum/:forumId" element={<Forum />} />
+              <Route path="forum/topics/:topicId" element={<ForumTopic />} />
+              <Route path="notifications" element={<Notifications />} />
+              <Route path="news" element={<News />} />
+              <Route path="players" element={<Players />} />
+              {/* The page's old address. Kept as an alias so links already in
+                  mail, forum posts and bookmarks keep resolving. */}
+              <Route path="online" element={<Players />} />
+              <Route path="profile" element={<Profile />} />
+              <Route path="players/:playerId" element={<PlayerProfile />} />
+              {/*
+                Every plugin page lives under one namespaced route rather than at the
+                `path` it declares. The loader validates a plugin's basePath against
+                the server's own prefixes, but nothing validates a page's *frontend*
+                path against these core routes — so a top-level registration could
+                let a plugin shadow /bank. The declared `path` stays advisory in v1;
+                top-level registration waits on a collision check.
+              */}
+              <Route path="plugins/:pageId" element={<PluginPage />} />
+              <Route path="admin" element={<Admin />} />
+              <Route path="*" element={<NotFound />} />
+            </Route>
+          </>
+        ) : (
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        )}
+      </Routes>}
+    </BrowserRouter>
+  );
+}

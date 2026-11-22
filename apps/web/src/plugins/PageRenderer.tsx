@@ -1,0 +1,1109 @@
+import { checkoutDestination } from "./checkout.js";
+import { Fragment, Suspense, lazy, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { FormValuesResponseSchema, TableRowsResponseSchema } from "@gl3/shared";
+import { ErrorText, Loading, Money, Panel } from "../components/ui.js";
+import { GameImage, SlotBanner, SlotImage } from "../components/GameImage.js";
+import { PropertyPanel } from "../components/PropertyPanel.js";
+import { HudIcon, poolIconFor } from "../components/HudIcon.js";
+import { Meter } from "../components/Meter.js";
+import { togglePending, formatRemaining, type FormField, type RenderInstruction, ApiError, api } from "@gl3/client";
+import styles from "../pages/pages.module.css";
+
+// The 56-card SVG deck behind `Hand` is ~155 kB gzipped — over half the app's
+// transfer — and only a `cards` node ever draws it. This must stay the sole
+// static-import-free path to PlayingCard.js, or the deck lands back in the
+// entry chunk for every page.
+const Hand = lazy(() =>
+  import("../components/PlayingCard.js").then((m) => ({ default: m.Hand })),
+);
+
+/**
+ * A run of instructions that share one `<Panel>`.
+ *
+ * `renderNode` flattens a panel to `[header, ...children]`, so the panel body is
+ * everything between one `panelHeader` and the next. `title: null` is the run
+ * before the first header — those instructions render bare, at top level.
+ *
+ * The limitation this inherits is real and worth naming: a *nested* panel
+ * degrades to a *sibling* panel, because `[header, ...children]` cannot say
+ * where a nested panel's children end. `panel(A, [a, panel(B, [b]), c])` and
+ * `panel(A, [a, panel(B, [b, c])])` flatten to identical instruction lists, so
+ * no grouping pass can tell them apart. Siblings are the graceful degradation;
+ * making `renderNode` return a nested structure is the fix if it ever matters.
+ */
+interface PanelGroup {
+  readonly title: string | null;
+  /**
+   * `row` lays the run out horizontally, wrapping — the casino table's row of
+   * opponents' hands. It rides on the panel header for the same reason the
+   * title does: once flattened, the header is all that is left of the panel.
+   */
+  readonly layout: "row" | null;
+  /** A boolean makes the panel a disclosure (`true` starts closed); `null` is a plain panel. */
+  readonly collapsed: boolean | null;
+  readonly items: readonly { readonly index: number; readonly inst: RenderInstruction }[];
+}
+
+/**
+ * `index` is the instruction's position in the *flat* list, not its position in
+ * the group: it keys the per-form input state, which has to stay stable and
+ * unique across the whole page (see `formValues`).
+ */
+function groupIntoPanels(instructions: readonly RenderInstruction[]): PanelGroup[] {
+  const groups: PanelGroup[] = [];
+  let title: string | null = null;
+  let layout: "row" | null = null;
+  let collapsed: boolean | null = null;
+  let items: { index: number; inst: RenderInstruction }[] = [];
+
+  const flush = (): void => {
+    // Drops only the leading empty run; an empty panel still renders its header.
+    if (title !== null || items.length > 0) groups.push({ title, layout, collapsed, items });
+  };
+
+  instructions.forEach((inst, index) => {
+    if (inst.kind === "panelHeader") {
+      flush();
+      title = inst.title;
+      layout = inst.layout;
+      collapsed = inst.collapsed;
+      items = [];
+      return;
+    }
+    items.push({ index, inst });
+  });
+  flush();
+  return groups;
+}
+
+/**
+ * A ticking cell for `render: "countdown"`. The cell value is an ISO
+ * timestamp; anything unparsable ("—", "") renders verbatim, so a server
+ * mixing live rows and placeholders needs no special casing.
+ *
+ * Deadline-derived, not tick-counted — lib/countdown.ts explains why (background
+ * tabs throttle intervals; the interval is only a repaint trigger). When a
+ * deadline that was LIVE AT MOUNT passes, `onDue` fires exactly once so the
+ * parent can refetch — a lazily-settled row (the settle-at-read idiom) shows
+ * its outcome without a manual reload. A deadline already past at mount never
+ * fires it: with a server that keeps answering an expired timestamp, that
+ * refetch would loop forever.
+ */
+function CountdownCell({ value, onDue }: { value: string; onDue: () => void }): JSX.Element {
+  const target = Date.parse(value);
+  const [now, setNow] = useState(() => Date.now());
+  const onDueRef = useRef(onDue);
+  onDueRef.current = onDue;
+
+  useEffect(() => {
+    if (!Number.isFinite(target) || target <= Date.now()) return;
+    const tick = window.setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= target) {
+        window.clearInterval(tick);
+        onDueRef.current();
+      }
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [target]);
+
+  if (!Number.isFinite(target)) return <>{value}</>;
+  const remaining = Math.ceil((target - now) / 1000);
+  return <>{remaining > 0 ? formatRemaining(remaining) : "due"}</>;
+}
+
+/**
+ * A row-action button that may be gated by `disabledKey` / `cooldownKey`.
+ *
+ * `until` is an ISO deadline (or "" for none) and is read the same way
+ * `CountdownCell` reads a cell: an absolute target, re-derived from
+ * `Date.now()` on every render, so a throttled or suspended tab costs display
+ * latency and never correctness (lib/countdown.ts has the full reasoning).
+ * While it has not passed, the button is disabled and shows the remaining time
+ * INSTEAD of its label; when a deadline that was live at mount passes, `onDue`
+ * fires once so the table refetches — the same bump the countdown cell uses,
+ * and the same never-for-an-already-past deadline rule, which is what keeps a
+ * server that keeps answering a stale timestamp from looping refetches.
+ */
+function RowActionButton({ label, blocked, until, busy, onDue, onClick }: {
+  label: string;
+  blocked: boolean;
+  until: string;
+  busy: boolean;
+  onDue: () => void;
+  onClick: () => void;
+}): JSX.Element {
+  const target = Date.parse(until);
+  const live = Number.isFinite(target);
+  const [now, setNow] = useState(() => Date.now());
+  const onDueRef = useRef(onDue);
+  onDueRef.current = onDue;
+
+  useEffect(() => {
+    if (!live || target <= Date.now()) return;
+    const tick = window.setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= target) {
+        window.clearInterval(tick);
+        onDueRef.current();
+      }
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [live, target]);
+
+  const remaining = live ? Math.ceil((target - now) / 1000) : 0;
+  const counting = remaining > 0;
+  return (
+    <button
+      type="button"
+      disabled={busy || blocked || counting}
+      onClick={onClick}
+    >
+      {counting ? formatRemaining(remaining) : label}
+    </button>
+  );
+}
+
+/**
+ * Fetches rows for a `table` instruction. Re-fetches whenever `refetchSignal`
+ * increments (i.e. after any successful `runAction` on the same page), so
+ * mutation-then-view stays consistent without a full page reload.
+ *
+ * Uses plain `useState` + `useEffect` + `api()` — same pattern as the rest of
+ * `PageRenderer` — instead of react-query, which is not wired into plugin pages.
+ */
+function TableBlock({ source, columns, rowActions, onRowAction, refetchSignal }: {
+  source: string;
+  columns: readonly {
+    readonly key: string;
+    readonly label: string;
+    readonly render: "image" | "countdown" | null;
+    readonly imageSize: "sm" | "md" | "lg";
+  }[];
+  rowActions: readonly {
+    readonly label: string;
+    readonly action: string;
+    readonly confirm: string | null;
+    readonly disabledKey: string | null;
+    readonly cooldownKey: string | null;
+  }[];
+  /** Fires the resolved action; resolves true on success so the arm state can clear either way. */
+  onRowAction: (action: string) => Promise<boolean>;
+  refetchSignal: number;
+}): JSX.Element {
+  const [rows, setRows] = useState<ReadonlyArray<Record<string, string>>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+  // `"<rowIndex>:<actionIndex>"` of the one armed confirm — arming another row
+  // disarms this one, so at most one destructive action is ever primed.
+  const [armed, setArmed] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  // Bumped when a countdown cell reaches zero: one refetch, so a row the
+  // server settles lazily at read time (fixer's status) shows its outcome.
+  const [dueBump, setDueBump] = useState(0);
+
+  // `source` is `"GET /api/..."` — strip the method prefix for `api()`.
+  const path = source.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void api<unknown>(path)
+      .then((body) => {
+        if (cancelled) return;
+        const parsed = TableRowsResponseSchema.parse(body);
+        setRows(parsed.rows);
+      })
+      .catch((caught: unknown) => {
+        if (cancelled) return;
+        setError(caught);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [path, refetchSignal, dueBump]);
+
+  if (loading) return <Loading what="table" />;
+  if (error !== null) return <ErrorText error={error} />;
+  if (rows.length === 0) return <p className={styles.muted}>No data.</p>;
+
+  // `:id` (or `:locationId`, any `:token`) resolves against the row's own
+  // fields, which every table source carries even when no column displays
+  // them (selects consume them as `valueKey`s; admin-ids-hidden keeps them
+  // out of the columns only). Null when the row lacks a token — the button
+  // is then not drawn at all, rather than firing at a literal ":id" path.
+  function resolveAction(action: string, row: Record<string, string>): string | null {
+    let missing = false;
+    const resolved = action.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_, token: string) => {
+      const value = row[token];
+      if (value === undefined) { missing = true; return ""; }
+      return encodeURIComponent(value);
+    });
+    return missing ? null : resolved;
+  }
+
+  async function fire(key: string, resolved: string): Promise<void> {
+    setBusy(key);
+    try {
+      await onRowAction(resolved);
+    } finally {
+      setBusy(null);
+      setArmed(null);
+    }
+  }
+
+  const showActions = rowActions.length > 0;
+
+  return (
+    <table className={styles.table}>
+      <thead>
+        <tr>
+          {columns.map((col) => <th key={col.key}>{col.label}</th>)}
+          {showActions ? <th aria-label="actions" /> : null}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row, rowIndex) => (
+          <tr key={rowIndex}>
+            {columns.map((col) => (
+              <td key={col.key}>
+                {col.render === "image"
+                  // The cell value is a URL the server resolved; `GameImage`
+                  // owns the missing-art case, which for a table means most
+                  // rows on a fresh install.
+                  ? <GameImage url={row[col.key] ?? null} alt={col.label || "image"} size={col.imageSize} />
+                  : col.render === "countdown"
+                    ? <CountdownCell value={row[col.key] ?? ""} onDue={() => setDueBump((n) => n + 1)} />
+                    : row[col.key] ?? ""}
+              </td>
+            ))}
+            {showActions ? (
+              <td>
+                {rowActions.map((rowAction, actionIndex) => {
+                  const key = `${rowIndex}:${actionIndex}`;
+                  const resolved = resolveAction(rowAction.action, row);
+                  if (resolved === null) return null;
+                  if (rowAction.confirm !== null && armed === key) {
+                    // Two-step in place, the property board's shape rather
+                    // than `window.confirm`: the first click armed it, this
+                    // renders the question with an explicit way out.
+                    // The question sits on its own line above a paired
+                    // Confirm / Cancel. Inline with the buttons, a phone's
+                    // auto-width action column squeezed the sentence to a
+                    // word a line and wrapped the two buttons apart.
+                    return (
+                      <span key={actionIndex} className={styles.confirm}>
+                        <span className={styles.meta} role="alert">{rowAction.confirm}</span>
+                        <span className={styles.actions}>
+                          <button
+                            type="button"
+                            disabled={busy !== null}
+                            onClick={() => { void fire(key, resolved); }}
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy !== null}
+                            onClick={() => { setArmed(null); }}
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      </span>
+                    );
+                  }
+                  // `disabledKey` first, then `cooldownKey` — the spec's
+                  // precedence: a row that says "not for you" never shows a
+                  // clock that would imply it becomes available.
+                  const blocked = rowAction.disabledKey !== null
+                    && row[rowAction.disabledKey] === "true";
+                  const until = rowAction.cooldownKey !== null
+                    ? row[rowAction.cooldownKey] ?? ""
+                    : "";
+                  return (
+                    <RowActionButton
+                      key={actionIndex}
+                      label={rowAction.label}
+                      blocked={blocked}
+                      until={blocked ? "" : until}
+                      busy={busy !== null}
+                      onDue={() => setDueBump((n) => n + 1)}
+                      onClick={() => {
+                        if (rowAction.confirm !== null) setArmed(key);
+                        else void fire(key, resolved);
+                      }}
+                    />
+                  );
+                })}
+              </td>
+            ) : null}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/**
+ * A form field's `select` widget: options fetched from `optionsSource`, the
+ * same shape and refetch behaviour as `TableBlock`, so a row added by a
+ * sibling form on the page (e.g. "Add town") appears in the select without a
+ * reload. Value state stays in the parent's `formValues` — this component owns
+ * only the options.
+ */
+function SelectField({ field, value, onChange, refetchSignal }: {
+  field: Extract<FormField, { type: "select" }>;
+  value: string;
+  /** Receives the chosen option's full row (null for the placeholder), so a `prefillForm` select can seed its siblings from it. */
+  onChange: (value: string, row: Record<string, string> | null) => void;
+  refetchSignal: number;
+}): JSX.Element {
+  const [rows, setRows] = useState<ReadonlyArray<Record<string, string>>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+
+  const path = field.optionsSource.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void api<unknown>(path)
+      .then((body) => {
+        if (cancelled) return;
+        const parsed = TableRowsResponseSchema.parse(body);
+        // The full rows, not just the value/label pairs: `prefillForm` seeds
+        // sibling fields from the chosen row, and re-deriving them later would
+        // mean a second fetch.
+        setRows(parsed.rows);
+      })
+      .catch((caught: unknown) => {
+        if (cancelled) return;
+        setError(caught);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [path, refetchSignal]);
+
+  if (error !== null) return <ErrorText error={error} />;
+
+  if (field.presentation === "list") {
+    return <div role="radiogroup" aria-label={field.label} className={styles.productOptions}>
+      {loading ? <p role="status">Loading…</p> : rows.length === 0 ? <p>No products available.</p> : null}
+      {field.allowEmpty && <label className={styles.productOption}>
+        <input type="radio" name={field.name} checked={value === ""} onChange={() => { onChange("", null); }} />
+        <span>None</span>
+      </label>}
+      {!loading && rows.map(row => {
+        const optionValue = row[field.valueKey] ?? "";
+        const originalPrice = field.originalPriceKey ? row[field.originalPriceKey] : "";
+        const price = field.priceKey ? row[field.priceKey] : "";
+        const description = field.descriptionKey ? row[field.descriptionKey] : "";
+        return <label key={optionValue} className={styles.productOption}>
+          <input type="radio" name={field.name} value={optionValue} required={!field.allowEmpty}
+            checked={value === optionValue} onChange={() => { onChange(optionValue, row); }} />
+          <span className={styles.productDetails}>
+            <strong>{row[field.labelKey] ?? optionValue}</strong>
+            {description && <span>{description}</span>}
+          </span>
+          <span className={styles.productPrice}>
+            {originalPrice && <s aria-label={`Original price ${originalPrice}`}>{originalPrice}</s>}
+            {price && <strong>{price}</strong>}
+          </span>
+        </label>;
+      })}
+    </div>;
+  }
+
+  const options = rows.map((row) => ({
+    value: row[field.valueKey] ?? "",
+    label: row[field.labelKey] ?? row[field.valueKey] ?? "",
+  }));
+
+  return (
+    <select
+      name={field.name}
+      value={value}
+      disabled={loading}
+      onChange={(event) => {
+        const chosen = rows.find((row) => (row[field.valueKey] ?? "") === event.target.value) ?? null;
+        onChange(event.target.value, chosen);
+      }}
+    >
+      {/* The placeholder doubles as the "clear" option when allowEmpty: the
+          submitted "" is what the roles route maps to null. Without allowEmpty
+          it is only the unselected state — routes validate the UUID anyway. */}
+      <option value="">{field.allowEmpty ? "(none)" : loading ? "Loading…" : "Select…"}</option>
+      {options.map((opt) => (
+        <option key={opt.value} value={opt.value}>{opt.label}</option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * A `meterSource` instruction: fetches `{ values }` once (and again on
+ * `refetchSignal`, same as `TableBlock`) and reads `value`/`max` off two named
+ * keys — the response is a form-values payload, not a table, because a
+ * pool's numbers are one flat map, not rows. No `emptyText`: unlike
+ * `KeyValueSourceBlock`, this node has nowhere to fall back to, so a 404
+ * renders `ErrorText` like any other failure.
+ */
+export function MeterSourceBlock({ label, source, valueKey, maxKey, refetchSignal }: {
+  label: string;
+  source: string;
+  valueKey: string;
+  maxKey: string;
+  refetchSignal: number;
+}): JSX.Element {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+
+  const path = source.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void api<unknown>(path)
+      .then((body) => {
+        if (cancelled) return;
+        const parsed = FormValuesResponseSchema.parse(body);
+        setValues(parsed.values);
+      })
+      .catch((caught: unknown) => {
+        if (cancelled) return;
+        setError(caught);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [path, refetchSignal]);
+
+  if (loading) return <Loading what="meter" />;
+  if (error !== null) return <ErrorText error={error} />;
+
+  const value = Number(values[valueKey]);
+  const max = Number(values[maxKey]);
+  return (
+    <Meter
+      label={label}
+      value={Number.isFinite(value) ? value : 0}
+      max={Number.isFinite(max) && max > 0 ? max : 1}
+    />
+  );
+}
+
+/**
+ * A `keyValueSource` instruction: fetches `{ values }` (same shape and
+ * refetch behaviour as `MeterSourceBlock`) and draws one row per `entries`
+ * item whose `key` is present. Zero present keys OR a 404 renders
+ * `emptyText` — jobs/education/houses pages use this for "you have none of
+ * this yet" rather than an error, since a 404 there means "no record", not
+ * "the server failed."
+ */
+export function KeyValueSourceBlock({ source, entries, emptyText, refetchSignal }: {
+  source: string;
+  entries: readonly { readonly label: string; readonly key: string }[];
+  emptyText: string | null;
+  refetchSignal: number;
+}): JSX.Element {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+
+  const path = source.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void api<unknown>(path)
+      .then((body) => {
+        if (cancelled) return;
+        const parsed = FormValuesResponseSchema.parse(body);
+        setValues(parsed.values);
+      })
+      .catch((caught: unknown) => {
+        if (cancelled) return;
+        setError(caught);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [path, refetchSignal]);
+
+  if (loading) return <Loading what="details" />;
+  if (error !== null) {
+    if (error instanceof ApiError && error.status === 404) {
+      return <p className={styles.muted}>{emptyText ?? "No data."}</p>;
+    }
+    return <ErrorText error={error} />;
+  }
+
+  const present = entries.filter((entry) => values[entry.key] !== undefined);
+  if (present.length === 0) {
+    return <p className={styles.muted}>{emptyText ?? "No data."}</p>;
+  }
+
+  return (
+    <dl>
+      {present.map((entry) => (
+        <div key={entry.key}>
+          <dt className={styles.meta}><PoolLabel label={entry.label} /></dt>
+          <dd>{values[entry.key]}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+/** A keyValue label, with the Shell HUD's pool glyph prepended when the
+ * label names a pool — the same familiarity-by-repetition the meters get. */
+function PoolLabel({ label }: { label: string }): JSX.Element {
+  const icon = poolIconFor(label);
+  if (icon === null) return <>{label}</>;
+  return <span className={styles.iconLabel}><HudIcon id={icon} /> {label}</span>;
+}
+
+/**
+ * A `form` instruction: text/select/hidden fields, submitted via `runAction`.
+ *
+ * `valuesSource` (a `"GET /api/..."` string, or null) seeds `formValues` from
+ * the server on mount and again after every successful submit anywhere on the
+ * page — same cancel-flag/refetch-signal shape as `SelectField` and
+ * `TableBlock`. Prefill degrades to a blank form on a fetch failure or a
+ * response shape that doesn't parse as `FormValuesResponseSchema`; either way
+ * the submit path must keep working.
+ */
+function FormBlock({ index, inst, formValues, setFormValues, pending, refetchSignal, runAction }: {
+  index: number;
+  inst: Extract<RenderInstruction, { kind: "form" }>;
+  formValues: Record<string, string>;
+  setFormValues: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  pending: boolean;
+  refetchSignal: number;
+  runAction: (index: number, action: string, body?: Record<string, string>) => Promise<void>;
+}): JSX.Element {
+  const prefillPath = inst.valuesSource === null ? null : inst.valuesSource.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    if (prefillPath === null) return;
+    let cancelled = false;
+    void api<unknown>(prefillPath)
+      .then((body) => {
+        if (cancelled) return;
+        const parsed = FormValuesResponseSchema.safeParse(body);
+        // Degrade to a blank form on any shape mismatch — prefill must never
+        // block the submit path.
+        if (!parsed.success) return;
+        const values = parsed.data.values;
+        setFormValues((previous) => {
+          const next = { ...previous };
+          for (const field of inst.fields) {
+            // Hidden fields submit their declared constant; never seeded.
+            if (field.type === "hidden") continue;
+            const value = values[field.name];
+            if (value !== undefined) next[`${index}:${field.name}`] = value;
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        // Fetch failure degrades to the pre-prefill blank form, silently.
+      });
+    return () => { cancelled = true; };
+  }, [prefillPath, refetchSignal, index]); // Primitives only: effect reads inst.fields/setFormValues but keys on primitives so parent re-renders don't refire it and revert in-progress edits.
+
+  return (
+    <form
+      className={styles.formCard}
+      onSubmit={(event) => {
+        event.preventDefault();
+        const body: Record<string, string> = {};
+        for (const field of inst.fields) {
+          // A hidden field has no input and therefore no `formValues`
+          // entry — its constant comes straight off the schema.
+          body[field.name] = field.type === "hidden"
+            ? field.value
+            : formValues[`${index}:${field.name}`] ?? "";
+        }
+        void runAction(index, inst.action, body);
+      }}
+    >
+      {inst.fields.map((field) => {
+        const key = `${index}:${field.name}`;
+        // Nothing to draw and nothing to label: onSubmit reads the
+        // constant off the field itself. Rendering an
+        // `<input type="hidden">` would only add a second, unread copy.
+        if (field.type === "hidden") return null;
+        const FieldWrapper = field.type === "select" && field.presentation === "list" ? "div" : "label";
+        return (
+          <FieldWrapper key={field.name} className={styles.field}>
+            <span className={styles.meta}>{field.label}</span>
+            {field.type === "select" ? (
+              <SelectField
+                field={field}
+                value={formValues[key] ?? ""}
+                onChange={(value, row) => {
+                  setFormValues((previous) => {
+                    const next = { ...previous, [key]: value };
+                    // A `prefillForm` select seeds its siblings from the chosen
+                    // row, by field name — picking the row to edit populates
+                    // the edit. Only string keys the row carries are seeded:
+                    // a field the row lacks (or another select, which picks
+                    // its own options) keeps what it had, and hidden fields
+                    // keep their declared constant. Fires only on a real
+                    // selection change, never on the placeholder.
+                    if (field.prefillForm === true && row !== null) {
+                      for (const sibling of inst.fields) {
+                        if (sibling !== field && sibling.type !== "select" && sibling.type !== "hidden") {
+                          const seeded = row[sibling.name];
+                          if (seeded !== undefined) {
+                            next[`${index}:${sibling.name}`] = seeded;
+                          }
+                        }
+                      }
+                    }
+                    return next;
+                  });
+                }}
+                refetchSignal={refetchSignal}
+              />
+            ) : (
+              <input
+                name={field.name}
+                // `money` is a decimal string on the wire, so it stays a text
+                // input — a number input would round-trip it through Number.
+                type={field.type === "money" ? "text" : field.type === "decimal" ? "number" : field.type}
+                // `<input type="number">` defaults to step="1", which makes
+                // the browser reject a fractional value on submit. `decimal`
+                // is the same widget with that restriction lifted.
+                {...(field.type === "decimal" ? { step: "any" } : {})}
+                {...(field.min !== undefined ? { min: field.min } : {})}
+                {...(field.max !== undefined ? { max: field.max } : {})}
+                value={formValues[key] ?? ""}
+                onChange={(event) => {
+                  const { value } = event.target;
+                  setFormValues((previous) => ({ ...previous, [key]: value }));
+                }}
+              />
+            )}
+          </FieldWrapper>
+        );
+      })}
+      <button type="submit" disabled={pending}>{inst.submitLabel}</button>
+    </form>
+  );
+}
+
+/**
+ * The admin upload widget: pick an entity, pick a file, and the two requests
+ * that binding art actually takes happen here rather than in the plugin.
+ *
+ * Two requests, not one, and the split is the design: `POST /api/admin/assets`
+ * takes RAW IMAGE BYTES (a plugin route's Zod-parsed JSON body could not carry
+ * them), and `PUT /api/admin/assets/bind` is ordinary JSON. Both are core
+ * routes — which is exactly why this is its own node kind rather than a `form`,
+ * since a form's action must live under the declaring plugin's own basePaths.
+ *
+ * `scope` is never chosen here. The server stamped it from the declaring
+ * plugin's id, so this widget can only ever bind that plugin's art.
+ */
+function AssetBinderBlock({ scope, slot, entitySource, entityLabelKey, refetchSignal }: {
+  scope: string;
+  slot: string;
+  /** Null for a singleton slot: one image, so no entity picker is drawn. */
+  entitySource: string | null;
+  entityLabelKey: string | null;
+  refetchSignal: number;
+}): JSX.Element {
+  const [rows, setRows] = useState<ReadonlyArray<Record<string, string>>>([]);
+  const [entityId, setEntityId] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+
+  const singleton = entitySource === null;
+  const path = entitySource === null ? null : entitySource.replace(/^GET\s+/, "");
+
+  useEffect(() => {
+    if (path === null) return;
+    let cancelled = false;
+    void api<unknown>(path)
+      .then((body) => {
+        if (cancelled) return;
+        setRows(TableRowsResponseSchema.parse(body).rows);
+      })
+      .catch((caught: unknown) => { if (!cancelled) setError(caught); });
+    return () => { cancelled = true; };
+  }, [path, refetchSignal]);
+
+  async function submit(event: React.FormEvent): Promise<void> {
+    event.preventDefault();
+    if (file === null || (!singleton && entityId === "")) return;
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      // The raw bytes, with the file's own type as the content-type. The server
+      // reads the magic bytes and refuses the upload if the two disagree, so a
+      // mislabelled file fails here rather than being stored.
+      const bytes = await file.arrayBuffer();
+      const uploaded = await api<{ assetId: string }>("/api/admin/assets", {
+        method: "POST",
+        headers: { "content-type": file.type },
+        body: bytes,
+      });
+      await api<{ bound: boolean }>("/api/admin/assets/bind", {
+        method: "PUT",
+        // `entityId` is omitted entirely for a singleton — the server supplies
+        // the constant, so the client never names it.
+        body: JSON.stringify({ scope, slot, assetId: uploaded.assetId, ...(singleton ? {} : { entityId }) }),
+      });
+      setStatus("Image bound.");
+      setFile(null);
+    } catch (caught: unknown) {
+      setError(caught);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clear(): Promise<void> {
+    if (!singleton && entityId === "") return;
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      await api<{ bound: boolean }>("/api/admin/assets/bind", {
+        method: "PUT",
+        body: JSON.stringify({ scope, slot, assetId: null, ...(singleton ? {} : { entityId }) }),
+      });
+      setStatus("Image removed.");
+    } catch (caught: unknown) {
+      setError(caught);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className={styles.form} onSubmit={(event) => { void submit(event); }}>
+      {singleton ? null : (
+        <label>
+          Entity
+          <select value={entityId} onChange={(event) => { setEntityId(event.target.value); }}>
+            <option value="">Select…</option>
+            {rows.map((row) => (
+              <option key={row["id"] ?? ""} value={row["id"] ?? ""}>
+                {(entityLabelKey === null ? undefined : row[entityLabelKey]) ?? row["id"] ?? ""}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <label>
+        Image
+        <input
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          onChange={(event) => { setFile(event.target.files?.[0] ?? null); }}
+        />
+      </label>
+      <button type="submit" disabled={busy || file === null || (!singleton && entityId === "")}>Upload &amp; bind</button>
+      <button type="button" disabled={busy || (!singleton && entityId === "")} onClick={() => { void clear(); }}>
+        Remove image
+      </button>
+      <p className={styles.muted} role="status">{status}</p>
+      <ErrorText error={error} />
+    </form>
+  );
+}
+
+/**
+ * Renders a flat list of RenderInstructions. Button/form actions are sent via
+ * `api()` (the actions are `"METHOD /path"` strings declared in the schema).
+ */
+export function PageRenderer({ instructions, onActionSuccess, animateCards = false }: {
+  animateCards?: boolean;
+  instructions: readonly RenderInstruction[];
+  /**
+   * Fired after every 2xx action. The host (PluginPage/Admin) invalidates
+   * app-level queries here — the Shell's pool bars and stat row read `me`,
+   * and most plugin routes publish no event to invalidate it (gym's train
+   * left the energy bar stale, found live 2026-08-27). A prop, not
+   * useQueryClient in here, so the renderer stays mountable without a
+   * QueryClientProvider (every renderer test does exactly that).
+   */
+  onActionSuccess?: (() => void) | undefined;
+}): JSX.Element {
+  const navigate = useNavigate();
+  const [error, setError] = useState<unknown>(null);
+  // Keyed `"<instructionIndex>:<fieldName>"`, not by bare field name: two forms
+  // on one page may each declare an `amount`, and a page-wide map would make
+  // them the same input. Submit maps its own keys back to bare names.
+  const [formValues, setFormValues] = useState<Record<string, string>>({});
+  // Keyed by instruction index, same as `formValues` and for the same reason:
+  // stable and unique across the whole page. One button in flight does not
+  // disable the others (see `togglePending`) — only the control that fired.
+  const [pending, setPending] = useState<ReadonlySet<number>>(new Set());
+  // Incremented after every successful `runAction` so TableBlock re-fetches.
+  const [refetchSignal, setRefetchSignal] = useState(0);
+
+  async function runAction(index: number, action: string, body?: Record<string, string>): Promise<void> {
+    setError(null);
+    const [method, path] = action.split(" ");
+    if (method === undefined || path === undefined) {
+      // Unreachable: the payload was validated against VIEW_ACTION_RE at parse
+      // time, so an action here always has both halves. Handled rather than
+      // asserted so a schema change upstream degrades to a message.
+      setError(new Error(`Plugin action is malformed: ${action}`));
+      return;
+    }
+    // Set before the request, cleared in `finally`: plugin routes carry no
+    // idempotency key (NOTES.md rule 1's failure mode reached from the
+    // client), so a double-click must not fire a second POST while the first
+    // is still in flight, whether it succeeds, fails, or throws.
+    setPending((previous) => togglePending(previous, index, true));
+    try {
+      // The client sets `content-type: application/json` iff `init.body` is
+      // present, and the server answers a bodyless request carrying that header
+      // with 400 FST_ERR_CTP_EMPTY_JSON_BODY — so a `button` (no body) must not
+      // pass the key at all. Checkout actions return a hosted destination.
+      const result = await api<unknown>(path, {
+        method,
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      const checkout = checkoutDestination(result);
+      if (checkout) window.location.assign(checkout);
+      // Any successful action may have mutated table-backed data — bump
+      // the signal so every TableBlock on this page re-fetches.
+      setRefetchSignal((n) => n + 1);
+      onActionSuccess?.();
+    } catch (caught) {
+      // Kept as the thrown value, not flattened to `.message`: describeError
+      // turns an ApiError into player copy ("Not ready yet — 30s to go.")
+      // where `.message` would show "429 on_cooldown".
+      setError(caught);
+    } finally {
+      setPending((previous) => togglePending(previous, index, false));
+    }
+  }
+
+  /**
+   * A table row's action: same wire behaviour as a bodyless `button` action,
+   * but pending state lives in the TableBlock (per row, not per instruction),
+   * so this only reports success back for the arm state to clear.
+   */
+  async function runRowAction(action: string): Promise<boolean> {
+    setError(null);
+    const [method, path] = action.split(" ");
+    if (method === undefined || path === undefined) {
+      setError(new Error(`Plugin action is malformed: ${action}`));
+      return false;
+    }
+    try {
+      await api<unknown>(path, { method });
+      setRefetchSignal((n) => n + 1);
+      return true;
+    } catch (caught) {
+      setError(caught);
+      return false;
+    }
+  }
+
+  function renderInstruction(index: number, inst: RenderInstruction): JSX.Element | null {
+    switch (inst.kind) {
+      case "panelHeader":
+        // Consumed by groupIntoPanels; a header never reaches a group's items.
+        return null;
+      case "text":
+        return <p key={index}>{inst.value}</p>;
+      case "money":
+        return <p key={index}><Money value={inst.value} /></p>;
+      case "error":
+        // Deliberately not <ErrorText>: that runs describeError, which maps a
+        // bare string to "Something went wrong." and would swallow the copy the
+        // plugin wrote. ErrorText is for thrown ApiErrors, this is a view node.
+        return <p key={index} role="alert" className={styles.bad}>{inst.value}</p>;
+      case "link":
+        return (
+          <button key={index} type="button" onClick={() => { navigate(inst.to); }}>
+            {inst.label}
+          </button>
+        );
+      case "button":
+        return (
+          <button
+            key={index}
+            type="button"
+            disabled={pending.has(index)}
+            onClick={() => { void runAction(index, inst.action); }}
+          >
+            {inst.label}
+          </button>
+        );
+      case "cooldownButton":
+        // v1 renders a plain button gated on the same action. CooldownButton and
+        // useCountdowns both exist and are ready, but useCountdowns is seeded
+        // from server-supplied seconds and the manifest carries no cooldown
+        // snapshot — so at render there is nothing to seed the countdown with.
+        return (
+          <button
+            key={index}
+            type="button"
+            disabled={pending.has(index)}
+            onClick={() => { void runAction(index, inst.action); }}
+          >
+            {inst.label}
+          </button>
+        );
+      case "keyValue":
+        return (
+          <dl key={index}>
+            {inst.rows.map((row, rowIndex) => (
+              <div key={rowIndex}>
+                <dt className={styles.meta}><PoolLabel label={row.label} /></dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        );
+      case "meter":
+        return <Meter key={index} label={inst.label} value={inst.value} max={inst.max} />;
+      case "meterSource":
+        return (
+          <MeterSourceBlock
+            key={index}
+            label={inst.label}
+            source={inst.source}
+            valueKey={inst.valueKey}
+            maxKey={inst.maxKey}
+            refetchSignal={refetchSignal}
+          />
+        );
+      case "keyValueSource":
+        return (
+          <KeyValueSourceBlock
+            key={index}
+            source={inst.source}
+            entries={inst.entries}
+            emptyText={inst.emptyText}
+            refetchSignal={refetchSignal}
+          />
+        );
+      case "form":
+        return (
+          <FormBlock
+            key={index}
+            index={index}
+            inst={inst}
+            formValues={formValues}
+            setFormValues={setFormValues}
+            pending={pending.has(index)}
+            refetchSignal={refetchSignal}
+            runAction={runAction}
+          />
+        );
+      case "table":
+        return (
+          <TableBlock
+            key={index}
+            source={inst.source}
+            columns={inst.columns}
+            rowActions={inst.rowActions}
+            onRowAction={runRowAction}
+            refetchSignal={refetchSignal}
+          />
+        );
+      case "image":
+        return <GameImage key={index} url={inst.url} alt={inst.alt} size={inst.size} />;
+      case "slotImage":
+        // The banner size is page chrome and takes core's own frame; the
+        // three fixed sizes are inline art and draw bare, zoomable.
+        return inst.size === "banner"
+          ? <SlotBanner key={index} scope={inst.scope} slot={inst.slot} alt={inst.alt} />
+          : <SlotImage key={index} scope={inst.scope} slot={inst.slot} alt={inst.alt} size={inst.size} />;
+      case "propertyPanel":
+        // The same component the bullets and casino pages embed; it reads
+        // the town's property rows itself and shows Buy or the owner tools.
+        return <PropertyPanel key={index} pluginId={inst.pluginId} {...(inst.show === null ? {} : { show: inst.show })} />;
+      case "assetBinder":
+        return (
+          <AssetBinderBlock
+            key={index}
+            scope={inst.scope}
+            slot={inst.slot}
+            entitySource={inst.entitySource}
+            entityLabelKey={inst.entityLabelKey}
+            refetchSignal={refetchSignal}
+          />
+        );
+      case "cards": {
+        // The wrapper is what carries `--card-w`, the one knob the card CSS
+        // reads (theme.css), so a hand's size is set by a class on an ancestor
+        // rather than by touching PlayingCard. It is also the single flex item
+        // a `layout: "row"` panel needs per hand — a bare `.hand` would let the
+        // row break between two cards of the SAME hand.
+        const sizeClass = inst.size === "sm"
+          ? styles.handSm
+          : inst.size === "lg" ? styles.handLg : styles.handMd;
+        // Fallback mirrors Hand's markup card-for-card so the deck chunk
+        // arriving does not shift the layout under a pending Hit button.
+        const hand = (
+          <Suspense
+            fallback={
+              <span className="hand" role="group" aria-busy="true" aria-label={`${inst.cards.length} cards`}>
+                {inst.cards.map((code, i) => (
+                  <span key={`${code}-${i}`} data-card className="card card--unknown" />
+                ))}
+              </span>
+            }
+          >
+            <Hand codes={inst.cards} animate={animateCards} />
+          </Suspense>
+        );
+        if (inst.caption === null) {
+          return <div key={index} className={sizeClass}>{hand}</div>;
+        }
+        // figure/figcaption rather than a div and a span: the caption names
+        // whose hand this is, and the association is exactly what a screen
+        // reader needs to tell four hands in a row apart.
+        return (
+          <figure key={index} className={`${styles.handFigure} ${sizeClass}`}>
+            {hand}
+            <figcaption className={styles.meta}>{inst.caption}</figcaption>
+          </figure>
+        );
+      }
+    }
+  }
+
+  return (
+    <div className={styles.stack}>
+      <ErrorText error={error} />
+      {groupIntoPanels(instructions).map((group, groupIndex) => {
+        const body = group.items.map(({ index, inst }) => renderInstruction(index, inst));
+        const laidOut = group.layout === "row" ? <div className={styles.handRow}>{body}</div> : body;
+        return group.title === null ? (
+          <Fragment key={groupIndex}>{laidOut}</Fragment>
+        ) : (
+          <Panel key={groupIndex} title={group.title} collapsed={group.collapsed ?? undefined}>{laidOut}</Panel>
+        );
+      })}
+    </div>
+  );
+}

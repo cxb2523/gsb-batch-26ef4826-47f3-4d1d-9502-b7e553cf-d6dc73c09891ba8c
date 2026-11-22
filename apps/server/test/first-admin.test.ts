@@ -1,0 +1,82 @@
+import { eq } from "drizzle-orm";
+import type { FastifyInstance } from "fastify";
+import type { Redis } from "ioredis";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { players, roleModuleAccess, roles } from "../src/db/schema/index.js";
+import { resetDb, testDb } from "./helpers/db.js";
+import { registerVerifiedPlayer } from "./helpers/register.js";
+import { bootTestServer } from "./helpers/server.js";
+
+const { db, sql: conn } = testDb();
+let app: FastifyInstance;
+let redis: Redis;
+let closeServer: () => Promise<void>;
+
+beforeEach(async () => {
+  await resetDb(db);
+  if (!app) ({ app, close: closeServer, redis } = await bootTestServer());
+});
+
+afterAll(async () => { await closeServer(); await conn.end(); });
+
+async function register(username: string) {
+  return registerVerifiedPlayer({ app, redis }, { username }) as Promise<{ playerId: string; token: string }>;
+}
+
+async function grantsOf(playerId: string): Promise<string[]> {
+  const rows = await db
+    .select({ moduleKey: roleModuleAccess.moduleKey })
+    .from(players)
+    .innerJoin(roleModuleAccess, eq(roleModuleAccess.roleId, players.roleId))
+    .where(eq(players.id, playerId));
+  return rows.map((r) => r.moduleKey);
+}
+
+describe("first registered player becomes admin", () => {
+  it("gives the very first player the Administrator role with *", async () => {
+    const first = await register("Founder");
+    expect(await grantsOf(first.playerId)).toEqual(["*"]);
+    const [role] = await db.select().from(roles);
+    expect(role?.name).toBe("Administrator");
+  });
+
+  it("gives the second player no role and both players see correct grants on /me", async () => {
+    const first = await register("Founder");
+    const second = await register("Latecomer");
+    expect(await grantsOf(second.playerId)).toEqual([]);
+    const [row] = await db.select({ roleId: players.roleId }).from(players)
+      .where(eq(players.id, second.playerId));
+    expect(row?.roleId).toBeNull();
+
+    // /api/auth/me exposes grants
+    const adminMe = await app.inject({
+      method: "GET", url: "/api/auth/me",
+      headers: { authorization: `Bearer ${first.token}` },
+    });
+    expect(adminMe.statusCode).toBe(200);
+    expect(adminMe.json().grants).toEqual(["*"]);
+
+    const plainMe = await app.inject({
+      method: "GET", url: "/api/auth/me",
+      headers: { authorization: `Bearer ${second.token}` },
+    });
+    expect(plainMe.statusCode).toBe(200);
+    expect(plainMe.json().grants).toEqual([]);
+  });
+
+  it("exactly one admin under concurrent first registrations", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 4 }, (_, i) =>
+        app.inject({
+          method: "POST", url: "/api/auth/register",
+          payload: { username: `Racer${i}`, email: `racer${i}@example.test`, password: "hunter2hunter2", acceptTerms: true },
+        }),
+      ),
+    );
+    const created = results.filter((r) => r.statusCode === 201);
+    expect(created.length).toBeGreaterThanOrEqual(2);
+    const admins = await db.select({ id: players.id }).from(players)
+      .innerJoin(roles, eq(players.roleId, roles.id));
+    expect(admins).toHaveLength(1);
+  });
+});

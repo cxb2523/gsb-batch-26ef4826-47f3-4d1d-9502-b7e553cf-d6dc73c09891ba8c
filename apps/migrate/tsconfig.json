@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../server" },
+    { "path": "../../packages/plugins/bounties" },
+    { "path": "../../packages/plugins/detectives" },
+    { "path": "../../packages/plugins/membership" },
+    { "path": "../../packages/plugins/theft" }
+  ]
+}

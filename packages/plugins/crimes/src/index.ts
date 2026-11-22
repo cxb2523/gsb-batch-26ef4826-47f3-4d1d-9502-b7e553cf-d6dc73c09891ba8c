@@ -1,0 +1,1057 @@
+import {
+  coreActionCost, coreDashboard, definePlugin, filterPoint, on, PluginError, route,
+  type PageSchema, type PlayerSnapshot, type PluginCtx, type Pool, type RankUpResult,
+} from "@gl3/plugin-sdk";
+
+/**
+ * Extra percentage points on a failed crime's jail chance, for THIS player
+ * on THIS crime. The commit route seeds `{ playerId, crimeId, extraPercent: 0 }`
+ * and applies the chain before the cooldown is claimed; the figure travels
+ * through the job data as `jailBonus` (a job's `ctx.filters` sees only its
+ * own plugin's subscriptions — the same reason `costs` travels), clamped to
+ * [0, 100] and added to the crime's own `jail_chance_percent`, capped at 100.
+ * Territory's heat is the first subscriber. "collect": a throwing subscriber
+ * adds nothing, and the crime's own odds stand.
+ */
+export interface JailOdds { readonly playerId: string; readonly crimeId: string; readonly extraPercent: number }
+export const jailOdds = filterPoint<JailOdds>("crimes.jailOdds", "collect");
+
+function readJailBonus(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.floor(value)));
+}
+import { benefits as membershipBenefits, isMember } from "@gl3/plugin-membership";
+import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
+import { uuidv7 } from "uuidv7";
+import { z } from "zod";
+import { evaluateSuccessFormula, formulaUsesToken, parseSuccessFormula } from "./formula.js";
+import type { FormulaNode } from "./formula.js";
+import { crimeLog, crimes, playerCrimeSkill, playerStats, players } from "./schema.js";
+
+// The sandboxed formula dialect's public API — apps/migrate imports the same
+// parser to validate imported crimePERCFORM expressions (B spec §5): one
+// grammar, two consumers, no drift between them.
+export {
+  parseSuccessFormula, evaluateSuccessFormula, formulaUsesToken,
+  FormulaParseError, FormulaEvalError,
+  type FormulaContext, type FormulaNode, type FormulaTokenName,
+} from "./formula.js";
+
+/**
+ * Ported from `apps/server/src/game/crimes/routes.ts` and `worker.ts`. Paths,
+ * status codes, error strings and response bodies are unchanged. The
+ * idempotency guard moves from `crime_log.job_id` to `plugin_job_runs`
+ * (structural in ctx.transaction), and one behaviour changes on a retried
+ * already-committed job: it emits zero events where core republished
+ * `crime.resolved` (spec §2 — accepted deviation).
+ *
+ * `@gl3/shared` is off-limits to a plugin package, so `IdSchema` is restated.
+ */
+const IdSchema = z.string().uuid();
+const CommitCrimeParamsSchema = z.object({ crimeId: IdSchema });
+
+/** V2 shipped a default ladder starting at 35% (spec §1.2 US_crimes default). */
+const DEFAULT_CRIME_CHANCE = "35.00";
+
+/** V2 crimes.hooks.php: ceil(C_cooldown * 0.75) while the membership timer runs. */
+function memberCooldown(base: number, member: boolean): number {
+  return member ? Math.ceil(base * 0.75) : base;
+}
+
+const POOLS = ["energy", "will", "brave"] as const satisfies readonly Pool[];
+
+/**
+ * Positive-amount entries only, in fixed pool order — what's actually worth
+ * locking and spending over. `costs` comes back from `core.actionCost` with
+ * whatever subscribers chose to add; an empty or all-zero map is what "no
+ * attribute plugin installed" (or "installed but this action is unpriced")
+ * looks like, and that's the case `priced.length > 0` guards on below.
+ */
+function pricedEntries(costs: Partial<Record<Pool, number>>): [Pool, number][] {
+  return POOLS
+    .map((pool) => [pool, costs[pool]] as const)
+    .filter((entry): entry is [Pool, number] => typeof entry[1] === "number" && entry[1] > 0);
+}
+
+/**
+ * Narrows the job data's `costs` field back into `Partial<Record<Pool,
+ * number>>`. The route is the only writer of this field (it enqueues exactly
+ * what `pricedEntries` returned), but job data crosses a queue as JSON, so
+ * this reads it back as `unknown` and validates rather than casting.
+ */
+function readCosts(value: unknown): Partial<Record<Pool, number>> {
+  if (typeof value !== "object" || value === null) return {};
+  const record = value as Record<string, unknown>;
+  const out: Partial<Record<Pool, number>> = {};
+  for (const pool of POOLS) {
+    const amount = record[pool];
+    if (typeof amount === "number") out[pool] = amount;
+  }
+  return out;
+}
+
+const declareBenefit = on(membershipBenefits, (_ctx, list) => [
+  ...list,
+  { title: "Getaway Driver", description: "All crime cooldowns are reduced by 25%" },
+]);
+
+/**
+ * Under per-subscriber binding the ctx handed here is crimes' OWN — so
+ * `ctx.cooldown.peek("crime", ...)` reads the exact scope the commit route
+ * (`commitRoute` above) arms, not a sibling plugin's namespace.
+ */
+const dashboardWidget = on(coreDashboard, async (ctx, value) => {
+  const player = ctx.player;
+  if (player === null) return value;
+  const remaining = await ctx.cooldown.peek("crime", player.id);
+  return [...value, {
+    pluginId: ctx.pluginId,
+    title: "Crimes",
+    view: {
+      kind: "panel" as const, title: "Crimes",
+      children: [
+        {
+          kind: "text" as const,
+          value: remaining > 0 ? `Next crime ready in ${remaining}s` : "A crime is ready.",
+        },
+        { kind: "link" as const, label: "Go to crimes", to: "/plugins/crimes.index" },
+      ],
+    },
+  }];
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/crimes — port of routes.ts:26-47
+// ---------------------------------------------------------------------------
+
+/**
+ * The listing's preview of a formula crime's chance: the commit job's own
+ * evaluation (parse guarded, six tokens, SKILL from the learned per-crime
+ * chance) against the caller's current stats. Null on any fault — the same
+ * degrade-not-500 stance the job takes, and the web's "chance by stats"
+ * fallback renders it.
+ */
+function previewFormulaChance(
+  formula: string,
+  stats: { level: number; crimeExp: bigint; exp: bigint; will: number; iq: bigint } | undefined,
+  skillChance: string | undefined,
+): string | null {
+  if (stats === undefined) return null;
+  try {
+    return evaluateSuccessFormula(parseSuccessFormula(formula), {
+      LEVEL: stats.level,
+      CRIMEXP: Number(stats.crimeExp),
+      EXP: Number(stats.exp),
+      WILL: stats.will,
+      IQ: Number(stats.iq),
+      SKILL: Number(skillChance ?? DEFAULT_CRIME_CHANCE),
+    }).toFixed(2);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The crime board behind BOTH `GET /api/crimes` (the JSON DTO the web client
+ * reads) and `GET /api/crimes/rows` (the view-node table a vocabulary-
+ * rendering client reads). Extracted so the two can never drift (spec
+ * 2026-09-18 §3.3) — the DTO array it returns is exactly what the listing
+ * route has always returned, field for field.
+ */
+async function listCrimes(ctx: PluginCtx, player: PlayerSnapshot) {
+  const cooldownRemaining = await ctx.cooldown.peek("crime", player.id);
+
+  return ctx.transaction(async (tx) => {
+    const [me] = await tx.db.select({
+      level: playerStats.level, crimeExp: playerStats.crimeExp,
+      exp: playerStats.exp, will: playerStats.will, iq: playerStats.iq,
+    })
+      .from(playerStats).where(eq(playerStats.playerId, player.id));
+    // V2's listing gate (crimes.inc: `WHERE C_level <= US_rank`), on GL3's
+    // level axis — a crime above the player's level is not listed at all,
+    // exactly as in V2, so there is nothing under-level to even attempt.
+    const rows = await tx.db.select().from(crimes)
+      .where(lte(crimes.minLevel, me?.level ?? 1))
+      .orderBy(asc(crimes.sort));
+    const skills = await tx.db.select().from(playerCrimeSkill)
+      .where(eq(playerCrimeSkill.playerId, player.id));
+    const skillByCrime = new Map(skills.map((s) => [s.crimeId, s.chance]));
+    const member = await isMember(tx, player.id);
+    // `crimes` is a CORE table, so its art is core-scoped even though this
+    // plugin renders it — the same cross-scope read inventory, travel and
+    // ranks all make.
+    const art = await ctx.assets.resolve("core", rows.map((c) => c.id), "crime");
+
+    return rows.map((crime) => ({
+      id: crime.id,
+      name: crime.name,
+      description: crime.description,
+      cooldownSeconds: memberCooldown(crime.cooldownSeconds, member),
+      minPayout: crime.minPayout.toString(),
+      maxPayout: crime.maxPayout.toString(),
+      // A formula crime previews its chance evaluated against the
+      // CALLER's stats — the same figure the commit job would roll
+      // against right now. Unlocked point-in-time preview (detectives'
+      // list precedent); a parse or eval fault previews null and the
+      // web renders "chance by stats" for it.
+      chance: crime.successFormula === null
+        ? (skillByCrime.get(crime.id) ?? DEFAULT_CRIME_CHANCE)
+        : previewFormulaChance(crime.successFormula, me, skillByCrime.get(crime.id)),
+      cooldownRemaining,
+      ...(art.has(crime.id) ? { imageUrl: art.get(crime.id) as string } : {}),
+    }));
+  });
+}
+
+const listRoute = route({
+  method: "GET",
+  path: "/api/crimes",
+  handler: async (ctx) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    return { status: 200, body: { crimes: await listCrimes(ctx, player) } };
+  },
+});
+
+/**
+ * `crimes.index`'s table source (spec 2026-09-18 §3.3). Every cell is a
+ * string and none is ever null — `TableRowsResponseSchema`'s contract.
+ *
+ * `cooldown` and `cooldownUntil` carry the same ISO instant on purpose: the
+ * column renders it as a live countdown (`render: "countdown"`) and the row
+ * action disables its button against it (`cooldownKey`). The crime cooldown
+ * is one per-player figure rather than per crime, so every row shares the
+ * deadline.
+ *
+ * `cannotCommit` is therefore always `"false"`: the cooldown gates through
+ * `cooldownKey`, so the button counts down in place rather than rendering
+ * flatly disabled — travel's shape, and what the spec's §3.3 amendment asks
+ * for. The field stays on the row (and `disabledKey` stays on the action) for
+ * a future block that is NOT a countdown; `disabledKey` is checked first, so
+ * setting it would win over the timer.
+ */
+const rowsRoute = route({
+  method: "GET",
+  path: "/api/crimes/rows",
+  handler: async (ctx) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+
+    const listed = await listCrimes(ctx, player);
+    const nowMs = Date.now();
+
+    return {
+      status: 200,
+      body: {
+        rows: listed.map((c) => {
+          const until = c.cooldownRemaining > 0
+            ? new Date(nowMs + c.cooldownRemaining * 1000).toISOString()
+            : "";
+          return {
+            id: c.id,
+            image: c.imageUrl ?? "",
+            name: c.name,
+            // `chance` is null only when a formula crime's preview faulted
+            // (parse or eval); the figure itself, when there is one, is the
+            // per-attempt chance either model produced.
+            chance: c.chance === null ? "formula" : `${c.chance}%`,
+            payout: `${c.minPayout}–${c.maxPayout}`,
+            cooldown: until,
+            cooldownUntil: until,
+            cannotCommit: "false",
+          };
+        }),
+      },
+    };
+  },
+});
+
+/**
+ * `crimes.index`'s `keyValueSource` (spec 2026-09-18 §3.3): the caller's most
+ * recent attempt, for a client with no socket. 404 `no_crimes` when there has
+ * never been one — the renderer draws `emptyText` for a 404, so absence is a
+ * state rather than an error to show.
+ *
+ * The commit route is 202 and its outcome lands moments later, so a client
+ * that reads this straight after a commit may still see the PREVIOUS attempt.
+ * `at` is what lets it tell; `crime.resolved` over the socket remains the
+ * authoritative signal.
+ */
+const lastRoute = route({
+  method: "GET",
+  path: "/api/crimes/last",
+  handler: async (ctx) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+
+    // There is no non-transactional read accessor on PluginCtx, so this one
+    // SELECT runs in its own transaction like every other plugin read.
+    const row = await ctx.transaction(async (tx) => {
+      const [found] = await tx.db.select({
+        name: crimes.name,
+        success: crimeLog.success,
+        payout: crimeLog.payout,
+        at: crimeLog.createdAt,
+      })
+        .from(crimeLog)
+        .innerJoin(crimes, eq(crimes.id, crimeLog.crimeId))
+        .where(eq(crimeLog.playerId, player.id))
+        .orderBy(desc(crimeLog.createdAt))
+        .limit(1);
+      return found ?? null;
+    });
+    if (row === null) throw new PluginError("no_crimes", 404);
+
+    return {
+      status: 200,
+      body: {
+        values: {
+          crime: row.name,
+          outcome: row.success ? "success" : "failed",
+          payout: row.payout.toString(),
+          at: row.at.toISOString(),
+        },
+      },
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/crimes/:crimeId/commit — port of routes.ts:49-93
+// ---------------------------------------------------------------------------
+
+const commitRoute = route({
+  method: "POST",
+  path: "/api/crimes/:crimeId/commit",
+  accessInJail: false,
+  // Hospital blocks crimes exactly as jail does (V2 behavior). This route
+  // predates the accessInHospital field (default true) and was the one
+  // gameplay action a hospitalised player could still take.
+  accessInHospital: false,
+  params: CommitCrimeParamsSchema,
+  handler: async (ctx, { params }) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    const { crimeId } = params;
+
+    // Look the crime up BEFORE claiming the cooldown so a typo costs nothing.
+    const pre = await ctx.transaction(async (tx) => {
+      const [row] = await tx.db.select().from(crimes).where(eq(crimes.id, crimeId));
+      const [me] = await tx.db.select({ level: playerStats.level })
+        .from(playerStats).where(eq(playerStats.playerId, player.id));
+      return { crime: row ?? null, level: me?.level ?? 1, member: await isMember(tx, player.id) };
+    });
+    const crime = pre.crime;
+    if (crime === null) throw new PluginError("crime_not_found", 404);
+    // The authoritative half of the listing gate: the list route simply does
+    // not show over-level crimes (V2's `WHERE C_level <= US_rank` shape), so
+    // reaching here under-level means a crafted request — refused before
+    // anything is priced and before the cooldown burns, like every other
+    // refusal below.
+    if (crime.minLevel > pre.level) {
+      throw new PluginError("insufficient_level", 409, { required: crime.minLevel });
+    }
+
+    // Order: crime lookup, then what this attempt costs, then the cooldown
+    // claim — a player who cannot pay is refused before the cooldown burns
+    // (matching the typo/unknown-crime checks above, which already cost
+    // nothing), and a player who can pay is charged exactly once,
+    // authoritatively, in the job below rather than here.
+    const resolvedCost = await ctx.filters.apply(coreActionCost, { action: "crimes.commit", costs: {} });
+    // Per-crime brave pricing (audit §7 item 13; C spec §1.1): the amount is
+    // content, so it comes from the crime's own brave_cost column rather
+    // than a filter subscriber — the actionCost value carries no per-crime
+    // context. Priced iff the brave pool is declared by an installed plugin;
+    // undeclared or 0 means this crime never costs brave, on every
+    // GL3-native game forever.
+    if (ctx.attributePools.get("brave") !== null && crime.braveCost > 0) {
+      resolvedCost.costs.brave = crime.braveCost;
+    }
+    const priced = pricedEntries(resolvedCost.costs);
+    // Resolved here, alongside the cost, for the same reason: the job cannot
+    // see a sibling plugin's subscription.
+    const odds = await ctx.filters.apply(jailOdds, { playerId: player.id, crimeId, extraPercent: 0 });
+    const jailBonus = readJailBonus(odds.extraPercent);
+
+    if (priced.length > 0) {
+      // tx.attributes.read SETTLES (lazily regenerates and writes back), so
+      // the caller must already hold the row — same contract every other
+      // tx.attributes caller follows. The funds check itself runs AFTER this
+      // transaction commits, not inside it: the settle is real bookkeeping
+      // about the player's pool, independent of whether this particular
+      // attempt can afford to run, and rolling it back on a 409 would mean
+      // an always-broke player's pool never gets seeded until some other
+      // route happens to touch it.
+      const attrs = await ctx.transaction(async (tx) => {
+        await tx.locks.player([player.id]);
+        return tx.attributes.read(player.id);
+      });
+      for (const [pool, amount] of priced) {
+        if (attrs[pool] < amount) throw new PluginError(`insufficient_${pool}`, 409);
+      }
+    }
+
+    const won = await ctx.cooldown.acquire("crime", player.id, memberCooldown(crime.cooldownSeconds, pre.member));
+    if (!won) {
+      const retryAfter = await ctx.cooldown.peek("crime", player.id);
+      throw new PluginError(
+        "on_cooldown",
+        429,
+        { retryAfter },
+        { "retry-after": String(Math.max(retryAfter, 1)) },
+      );
+    }
+
+    try {
+      // The job cannot re-resolve this itself: a job's `ctx.filters` only
+      // ever sees its OWN plugin's subscriptions (apps/server/src/plugins/
+      // jobs.ts builds it from the single job-owning manifest), never a
+      // sibling attribute plugin's — so the figure resolved above travels
+      // through as job data, the same way playerId/crimeId already do.
+      //
+      // Enqueued via the outbox, in its own small transaction AFTER the
+      // cooldown claim: the attribute settle above must stay separate (its
+      // own comment — settling is real bookkeeping that must not roll back
+      // on an affordability 409), and a job row committed before the
+      // cooldown was claimed would fire for a player who then 429s. What
+      // remains outside the outbox's reach is only the Redis↔Postgres seam
+      // itself — a crash between the claim and this commit burns the
+      // cooldown without a job, the same window the old post-commit enqueue
+      // had, now strictly narrower and with the compensation below still
+      // covering the failure branch.
+      const jobId = await ctx.transaction((tx) =>
+        tx.jobs.enqueue("commit", {
+          playerId: player.id, crimeId, costs: Object.fromEntries(priced), jailBonus,
+        }));
+      return { status: 202, body: { jobId, accepted: true } };
+    } catch (error) {
+      try {
+        await ctx.cooldown.release("crime", player.id);
+      } catch (releaseError) {
+        ctx.log.error("failed to release crime cooldown after enqueue failure", {
+          err: String(releaseError), playerId: player.id, crimeId,
+        });
+      }
+      throw error;
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Commit job — port of worker.ts processCrimeJob (spec §4)
+// ---------------------------------------------------------------------------
+
+async function commitJob(ctx: PluginCtx, data: Record<string, unknown>): Promise<void> {
+  const playerId = String(data["playerId"]);
+  const crimeId = String(data["crimeId"]);
+  const priced = pricedEntries(readCosts(data["costs"]));
+  const jailBonus = readJailBonus(data["jailBonus"]);
+  const rng = ctx.job?.rng;
+  if (rng === undefined) throw new Error("commit job ran without a seeded rng");
+
+  // All reads and writes in one transaction (spec §4.3). plugin_job_runs
+  // insert is structural (first in ctx.transaction); a retry throws
+  // JobAlreadyAppliedError before any handler code runs. Pre-tx reads
+  // (spec §4.1) live inside this same transaction — ctx only exposes
+  // `transaction` for DB access, and each call would re-claim the job.
+  await ctx.transaction(async (tx) => {
+    let promotion: RankUpResult | null = null;
+
+    // Pre-tx reads (spec §4.1) — ctx.player is null inside a job.
+    const [crime] = await tx.db.select().from(crimes).where(eq(crimes.id, crimeId));
+    if (!crime) return; // crime deleted between enqueue and resolve
+
+    const [actor] = await tx.db.select({ username: players.username })
+      .from(players).where(eq(players.id, playerId));
+    if (!actor) return; // player deleted
+    const actorName = actor.username;
+
+    // Per-crime chance — three composable shapes on two models (audit §7
+    // item 5; B0, spec 2026-08-26-mccodes-migrator-design §2.2).
+    //
+    // success_formula present: the sandboxed six-token dialect, evaluated
+    // against THIS player's stats. Without SKILL it is the pure MCCodes
+    // model — player_crime_skill is V2's shape and has no MCCodes meaning,
+    // and such a crime never reads or writes it. With SKILL it is the
+    // hybrid: the learned per-crime chance feeds the stat formula, and the
+    // growth below applies so the learned part keeps learning. An eval-time
+    // fault (division by zero against a live player's stats, which parse-time
+    // validation cannot foresee) resolves as 0%: the attempt fails, the job
+    // never crashes, and the fault is logged for the admin.
+    //
+    // NULL: V2's per-player skill chance, byte-identical to the pre-B0 path
+    // — player_crime_skill is one row per (player, crime); core queried by
+    // playerId only and took [0], grabbing an arbitrary row's chance. This
+    // port scopes it to the committed crimeId (documented deviation;
+    // security-review-confirmed) and falls back to the default when the
+    // player has no row for this crime yet.
+    const [skillRow] = await tx.db.select({ chance: playerCrimeSkill.chance })
+      .from(playerCrimeSkill)
+      .where(and(eq(playerCrimeSkill.playerId, playerId), eq(playerCrimeSkill.crimeId, crimeId)));
+    const skillChance = Number(skillRow?.chance ?? DEFAULT_CRIME_CHANCE);
+
+    // Parsed ONCE, up front, behind the same guard the evaluation always
+    // had: a stored formula that fails to parse (a stale import, a
+    // hand-edited row — the validators keep new ones out, but the table is
+    // reachable) resolves the attempt as a 0% failure with a warning, the
+    // documented pre-SKILL behavior. The second, unguarded parse the growth
+    // gate originally ran would have thrown past the catch and killed the
+    // job — accepted commit, burned cooldown, three BullMQ retries, silence.
+    let parsedFormula: FormulaNode | null = null;
+    if (crime.successFormula !== null) {
+      try {
+        parsedFormula = parseSuccessFormula(crime.successFormula);
+      } catch (error) {
+        ctx.log.warn("crime success formula failed to parse; resolving as 0%", {
+          err: String(error), playerId, crimeId,
+        });
+      }
+    }
+
+    let chance: number;
+    if (parsedFormula !== null) {
+      const [stats] = await tx.db.select({
+        level: playerStats.level, crimeExp: playerStats.crimeExp,
+        exp: playerStats.exp, will: playerStats.will, iq: playerStats.iq,
+      })
+        .from(playerStats).where(eq(playerStats.playerId, playerId));
+      if (!stats) return; // player deleted between enqueue and resolve
+      try {
+        chance = evaluateSuccessFormula(parsedFormula, {
+          LEVEL: stats.level,
+          CRIMEXP: Number(stats.crimeExp), // exact below 2^53 (formula.ts header)
+          EXP: Number(stats.exp),
+          WILL: stats.will,
+          IQ: Number(stats.iq),
+          SKILL: skillChance,
+        });
+      } catch (error) {
+        ctx.log.warn("crime success formula failed to evaluate; resolving as 0%", {
+          err: String(error), playerId, crimeId,
+        });
+        chance = 0;
+      }
+    } else if (crime.successFormula !== null) {
+      // Parse failed above: 0%, and no skill growth — whether an unparseable
+      // formula "uses" SKILL is unknowable, and a formula that cannot run
+      // has no business accumulating a learned chance.
+      chance = 0;
+    } else {
+      chance = skillChance;
+    }
+
+    // The roll (spec §4.2) — seeded, identical draws to core.
+    const roll = rng.int(0, 10_000);
+    const success = roll < Math.round(chance * 100);
+    const payout = success ? rng.bigint(crime.minPayout, crime.maxPayout) : 0n;
+    const bullets = success ? BigInt(rng.int(crime.minBullets, crime.maxBullets + 1)) : 0n;
+    const exp = success ? crime.expReward : 0n;
+    // The crime's own odds plus whatever the route's jailOdds chain added
+    // (heat, first). A bonus of 0 — every boot without a subscriber — draws
+    // exactly what it always drew, so seeded replays are unchanged.
+    const jailChance = Math.min(100, crime.jailChancePercent + jailBonus);
+    const jailRoll = !success && jailChance > 0 ? rng.int(0, 100) : 100;
+    const jailed = jailRoll < jailChance;
+
+    // V2's progression-by-use, read from source (crimes.inc, method_commit):
+    // the attempt's outcome adds to this crime's learned chance —
+    //   success          +mt_rand(1, 4)  (rng.int(1, 5): max-exclusive)
+    //   failed, escaped  +mt_rand(1, 2)  (rng.int(1, 3))
+    //   failed, jailed   +0
+    // capped at 100. The port design's "on successful crimes" was corrected
+    // from the actual source: a clean failure teaches too, only getting
+    // caught does not. Applies iff the crime consumes the skill model —
+    // formula NULL, or formula referencing SKILL; a stats-only formula never
+    // reads the learned chance and so never accumulates one. The draws run
+    // AFTER the roll draws above, so the seeded replay of every pre-existing
+    // outcome is unchanged.
+    const growsSkill = crime.successFormula === null
+      || (parsedFormula !== null && formulaUsesToken(parsedFormula, "SKILL"));
+    if (growsSkill) {
+      const add = success ? rng.int(1, 5) : jailed ? 0 : rng.int(1, 3);
+      if (add > 0) {
+        const grown = Math.min(100, skillChance + add);
+        await tx.db.insert(playerCrimeSkill)
+          .values({ playerId, crimeId, chance: grown.toFixed(2) })
+          .onConflictDoUpdate({
+            target: [playerCrimeSkill.playerId, playerCrimeSkill.crimeId],
+            set: { chance: grown.toFixed(2) },
+          });
+      }
+    }
+
+    // Authoritative spend (core.actionCost) — inside the same transaction as
+    // the idempotency claim above, so a BullMQ redelivery never double-charges
+    // (rule 1). The route already pre-checked funds; this is what actually
+    // moves them, regardless of success/failure below (spending energy on an
+    // attempt, not a result, matches the pool's meaning). Skipped entirely
+    // when nothing is priced — that single guard is what keeps an install
+    // with no attribute plugin from taking a lock or touching a regen clock
+    // this job never used to touch.
+    //
+    // The handoff gap (STATUS.md, closed by C1): the route's pre-check is
+    // advisory, and a concurrent action can drain the pool between the 202
+    // and this spend. A shortfall resolves as a FAILED attempt — event
+    // published, nothing spent, no roll, no jail, no skill — inside this
+    // same transaction, so the idempotency claim COMMITS, BullMQ acks once,
+    // and a client polling for an outcome always gets one instead of
+    // watching retries exhaust into silence. The funds check runs under the
+    // lock already held, against the settled read, and precedes every spend
+    // so the batch is all-or-nothing: no pool pays for an attempt another
+    // pool cannot cover.
+    if (priced.length > 0) {
+      await tx.locks.player([playerId]);
+      const attrs = await tx.attributes.read(playerId);
+      const shortfall = priced.find(([pool, amount]) => attrs[pool] < amount);
+      if (shortfall !== undefined) {
+        await tx.db.insert(crimeLog).values({
+          id: uuidv7(), playerId, crimeId, success: false, payout: 0n, jobId: ctx.job!.id,
+        });
+        await tx.events.publishCore({
+          type: "crime.resolved",
+          actorId: playerId,
+          actorName,
+          audience: { kind: "player", playerId },
+          crimeId,
+          crimeName: crime.name,
+          success: false,
+          cause: "insufficient_pool",
+          payout: "0",
+          bullets: "0",
+          exp: "0",
+          jailedUntil: null,
+        });
+        return;
+      }
+      for (const [pool, amount] of priced) {
+        await tx.attributes.spend(playerId, pool, amount);
+      }
+    }
+
+    await tx.db.insert(crimeLog).values({
+      id: uuidv7(), playerId, crimeId, success, payout, jobId: ctx.job!.id,
+    });
+    if (payout > 0n) {
+      await tx.economy.applyBalanceChange(
+        { playerId, amount: payout, kind: "cash", reason: "crime.payout", refId: crimeId });
+    }
+    if (exp > 0n) promotion = await tx.economy.applyExpAndRankUp(playerId, exp);
+    // crime_exp_reward (audit §7 item 4, migration 0019): the counter's main
+    // producer — MCCodes' per-crime crimeXP. Default 0 writes nothing, so
+    // GL3-native crimes are byte-identical.
+    if (success && crime.crimeExpReward > 0n) {
+      await tx.db.update(playerStats)
+        .set({ crimeExp: sql`${playerStats.crimeExp} + ${crime.crimeExpReward}` })
+        .where(eq(playerStats.playerId, playerId));
+    }
+    // The bullet reward (V2 crimes.inc.php:128: `US_bullets + mt_rand(C_bullets,
+    // C_maxBullets)`). Rolled above since the first crime slice and reported
+    // in crime.resolved, but never credited until now — ranks' promotion
+    // reward (economy/ranks.ts) is the same plain-column write. Bullets are
+    // not a ledgered balance (rule 3 covers cash/bank/points), so no
+    // transactions row; idempotency is the plugin_job_runs claim above.
+    if (bullets > 0n) {
+      await tx.db.update(playerStats)
+        .set({ bullets: sql`${playerStats.bullets} + ${bullets}` })
+        .where(eq(playerStats.playerId, playerId));
+    }
+    if (jailed) await tx.jail.sendToJail(playerId, crime.jailSeconds);
+
+    // In-tx read for effectiveJailedUntil (spec §4.4) — same connection sees
+    // its own write; the value crime.resolved reports on the fresh path.
+    const [fresh] = await tx.db.select({ jailedUntil: playerStats.jailedUntil })
+      .from(playerStats).where(eq(playerStats.playerId, playerId));
+    const effectiveJailedUntil = fresh?.jailedUntil ?? null;
+
+    // Buffered events, flushed after commit in this order (spec §4.3 step 6).
+    // crime.resolved first, then player.jailed, then player.rankedUp.
+    await tx.events.publishCore({
+      type: "crime.resolved",
+      actorId: playerId,
+      actorName,
+      audience: { kind: "player", playerId },
+      crimeId,
+      crimeName: crime.name,
+      success,
+      payout: payout.toString(),
+      bullets: bullets.toString(),
+      exp: exp.toString(),
+      jailedUntil: effectiveJailedUntil ? effectiveJailedUntil.toISOString() : null,
+    });
+    if (jailed) {
+      await tx.events.publishCore({
+        type: "player.jailed",
+        actorId: playerId,
+        actorName,
+        audience: { kind: "player", playerId },
+        until: effectiveJailedUntil!.toISOString(),
+        reason: "crime.failed",
+      });
+    }
+    if (promotion) {
+      await tx.events.publishCore({
+        type: "player.rankedUp",
+        actorId: playerId,
+        actorName,
+        audience: { kind: "player", playerId },
+        rankId: promotion.rankId,
+        rankName: promotion.rankName,
+        cashReward: promotion.cashReward.toString(),
+        bulletReward: promotion.bulletReward.toString(),
+        maxHealth: promotion.maxHealth,
+      });
+    }
+  });
+  // No post-commit work: leaderboard scores and events are flushed by the ctx.
+}
+
+// ---------------------------------------------------------------------------
+// Admin routes
+// ---------------------------------------------------------------------------
+
+const AdminMoney = z.string().regex(/^\d+$/, "nonnegative integer string");
+/** Optional: absent leaves the column alone (update) or writes the default
+ *  (create, where "0"/NULL are the byte-identical values); a present string
+ *  must survive the sandboxed-dialect parser — invalid formulas 400 here,
+ *  at authoring time, rather than silently at resolve time (audit §7 item 5:
+ *  validate-every-input applies to game content too). */
+const AdminFormula = z.string().max(500).nullable();
+const CrimeUpdateSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1).max(80).optional(),
+  description: z.string().max(500).optional(),
+  minBullets: z.coerce.number().int().nonnegative().optional(),
+  maxBullets: z.coerce.number().int().nonnegative().optional(),
+  cooldownSeconds: z.coerce.number().int().nonnegative(),
+  minPayout: AdminMoney,
+  maxPayout: AdminMoney,
+  expReward: AdminMoney,
+  crimeExpReward: AdminMoney.optional(),
+  braveCost: z.coerce.number().int().nonnegative().optional(),
+  successFormula: AdminFormula.optional(),
+  /** Optional: absent leaves the level gate alone, the crimeExpReward shape. */
+  minLevel: z.coerce.number().int().nonnegative().optional(),
+  jailChancePercent: z.coerce.number().int().nonnegative(),
+  jailSeconds: z.coerce.number().int().nonnegative(),
+}).strict().refine((b) => BigInt(b.maxPayout) >= BigInt(b.minPayout), {
+  message: "maxPayout must be >= minPayout",
+});
+
+/**
+ * Create requires what update treats as optional: `name`, `description` and
+ * the `minBullets`/`maxBullets` success reward are NOT NULL on the row, so a
+ * create must supply them, while an update that omits them leaves them
+ * alone (the crimeExpReward shape). V2's admin edits every column
+ * (crimes.admin.php:112). `sort` is deliberately absent from both — the
+ * handler derives it, since asking an admin for a manual ordering integer is
+ * how two crimes end up sharing one.
+ */
+const CrimeCreateSchema = z.object({
+  name: z.string().min(1).max(80),
+  description: z.string().max(500),
+  cooldownSeconds: z.coerce.number().int().nonnegative(),
+  minPayout: AdminMoney,
+  maxPayout: AdminMoney,
+  minBullets: z.coerce.number().int().nonnegative(),
+  maxBullets: z.coerce.number().int().nonnegative(),
+  expReward: AdminMoney,
+  crimeExpReward: AdminMoney.optional(),
+  braveCost: z.coerce.number().int().nonnegative().optional(),
+  successFormula: AdminFormula.optional(),
+  /** Optional, default 0 = ungated — every native seed's value. */
+  minLevel: z.coerce.number().int().nonnegative().optional(),
+  jailChancePercent: z.coerce.number().int().nonnegative().max(100),
+  jailSeconds: z.coerce.number().int().nonnegative(),
+}).strict()
+  .refine((b) => BigInt(b.maxPayout) >= BigInt(b.minPayout), {
+    message: "maxPayout must be >= minPayout",
+  })
+  .refine((b) => b.maxBullets >= b.minBullets, {
+    message: "maxBullets must be >= minBullets",
+  });
+
+/** Parse-or-400 the formula (the AdminFormula doc comment's contract). Trim:
+ *  the stored expression is what the resolve job will parse per attempt, and
+ *  what an MCCodes import would have imported verbatim. */
+function validatedFormula(formula: string | null | undefined): string | null | undefined {
+  if (formula === undefined || formula === null) return formula;
+  const trimmed = formula.trim();
+  if (trimmed === "") return null;
+  try {
+    parseSuccessFormula(trimmed);
+    return trimmed;
+  } catch (error) {
+    throw new PluginError("invalid_formula", 400, {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+const adminCrimesListRoute = route({
+  method: "GET", path: "/api/admin/crimes/list", auth: "admin",
+  handler: async (ctx) => {
+    const rows = await ctx.transaction(async (tx) =>
+      tx.db.select().from(crimes).orderBy(asc(crimes.sort)),
+    );
+    return {
+      status: 200,
+      body: {
+        rows: rows.map((c) => ({
+          id: c.id, name: c.name,
+          description: c.description,
+          cooldownSeconds: String(c.cooldownSeconds),
+          minBullets: String(c.minBullets),
+          maxBullets: String(c.maxBullets),
+          minPayout: c.minPayout.toString(),
+          maxPayout: c.maxPayout.toString(),
+          expReward: c.expReward.toString(),
+          crimeExpReward: c.crimeExpReward.toString(),
+          braveCost: String(c.braveCost),
+          // "" not null: the table renderer parses rows with
+          // z.record(z.string()), and one null cell kills the whole table.
+          // The update route already reads "" back as NULL (blank = skill
+          // chance), so the round-trip is lossless.
+          successFormula: c.successFormula ?? "",
+          minLevel: String(c.minLevel),
+          jailChancePercent: String(c.jailChancePercent),
+          jailSeconds: String(c.jailSeconds),
+        })),
+      },
+    };
+  },
+});
+
+const adminCrimesCreateRoute = route({
+  method: "POST", path: "/api/admin/crimes", auth: "admin",
+  body: CrimeCreateSchema,
+  handler: async (ctx, { body }) => {
+    const formula = validatedFormula(body.successFormula);
+    const id = uuidv7();
+    await ctx.transaction(async (tx) => {
+      // Read the current max inside the same transaction as the insert: two
+      // concurrent creates that both read the old max would otherwise both
+      // claim the same `sort`, and the player list orders by it.
+      const [top] = await tx.db.select({ sort: crimes.sort })
+        .from(crimes).orderBy(desc(crimes.sort)).limit(1);
+      await tx.db.insert(crimes).values({
+        id, name: body.name, description: body.description,
+        cooldownSeconds: body.cooldownSeconds,
+        minPayout: BigInt(body.minPayout),
+        maxPayout: BigInt(body.maxPayout),
+        minBullets: body.minBullets,
+        maxBullets: body.maxBullets,
+        expReward: BigInt(body.expReward),
+        crimeExpReward: BigInt(body.crimeExpReward ?? "0"),
+        braveCost: body.braveCost ?? 0,
+        successFormula: formula ?? null,
+        minLevel: body.minLevel ?? 0,
+        jailChancePercent: body.jailChancePercent,
+        jailSeconds: body.jailSeconds,
+        sort: (top?.sort ?? 0) + 1,
+      });
+    });
+    return { status: 201, body: { id } };
+  },
+});
+
+const adminCrimesUpdateRoute = route({
+  method: "POST", path: "/api/admin/crimes/update", auth: "admin",
+  body: CrimeUpdateSchema,
+  handler: async (ctx, { body }) => {
+    const formula = validatedFormula(body.successFormula);
+    const updated = await ctx.transaction(async (tx) => {
+      // The bullet range is checked as a pair against the STORED row, not the
+      // body alone: a one-sided edit (raise minBullets, omit maxBullets) can
+      // invert a range the create refine would have refused.
+      if (body.minBullets !== undefined || body.maxBullets !== undefined) {
+        const [current] = await tx.db.select({ minBullets: crimes.minBullets, maxBullets: crimes.maxBullets })
+          .from(crimes).where(eq(crimes.id, body.id));
+        if (current === undefined) return false;
+        const min = body.minBullets ?? current.minBullets;
+        const max = body.maxBullets ?? current.maxBullets;
+        if (max < min) {
+          throw new PluginError("invalid_bullet_range", 400, { message: "maxBullets must be >= minBullets" });
+        }
+      }
+      // Absent keys stay untouched (drizzle omits undefined from SET) — an
+      // update that omits successFormula leaves the formula alone; sending
+      // null clears it back to the skill-chance path.
+      const result = await tx.db.update(crimes)
+        .set({
+          ...(body.name !== undefined ? { name: body.name } : {}),
+          ...(body.description !== undefined ? { description: body.description } : {}),
+          ...(body.minBullets !== undefined ? { minBullets: body.minBullets } : {}),
+          ...(body.maxBullets !== undefined ? { maxBullets: body.maxBullets } : {}),
+          cooldownSeconds: body.cooldownSeconds,
+          minPayout: BigInt(body.minPayout),
+          maxPayout: BigInt(body.maxPayout),
+          expReward: BigInt(body.expReward),
+          ...(body.crimeExpReward !== undefined ? { crimeExpReward: BigInt(body.crimeExpReward) } : {}),
+          ...(body.braveCost !== undefined ? { braveCost: body.braveCost } : {}),
+          ...(formula !== undefined ? { successFormula: formula } : {}),
+          ...(body.minLevel !== undefined ? { minLevel: body.minLevel } : {}),
+          jailChancePercent: body.jailChancePercent,
+          jailSeconds: body.jailSeconds,
+        })
+        .where(eq(crimes.id, body.id))
+        .returning({ id: crimes.id });
+      return result.length > 0;
+    });
+    if (!updated) throw new PluginError("crime_not_found", 404);
+    return { status: 204 };
+  },
+});
+
+const adminCrimesDeleteRoute = route({
+  method: "DELETE", path: "/api/admin/crimes/:id", auth: "admin",
+  params: z.object({ id: z.string().uuid() }),
+  handler: async (ctx, { params }) => {
+    const deleted = await ctx.transaction(async (tx) => {
+      // `crime_log.crime_id` and `player_crime_skill.crime_id` both cascade —
+      // a crime's attempt history and per-player skill are ABOUT the crime
+      // and go with it, unlike an item in someone's inventory. A worker still
+      // holding a queued attempt at it fails its insert on the missing FK,
+      // which is the at-least-once path failing closed (rule 1).
+      const result = await tx.db.delete(crimes)
+        .where(eq(crimes.id, params.id)).returning({ id: crimes.id });
+      return result.length > 0;
+    });
+    if (!deleted) throw new PluginError("crime_not_found", 404);
+    return { status: 204 };
+  },
+});
+
+const adminCrimesPage: PageSchema = {
+  id: "crimes-admin",
+  path: "/admin/crimes",
+  view: {
+    kind: "panel", title: "Crimes",
+    children: [
+      { kind: "table", source: "GET /api/admin/crimes/list", columns: [
+        { key: "name", label: "Name" },
+        { key: "minLevel", label: "Level" },
+        { key: "cooldownSeconds", label: "Cooldown (s)" },
+        { key: "minPayout", label: "Min payout" },
+        { key: "maxPayout", label: "Max payout" },
+        { key: "minBullets", label: "Min bullets" },
+        { key: "maxBullets", label: "Max bullets" },
+        { key: "expReward", label: "Exp" },
+        { key: "braveCost", label: "Brave" },
+        // Blank reads as "skill chance" exactly like the edit field below —
+        // the list payload already sends "" for NULL.
+        { key: "successFormula", label: "Formula" },
+        { key: "jailChancePercent", label: "Jail %" },
+        { key: "jailSeconds", label: "Jail (s)" },
+      ], rowActions: [
+        { label: "Delete", action: "DELETE /api/admin/crimes/:id", confirm: "Delete this crime? Its attempt history and player skill go with it." },
+      ] },
+      { kind: "form", action: "POST /api/admin/crimes", submitLabel: "Add crime", fields: [
+        { name: "name", label: "Name", type: "text" },
+        { name: "description", label: "Description", type: "text" },
+        { name: "cooldownSeconds", label: "Cooldown seconds", type: "number" },
+        { name: "minPayout", label: "Min payout", type: "money" },
+        { name: "maxPayout", label: "Max payout", type: "money" },
+        { name: "minBullets", label: "Min bullets", type: "number" },
+        { name: "maxBullets", label: "Max bullets", type: "number" },
+        { name: "expReward", label: "Exp reward", type: "money" },
+        { name: "crimeExpReward", label: "Crime exp reward", type: "money" },
+        { name: "braveCost", label: "Brave cost (0 = free; needs the brave pool plugin)", type: "number" },
+        { name: "successFormula", label: "Success formula (LEVEL/CRIMEXP/EXP/WILL/IQ/SKILL; blank = skill chance; SKILL grows with use)", type: "text" },
+        { name: "minLevel", label: "Min level (0 = ungated)", type: "number" },
+        { name: "jailChancePercent", label: "Jail chance %", type: "number" },
+        { name: "jailSeconds", label: "Jail seconds", type: "number" },
+      ] },
+      { kind: "form", action: "POST /api/admin/crimes/update", submitLabel: "Update crime", fields: [
+        // prefillForm: picking the crime seeds every field below from the
+        // selected row of the SAME list the dropdown loads its options from —
+        // the admin edits what is there instead of retyping the whole crime.
+        { name: "id", label: "Crime", type: "select", optionsSource: "GET /api/admin/crimes/list", valueKey: "id", labelKey: "name", prefillForm: true },
+        { name: "name", label: "Name", type: "text" },
+        { name: "description", label: "Description", type: "text" },
+        { name: "cooldownSeconds", label: "Cooldown seconds", type: "number" },
+        { name: "minPayout", label: "Min payout", type: "money" },
+        { name: "maxPayout", label: "Max payout", type: "money" },
+        { name: "minBullets", label: "Min bullets", type: "number" },
+        { name: "maxBullets", label: "Max bullets", type: "number" },
+        { name: "expReward", label: "Exp reward", type: "money" },
+        { name: "crimeExpReward", label: "Crime exp reward", type: "money" },
+        { name: "braveCost", label: "Brave cost (0 = free)", type: "number" },
+        { name: "successFormula", label: "Success formula (empty = back to skill chance)", type: "text" },
+        { name: "minLevel", label: "Min level (0 = ungated)", type: "number" },
+        { name: "jailChancePercent", label: "Jail chance %", type: "number" },
+        { name: "jailSeconds", label: "Jail seconds", type: "number" },
+      ] },
+    ],
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+export default definePlugin({
+  id: "crimes",
+  version: "1.0.0",
+  apiVersion: 1,
+  basePaths: ["/api/crimes", "/api/admin/crimes"],
+  // Real import dependencies (see this package's package.json) —
+  // enforced against the final boot set by plugins/validate.ts.
+  requires: ["membership"],
+  pages: [{
+    id: "crimes.index",
+    path: "/crimes",
+    menu: { label: "Crimes", order: 10, category: "crimes" },
+    // A real view-node page (spec 2026-09-18 §3.3), for clients that render
+    // the vocabulary — the Godot client does. apps/web is unaffected: its
+    // PluginPage checks PAGE_OVERRIDES before it ever looks at a view, so the
+    // hand-written Crimes page still wins there.
+    //
+    // The action's `:id` is the ROW's field, substituted by the renderer —
+    // the route's own param is `:crimeId`, and the two need not agree because
+    // what reaches the server is the substituted path.
+    view: {
+      kind: "panel",
+      title: "Crimes",
+      children: [
+        {
+          kind: "keyValueSource",
+          source: "GET /api/crimes/last",
+          emptyText: "No crimes committed yet",
+          entries: [
+            { label: "Crime", key: "crime" },
+            { label: "Outcome", key: "outcome" },
+            { label: "Payout", key: "payout" },
+            { label: "When", key: "at" },
+          ],
+        },
+        {
+          kind: "table",
+          source: "GET /api/crimes/rows",
+          columns: [
+            { key: "image", label: "Art", render: "image", imageSize: "sm" },
+            { key: "name", label: "Crime" },
+            { key: "chance", label: "Chance" },
+            { key: "payout", label: "Payout" },
+            { key: "cooldown", label: "Cooldown", render: "countdown" },
+          ],
+          // `cooldownKey` is what gates a crime on its timer — the button counts
+          // down in place. `disabledKey` is declared for a future non-timed
+          // block (the row's `cannotCommit` is always "false" today) and wins
+          // over the countdown when it is ever set.
+          rowActions: [{
+            label: "Commit", action: "POST /api/crimes/:id/commit",
+            disabledKey: "cannotCommit", cooldownKey: "cooldownUntil",
+          }],
+        },
+      ],
+    },
+  }],
+  routes: [listRoute, rowsRoute, lastRoute, commitRoute, adminCrimesListRoute, adminCrimesCreateRoute, adminCrimesUpdateRoute, adminCrimesDeleteRoute],
+  adminPages: [adminCrimesPage],
+  jobs: { commit: commitJob },
+  provides: [jailOdds],
+  filters: [declareBenefit, dashboardWidget],
+  worldHooks: [{ id: "corner", kind: "npc", label: "The corner", page: "crimes.index", model: "npc-coat", order: 20 }],
+  // No `events`: the crime outcome reaches the client as core's own
+  // `crime.resolved`, published by the commit job, not as a plugin envelope.
+});

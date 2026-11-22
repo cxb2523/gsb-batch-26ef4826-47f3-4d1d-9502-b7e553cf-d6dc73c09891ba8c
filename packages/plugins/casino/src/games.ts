@@ -1,0 +1,213 @@
+import { filterPoint, type PluginCtx, type ViewNode } from "@gl3/plugin-sdk";
+import type { z } from "zod";
+
+export interface GameStep<S> {
+  state: S;
+  /** What the player sees now. Rendered by PageRenderer; may contain `cards`. */
+  view: ViewNode;
+  done: boolean;
+  /**
+   * Raise the wager mid-hand (blackjack's double down; a poker raise). The hub
+   * debits the player, credits the house, updates the session and RE-RUNS the
+   * exposure check. A game never moves money itself.
+   */
+  wagerDelta?: bigint;
+  /** Cosmetic reveal of an already committed outcome. */
+  animation?: { view: ViewNode; durationMs: number };
+}
+
+export interface TableSeatInput {
+  seat: number;
+  wager: bigint;
+}
+
+/**
+ * One button the client can offer the player. PURE data, computed from state
+ * alone — a game returns `[]` when the viewer has no legal move right now
+ * (not their turn, hand done, spectator).
+ */
+export interface GameMove {
+  /**
+   * The exact payload to POST as the act body's `action`. When `needsAmount`
+   * is true the client shallow-merges `{ amount: "<digits>" }` from its own
+   * input field into a COPY of this object before posting — `action` itself
+   * never carries a placeholder amount.
+   */
+  action: unknown;
+  label: string;
+  needsAmount?: boolean;
+}
+
+/**
+ * Bounds a game's OWN move list — a third-party game controls this content
+ * and it rides a response, the same trust boundary `guardGame`'s truncated
+ * `detail` closes for a thrown message. At most `MAX_MOVES` entries, each
+ * label sliced to `MOVE_LABEL_MAX_CHARS`.
+ */
+export const MAX_MOVES = 12;
+export const MOVE_LABEL_MAX_CHARS = 40;
+
+export function boundMoves(moves: GameMove[]): GameMove[] {
+  return moves.slice(0, MAX_MOVES).map((move) => ({
+    ...move,
+    label: move.label.slice(0, MOVE_LABEL_MAX_CHARS),
+  }));
+}
+
+export interface TableStep<S> {
+  state: S;
+  done: boolean;
+  /** The seat whose turn it now is; null when the hand is done. */
+  turn: number | null;
+  /** A raise (double). `seat` must be the seat that just acted; `amount` > 0. */
+  wagerDelta?: { seat: number; amount: bigint };
+}
+
+export interface ReelDisplay {
+  reels: { image: string; label: string; held: boolean; spin: boolean; holdMove: number | null }[];
+  symbols: string[];
+  collectable: string;
+  rules: ViewNode;
+}
+
+/**
+ * The whole contract a casino game implements. `start`, `act` and `settle` are
+ * PURE — no database, no ctx, no clock, no randomness, no io. That is what
+ * makes installing a third-party game a smaller act of trust than installing
+ * an arbitrary plugin: it returns a payout figure and the hub decides whether
+ * the house can pay it and writes every ledger row.
+ */
+export interface GameDef<S = unknown> {
+  /** Persistent credits and repeat rounds, with explicit cash-out. */
+  machine?: boolean;
+  /** Public reel artwork and control placement; never includes future outcomes. */
+  reelDisplay?(state: S | null): ReelDisplay;
+  /** Must equal the declaring plugin's id — checked in `buildRegistry`. */
+  id: string;
+  name: string;
+  /**
+   * The most a player can be returned per unit of the CURRENT wager. Blackjack
+   * is 2.5 (a natural pays 3:2). A doubled hand has twice the wager and is
+   * still 2.5 of it, which is why the exposure check re-runs on `wagerDelta`
+   * rather than predicting a maximum up front.
+   */
+  maxPayoutMultiplier: number;
+  /** Validates the act body's `action`. Rule: zod every external boundary. */
+  action: z.ZodType<unknown>;
+  start(input: { wager: bigint; seed: string }): GameStep<S>;
+  act(state: S, action: unknown): GameStep<S>;
+  /** Total returned to the player. 0 = loss, wager = push, 2×wager = win. */
+  settle(state: S, wager: bigint): bigint;
+  /**
+   * Re-render an in-progress hand from its stored state, without advancing it.
+   * Pure, like the other three.
+   *
+   * The lobby (`GET /api/casino`) needs this and nothing else can supply it: a
+   * `ViewNode` is otherwise produced only as part of a `GameStep`, `state` is
+   * opaque game-owned jsonb the hub cannot interpret, and `act` cannot be used
+   * to peek because every action mutates. Without it a player who reloads the
+   * page mid-hand cannot be shown their own cards.
+   *
+   * OPTIONAL, so a game that does not implement it still compiles and simply
+   * resumes viewless rather than failing to install.
+   */
+  view?(state: S): ViewNode;
+  /**
+   * The moves the player can make right now, from `state` alone — pure, like
+   * `view`. OPTIONAL: a game that omits this is telling the hub (and, through
+   * it, the client) that it does not speak the generic-moves protocol at all,
+   * which is the client's signal to fall back to its own hardcoded UI for
+   * this game. A game that DOES implement it returns `[]` rather than
+   * omitting the method when the hand simply has no legal move right now
+   * (settled, waiting).
+   */
+  moves?(state: S): GameMove[];
+}
+
+export interface TableGameDef<S = unknown> {
+  /** Player-funded stacks retained between hands; only rake reaches the house. */
+  bankroll?: boolean;
+  /** Must equal the declaring plugin's id — checked in `buildTableRegistry`. */
+  id: string;
+  name: string;
+  /**
+   * The most a player can be returned per unit of the CURRENT wager. Blackjack
+   * is 2.5 (a natural pays 3:2). A doubled hand has twice the wager and is
+   * still 2.5 of it, which is why the exposure check re-runs on `wagerDelta`
+   * rather than predicting a maximum up front.
+   */
+  maxPayoutMultiplier: number;
+  /** Validates the act body's `action`. Rule: zod every external boundary. */
+  action: z.ZodType<unknown>;
+  /**
+   * `handNo` is the number this hand will be stored under (`casino_tables.
+   * hand_no` after the deal) — persisted, so a disputed hand replays from the
+   * stored (seed, handNo) pair. Optional so a game that ignores it (blackjack)
+   * and a hub that predates it stay compatible; a rotation-sensitive game
+   * (poker's button) uses it when present and derives from the seed when not.
+   */
+  deal(input: { seats: TableSeatInput[]; seed: string; handNo?: number; previousState?: unknown }): TableStep<S>;
+  act(state: S, seat: number, action: unknown): TableStep<S>;
+  /** What happens to a seat whose turn timer lapsed. Pure, like the rest. */
+  autoAct(state: S, seat: number): TableStep<S>;
+  /** Per-seat render. `viewer` null = a seated spectator not in this hand. */
+  view(state: S, viewer: number | null): ViewNode;
+  /** TOTAL returned per seat. A seat absent from the array is paid 0. */
+  settle(state: S): { seat: number; payout: bigint }[];
+  /**
+   * The moves `seat` can make right now, from `state` alone — pure, like
+   * `view`. `seat` is `null` for a spectator, the same convention `view`
+   * uses. OPTIONAL, and absence means the same thing it means on `GameDef`:
+   * this game does not speak the generic-moves protocol, so the client falls
+   * back to its own hardcoded UI (blackjack keeps its Hit/Stand/Double
+   * buttons this way — the backward-compatibility proof). A game that DOES
+   * implement it returns `[]` when the viewer has no legal move right now
+   * (not their turn, hand done, spectator) rather than omitting the method.
+   */
+  moves?(state: S, seat: number | null): GameMove[];
+}
+
+export const games = filterPoint<GameDef[]>("casino.games", "propagate");
+export const tableGames = filterPoint<TableGameDef[]>("casino.tableGames", "propagate");
+
+/**
+ * Built on first use and memoised by the caller. Request-time rather than
+ * boot-time, because a GameDef arrives inside a filter subscription and
+ * `definePlugin` cannot see it — the tradeoff spec §3 records.
+ */
+export async function buildRegistry(
+  ctx: Pick<PluginCtx, "filters">,
+  installedPluginIds: ReadonlySet<string>,
+): Promise<Map<string, GameDef>> {
+  const declared = await ctx.filters.apply(games, []);
+  const registry = new Map<string, GameDef>();
+  for (const game of declared) {
+    if (!installedPluginIds.has(game.id)) {
+      throw new Error(`casino game "${game.id}" is not an installed plugin id`);
+    }
+    if (registry.has(game.id)) throw new Error(`duplicate casino game id "${game.id}"`);
+    registry.set(game.id, game);
+  }
+  return registry;
+}
+
+/**
+ * Built on first use and memoised by the caller. Request-time rather than
+ * boot-time, because a TableGameDef arrives inside a filter subscription and
+ * `definePlugin` cannot see it — the tradeoff spec §3 records.
+ */
+export async function buildTableRegistry(
+  ctx: Pick<PluginCtx, "filters">,
+  installedPluginIds: ReadonlySet<string>,
+): Promise<Map<string, TableGameDef>> {
+  const declared = await ctx.filters.apply(tableGames, []);
+  const registry = new Map<string, TableGameDef>();
+  for (const game of declared) {
+    if (!installedPluginIds.has(game.id)) {
+      throw new Error(`casino table game "${game.id}" is not an installed plugin id`);
+    }
+    if (registry.has(game.id)) throw new Error(`duplicate casino table game id "${game.id}"`);
+    registry.set(game.id, game);
+  }
+  return registry;
+}

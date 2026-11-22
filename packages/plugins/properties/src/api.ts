@@ -1,0 +1,240 @@
+import { and, eq, sql } from "drizzle-orm";
+import type { PluginTx } from "@gl3/plugin-sdk";
+import { propertiesTable, playerStats, settings } from "./schema.js";
+
+const DEFAULT_SKIM_PERCENT = 10;
+const SKIM_KEY = "properties.skim_percent";
+
+/**
+ * The skim knob, read LIVE from the settings table inside the payer's
+ * transaction — one indexed PK lookup per property-income event — so an edit
+ * applies without a restart, which the admin panel states out loud. Malformed
+ * values fall back to the default, never throw mid-transaction. Exported for
+ * the admin settings route, which shows the same effective value.
+ */
+export async function readSkimPercent(tx: PluginTx): Promise<number> {
+  const [row] = await tx.db.select({ value: settings.value }).from(settings)
+    .where(eq(settings.key, SKIM_KEY));
+  if (row === undefined) return DEFAULT_SKIM_PERCENT;
+  const parsed = Number(row.value);
+  if (!Number.isInteger(parsed)) return DEFAULT_SKIM_PERCENT;
+  return Math.min(100, Math.max(0, parsed));
+}
+
+export interface PropertyOwnership {
+  propertyId: string;
+  ownerId: string;
+  /**
+   * The owner's lever: `cost` when > 0n, else `null`, meaning "the owner
+   * has not set one — use your own default". V2 does exactly this
+   * (`bullets.inc.php:86`: `if (!!$owner["cost"]) $this->setCost(...)`), and
+   * it is why the manifest declares no default: bullets' fallback is the
+   * location's own `bullet_cost`, which is per-location and admin-editable,
+   * and a manifest constant could not express that.
+   */
+  lever: bigint | null;
+}
+
+/**
+ * Who owns `pluginId`'s property in `locationId`, or null when nobody does or
+ * no such row exists. V2's `Property::getOwnership()`.
+ *
+ * Read-only and unlocked: a consumer calls this to decide whether to pay
+ * anyone at all. `payOwner` re-reads the row FOR UPDATE, so a concurrent
+ * transfer between the two calls cannot pay the wrong player.
+ *
+ * That guarantee has exactly one hole, and it is deliberate: `seizeOnKill`
+ * (`seizure.ts:32-41`) sets `owner_player_id = NULL` on kill without taking
+ * ANY lock — no `tx.locks.location`, no `tx.locks.player` — which is what
+ * keeps it out of every lock-order cycle in this plugin (see the comment at
+ * `seizure.ts:34-35`). So "every properties mutator is locations-first,
+ * therefore holding the location lock pins the owner" is false for this one
+ * subscriber: a consumer holding `tx.locks.location(L)` can still see the
+ * owner it read here vanish before `payOwner`'s locked re-read, in which
+ * case `payOwner` returns 0n (see its TOCTOU note). Do not "fix" this by
+ * adding a lock to `seizeOnKill` — that would reintroduce a cycle it was
+ * written specifically to avoid.
+ */
+export async function ownerAt(
+  tx: PluginTx, pluginId: string, locationId: string,
+): Promise<PropertyOwnership | null> {
+  const [row] = await tx.db
+    .select({
+      id: propertiesTable.id,
+      ownerPlayerId: propertiesTable.ownerPlayerId,
+      cost: propertiesTable.cost,
+    })
+    .from(propertiesTable)
+    .where(and(eq(propertiesTable.locationId, locationId), eq(propertiesTable.pluginId, pluginId)));
+  if (row === undefined || row.ownerPlayerId === null) return null;
+  return { propertyId: row.id, ownerId: row.ownerPlayerId, lever: row.cost > 0n ? row.cost : null };
+}
+
+/**
+ * Hand `propertyId` to `newOwnerId`, but ONLY if `expectedOwnerId` still owns
+ * it. Answers whether the handover happened.
+ *
+ * The bankruptcy takeover: a consumer that could not collect what the owner
+ * owes (casino's `settleSession`, where `payOwner`'s clamp short-paid a
+ * winner) takes the franchise instead of the money. It is a properties concern
+ * rather than the consumer's because the ownership column is this plugin's,
+ * and every guard that makes the move safe lives here.
+ *
+ * REFUSES three cases, each by answering `false` rather than throwing — a hand
+ * that has already paid out must not roll back because the table changed
+ * hands:
+ *  - the row is gone, or is unowned. "The unowned house cannot go bankrupt":
+ *    it is a faucet with no cash to run out of, so there is nothing to seize.
+ *  - somebody other than `expectedOwnerId` owns it now (a transfer, or
+ *    `seizeOnKill`, landed between the consumer's read and this call). The
+ *    new owner was never the one who failed to pay.
+ *  - `expectedOwnerId === newOwnerId`: nobody takes their own table over.
+ *
+ * `cost` is zeroed with the move, exactly as `transfer` and `drop` do — a
+ * lever is the owner's setting and does not survive the owner.
+ *
+ * LOCK ORDER (rule 6). Takes the property row `FOR UPDATE` and nothing else.
+ * The caller MUST already hold both players in ONE sorted `tx.locks.player`
+ * call (casino does: `[player, owner]`), because the balance movement that
+ * discovered the shortfall touched both.
+ */
+export async function takeOverFrom(
+  tx: PluginTx, propertyId: string, expectedOwnerId: string, newOwnerId: string,
+): Promise<boolean> {
+  if (expectedOwnerId === newOwnerId) return false;
+
+  const [row] = await tx.db
+    .select({ ownerPlayerId: propertiesTable.ownerPlayerId })
+    .from(propertiesTable)
+    .where(eq(propertiesTable.id, propertyId))
+    .for("update");
+  if (row === undefined || row.ownerPlayerId !== expectedOwnerId) return false;
+
+  await tx.db
+    .update(propertiesTable)
+    .set({ ownerPlayerId: newOwnerId, cost: 0n })
+    .where(eq(propertiesTable.id, propertyId));
+  return true;
+}
+
+/**
+ * Credit (`amount > 0`) or debit (`amount < 0`) the property's owner and move
+ * `profit` by the amount actually CREDITED. Credits are first reduced by the
+ * franchise skim (`properties.skim_percent`, default 10%, read live from the
+ * settings table — 0 restores full payout): the skimmed share is destroyed by
+ * never being credited, since the consumer already debited the payer in full.
+ * Returns the amount that actually moved — a debit is clamped to the owner's
+ * cash and never skimmed, so `profit` never claims a loss the ledger did not
+ * take and a house that pays out pays in full. Returns 0n when the property
+ * is unowned or `amount` is 0n.
+ *
+ * V2's `Property::updateProfit()` plus the balance write its callers do by
+ * hand; folded together here so a consumer cannot move one without the other.
+ *
+ * SILENT SHORT-PAY. The clamp is silent: nothing throws, `sum(ledger) ==
+ * balance` still holds, and a caller that ignores the return value (as
+ * `bullets` does — its one call site, `bullets/src/index.ts:175`, only ever
+ * credits, so it never hits this branch) gets no signal that the owner could
+ * not cover the debit. Any consumer whose payout can exceed its intake in a
+ * single interaction MUST check affordability before committing to it, not
+ * discover the shortfall here — e.g. an up-front exposure check refusing the
+ * interaction when `stake × maxPayoutMultiplier > ownerCash`, re-checked on
+ * anything that can raise the stake mid-interaction. `bullets` needs no such
+ * guard: a sale can never pay out more than it takes in.
+ *
+ * THE 0n RETURN IS THREE-WAY AMBIGUOUS. It means "unowned", "`amount` was
+ * 0n", and "the owner changed between the unlocked pre-read and the locked
+ * re-read, so this call skipped the payout" (see TOCTOU below) — a caller
+ * cannot tell these apart from the return value alone. The third case is
+ * usually a same-property transfer racing this call, but `seizeOnKill` (see
+ * `ownerAt`'s doc comment above) can also cause it outside any transfer.
+ *
+ * LOCK ORDER (rule 6). This is order-CONFORMING on its own, not merely
+ * order-dependent on the caller: an unlocked pre-read of `owner_player_id`
+ * (the same idiom `ownerAt` uses), then `tx.locks.player([ownerId])`, and
+ * only then the `FOR UPDATE` re-read that decides who actually gets paid. A
+ * caller that touches no other player may call this holding nothing.
+ *
+ * MUST: a consumer that also acts on a DIFFERENT player in the same
+ * transaction (the buyer) MUST resolve the owner (via `ownerAt`) and take
+ * both through ONE sorted `tx.locks.player([buyer, ownerId])` call BEFORE
+ * calling this or moving any balance. Re-locking an already-held row within
+ * one transaction is a no-op re-acquisition, never a wait, so that pre-lock
+ * does not conflict with the lock this function takes on its own — but
+ * locking the buyer alone and letting THIS function lock the owner
+ * afterwards, in its own separate statement, is exactly the ABBA shape that
+ * deadlocks against the reverse purchase (owner buying from buyer's own
+ * shop at the same moment).
+ * Regression: `apps/server/test/properties-consumer-lock-order.test.ts`.
+ *
+ * TOCTOU. If ownership changes between the unlocked pre-read and the locked
+ * re-read (a transfer lands in that gap), the row this function locked is
+ * the PRE-read owner's, not the new one's — paying the new owner would move
+ * money for a player whose row this call never locked, reopening the exact
+ * hole this function exists to close. So it skips the payout instead:
+ * `moved` is 0n for this call. The next call against the same property (the
+ * new owner's next sale) reads the correct owner and pays them.
+ */
+export async function payOwner(
+  tx: PluginTx, propertyId: string, amount: bigint, reason: string,
+): Promise<bigint> {
+  if (amount === 0n) return 0n;
+
+  // Unlocked pre-read to learn who to lock, exactly `ownerAt`'s idiom.
+  const [pre] = await tx.db
+    .select({ ownerPlayerId: propertiesTable.ownerPlayerId })
+    .from(propertiesTable)
+    .where(eq(propertiesTable.id, propertyId));
+  if (pre === undefined || pre.ownerPlayerId === null) return 0n;
+
+  await tx.locks.player([pre.ownerPlayerId]);
+
+  const [row] = await tx.db
+    .select({ id: propertiesTable.id, ownerPlayerId: propertiesTable.ownerPlayerId })
+    .from(propertiesTable)
+    .where(eq(propertiesTable.id, propertyId))
+    .for("update");
+  if (row === undefined || row.ownerPlayerId === null) return 0n;
+  // TOCTOU recheck — see the doc comment above.
+  if (row.ownerPlayerId !== pre.ownerPlayerId) return 0n;
+
+  const ownerId = row.ownerPlayerId;
+
+  let moved = amount;
+  if (amount < 0n) {
+    // Read under the lock taken above, so two concurrent debits cannot both
+    // pass the affordability check.
+    const [stats] = await tx.db
+      .select({ cash: playerStats.cash })
+      .from(playerStats)
+      .where(eq(playerStats.playerId, ownerId));
+    const cash = stats?.cash ?? 0n;
+    const wanted = -amount;
+    moved = -(cash < wanted ? cash : wanted);
+  }
+  if (moved === 0n) return 0n;
+
+  // CREDITS only: the franchise skim destroys its share by never crediting
+  // it — the consumer already debited the payer in full (the same way bullets
+  // destroys half of every sale), so no second ledger row is needed and the
+  // MIMO dashboard shows the drain as positive net on the consumer's reason.
+  // Debits are NEVER skimmed: the return value is what casino's bankruptcy
+  // detection reads, and a house that pays out must pay out in full.
+  if (moved > 0n) {
+    const skimPercent = await readSkimPercent(tx);
+    if (skimPercent > 0) {
+      // Ceiling on the destroyed share — the void gets the rounding, the
+      // same direction as the wealth-scaled fees' rounding.
+      const skim = (moved * BigInt(skimPercent) + 99n) / 100n;
+      moved -= skim;
+    }
+  }
+
+  await tx.economy.applyBalanceChange({ playerId: ownerId, amount: moved, kind: "cash", reason });
+  await tx.db
+    .update(propertiesTable)
+    .set({ profit: sql`${propertiesTable.profit} + ${moved}` })
+    .where(eq(propertiesTable.id, propertyId));
+
+  return moved;
+}

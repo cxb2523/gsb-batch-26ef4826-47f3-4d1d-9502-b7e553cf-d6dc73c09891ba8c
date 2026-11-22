@@ -1,0 +1,195 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1786071433411,
+      "tag": "0000_core_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786074813014,
+      "tag": "0001_numerous_boomerang",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786112590328,
+      "tag": "0002_add_crime_jail_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786136136219,
+      "tag": "0003_gang_ledger",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786236398674,
+      "tag": "0004_plugin_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786465391000,
+      "tag": "0005_combat_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786500874616,
+      "tag": "0006_drop_crime_log_job_id_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786639424488,
+      "tag": "0007_relinquish_plugin_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786744364641,
+      "tag": "0008_sentence_expiry_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786830000000,
+      "tag": "0009_relinquish_car_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786916400000,
+      "tag": "0010_relinquish_properties",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1787002800000,
+      "tag": "0011_round_entries",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1787089200000,
+      "tag": "0012_assets",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1787175600000,
+      "tag": "0013_location_combat_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1787262000000,
+      "tag": "0014_email_verified",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787262000001,
+      "tag": "0015_player_bans",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1787348400000,
+      "tag": "0016_player_attributes",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787434800000,
+      "tag": "0017_mccodes_core_readiness",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787521200000,
+      "tag": "0018_mccodes_plugin_family",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1787607600000,
+      "tag": "0019_mccodes_migrator_readiness",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1787962058939,
+      "tag": "0020_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1787979361825,
+      "tag": "0021_crimes_min_level",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1788136800000,
+      "tag": "0022_ip_telemetry",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1788393600000,
+      "tag": "0023_push_devices",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1788739200000,
+      "tag": "0024_terms_accepted",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1788998400000,
+      "tag": "0025_round_prizes",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1789084800000,
+      "tag": "0026_location_scenes",
+      "breakpoints": true
+    }
+  ]
+}

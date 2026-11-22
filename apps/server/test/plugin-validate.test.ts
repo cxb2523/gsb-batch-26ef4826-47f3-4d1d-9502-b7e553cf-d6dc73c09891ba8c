@@ -1,0 +1,403 @@
+import { definePlugin, type ViewNode } from "@gl3/plugin-sdk";
+import { describe, expect, it } from "vitest";
+import { validatePlugins } from "../src/plugins/validate.js";
+
+const plugin = (id: string, basePaths: string[], tables: Record<string, string> = {}) =>
+  definePlugin({ id, version: "1.0.0", basePaths, tables });
+
+describe("validatePlugins", () => {
+  it("accepts a well-formed set", () => {
+    expect(() =>
+      validatePlugins([
+        plugin("hello", ["/api/hello"], { greetings: "p_hello_greetings" }),
+        plugin("bounties", ["/api/bounties"], { bounties: "p_bounties_bounties" }),
+      ]),
+    ).not.toThrow();
+  });
+
+  it("rejects two plugins claiming the same id", () => {
+    expect(() =>
+      validatePlugins([plugin("hello", ["/api/hello"]), plugin("hello", ["/api/hi"])]),
+    ).toThrow(/hello/);
+  });
+
+  it("rejects a table without the plugin's prefix, naming the plugin", () => {
+    expect(() => validatePlugins([plugin("hello", ["/api/hello"], { players: "players" })])).toThrow(
+      /hello.*p_hello_/s,
+    );
+  });
+
+  // The ids here are load-bearing, not incidental. The prefix rule does not on
+  // its own make a cross-plugin table collision impossible: one plugin's prefix
+  // can be a prefix of another's, so `p_hello_x_t` is legitimately claimable by
+  // both "hello" (p_hello_) and "hello-x" (p_hello_x_). Pick two ids whose
+  // prefixes are unrelated — say "hello" and "hi" — and the *prefix* check
+  // rejects the second plugin first, the collision check never runs, and the
+  // test passes without ever reaching what it names.
+  it("rejects a table claimed by two plugins", () => {
+    expect(() =>
+      validatePlugins([
+        plugin("hello", ["/api/hello"], { t: "p_hello_x_t" }),
+        plugin("hello-x", ["/api/hello-x"], { t: "p_hello_x_t" }),
+      ]),
+    ).toThrow(/p_hello_x_t.*claimed by both.*hello-x/s);
+  });
+
+  it("rejects overlapping basePaths naming both plugins", () => {
+    expect(() =>
+      validatePlugins([plugin("hello", ["/api/hello"]), plugin("hello-world", ["/api/hello/world"])]),
+    ).toThrow(/hello.*hello-world|hello-world.*hello/s);
+  });
+
+  it("rejects a basePath reserved to core", () => {
+    expect(() => validatePlugins([plugin("evil", ["/api/auth"])])).toThrow(/reserved/);
+  });
+
+  // "world" is a core admin module key (world/admin-routes.ts's grant), same
+  // reserved-id shape as "roles" and "rounds" — a plugin claiming it would let
+  // an unrelated plugin's grant satisfy that core permission check.
+  it("rejects a plugin id colliding with a reserved core module key", () => {
+    expect(() => validatePlugins([plugin("world", ["/api/world-fixture"])])).toThrow(
+      /collides with a core admin module key/,
+    );
+  });
+
+  it("rejects a route path outside the plugin's declared basePaths", () => {
+    const manifest = definePlugin({
+      id: "hello",
+      version: "1.0.0",
+      basePaths: ["/api/hello"],
+      routes: [
+        { method: "GET", path: "/api/bounties", auth: "player", handler: async () => ({ status: 200 }) },
+      ],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/\/api\/bounties/);
+  });
+
+  it("rejects two pages sharing an id", () => {
+    const page = { id: "dup", path: "/dup", view: { kind: "text" as const, value: "x" } };
+    expect(() =>
+      validatePlugins([
+        definePlugin({ id: "a", version: "1.0.0", basePaths: ["/api/a"], pages: [page] }),
+        definePlugin({ id: "b", version: "1.0.0", basePaths: ["/api/b"], pages: [page] }),
+      ]),
+    ).toThrow(/dup/);
+  });
+});
+
+/**
+ * `VIEW_ACTION_RE` constrains only the *shape* of a view action, so
+ * `"POST /api/bank/withdraw"` is a well-formed action for any plugin — while a
+ * plugin *route* outside its `basePaths` is already a hard boot failure. The two
+ * halves of one manifest disagreed about what the plugin may reach.
+ *
+ * The stake is attribution rather than privilege: a plugin is in-process server
+ * code and could call `/api/bank/withdraw` directly from a handler. What
+ * containment buys is that a page rendered under a plugin's name cannot drive an
+ * endpoint that plugin never declared, so `basePaths` stays a truthful account of
+ * the surface a plugin touches.
+ */
+describe("validatePlugins view-action containment", () => {
+  // Typed `ViewNode` rather than `unknown` + a cast: the parameter type is what
+  // contextually types each fixture literal below, so a fixture that stops being
+  // a legal node fails to compile instead of failing at `definePlugin`.
+  const withPage = (view: ViewNode, basePaths = ["/api/hello"]) =>
+    definePlugin({
+      id: "hello",
+      version: "1.0.0",
+      basePaths,
+      pages: [{ id: "hello.index", path: "/hello", view }],
+    });
+
+  it("accepts an action inside the plugin's basePaths", () => {
+    const manifest = withPage({ kind: "button", label: "Greet", action: "POST /api/hello/greet" });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("accepts an action on the basePath itself, with no trailing segment", () => {
+    const manifest = withPage({ kind: "button", label: "Greet", action: "POST /api/hello" });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("rejects an out-of-scope action, naming the plugin, the page and the action", () => {
+    const manifest = withPage({ kind: "button", label: "Rob", action: "POST /api/bank/withdraw" });
+    expect(() => validatePlugins([manifest])).toThrow(
+      /plugin "hello".*page "hello\.index".*POST \/api\/bank\/withdraw/s,
+    );
+  });
+
+  // `/api/hello` must not contain `/api/helloworld` — the same trap the
+  // basePath-overlap check already guards, reached through a different field.
+  it("rejects an action whose path only shares a prefix with the basePath", () => {
+    const manifest = withPage({ kind: "button", label: "X", action: "POST /api/helloworld/greet" });
+    expect(() => validatePlugins([manifest])).toThrow(/\/api\/helloworld\/greet/);
+  });
+
+  it("reaches an action nested inside a panel inside a list", () => {
+    const manifest = withPage({
+      kind: "list",
+      items: [
+        { kind: "text", value: "before" },
+        {
+          kind: "panel",
+          title: "Deep",
+          children: [{ kind: "button", label: "Rob", action: "POST /api/bank/withdraw" }],
+        },
+      ],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/POST \/api\/bank\/withdraw/);
+  });
+
+  it("checks a cooldownButton's HTTP action", () => {
+    const manifest = withPage({
+      kind: "cooldownButton",
+      label: "Rob",
+      action: "POST /api/bank/withdraw",
+      cooldownAction: "hello_greet",
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/POST \/api\/bank\/withdraw/);
+  });
+
+  it("checks a form's action", () => {
+    const manifest = withPage({
+      kind: "form",
+      action: "POST /api/bank/withdraw",
+      submitLabel: "Go",
+      fields: [{ name: "amount", label: "Amount", type: "money" }],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/POST \/api\/bank\/withdraw/);
+  });
+
+  it("accepts a select field's optionsSource inside the plugin's basePaths", () => {
+    const manifest = withPage({
+      kind: "form",
+      action: "POST /api/hello/greet",
+      submitLabel: "Go",
+      fields: [{
+        name: "thingId",
+        label: "Thing",
+        type: "select",
+        optionsSource: "GET /api/hello/things",
+        valueKey: "id",
+        labelKey: "name",
+      }],
+    });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  // `optionsSource` fetches on mount exactly like `table.source` — an
+  // uncontained one would let a page read any endpoint in the app.
+  it("rejects a select field's out-of-scope optionsSource, naming the source", () => {
+    const manifest = withPage({
+      kind: "form",
+      action: "POST /api/hello/greet",
+      submitLabel: "Go",
+      fields: [{
+        name: "thingId",
+        label: "Thing",
+        type: "select",
+        optionsSource: "GET /api/bank/accounts",
+        valueKey: "id",
+        labelKey: "name",
+      }],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/GET \/api\/bank\/accounts/);
+  });
+
+  it("accepts a form's valuesSource inside the plugin's basePaths", () => {
+    const manifest = withPage({
+      kind: "form",
+      action: "POST /api/hello/settings",
+      submitLabel: "Save",
+      valuesSource: "GET /api/hello/settings",
+      fields: [{ name: "cost", label: "Cost", type: "money" }],
+    });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  // `valuesSource` fetches on mount exactly like `table.source` — an
+  // uncontained one would let a page read any endpoint in the app.
+  it("rejects a form's out-of-scope valuesSource, naming the source", () => {
+    const manifest = withPage({
+      kind: "form",
+      action: "POST /api/hello/settings",
+      submitLabel: "Save",
+      valuesSource: "GET /api/bank/accounts",
+      fields: [{ name: "cost", label: "Cost", type: "money" }],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(/GET \/api\/bank\/accounts/);
+  });
+
+  // `keyValueSource.source` and `meterSource.source` fetch on mount exactly like
+  // `table.source`. Both fell through `viewActions`' `default` arm until the
+  // core-view-pages cluster, so a plugin could declare a read of any endpoint in
+  // the app and boot clean — attribution silently broken through two of the
+  // fifteen node kinds rather than through the kinds anyone was watching.
+  it("accepts a keyValueSource's source inside the plugin's basePaths", () => {
+    const manifest = withPage({
+      kind: "keyValueSource",
+      source: "GET /api/hello/summary",
+      entries: [{ label: "A", key: "a" }],
+    });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("rejects a keyValueSource's out-of-scope source, naming the source", () => {
+    const manifest = withPage({
+      kind: "keyValueSource",
+      source: "GET /api/bank/accounts",
+      entries: [{ label: "A", key: "a" }],
+    });
+    expect(() => validatePlugins([manifest])).toThrow(
+      /plugin "hello".*page "hello\.index".*GET \/api\/bank\/accounts.*outside/s,
+    );
+  });
+
+  it("accepts a meterSource's source inside the plugin's basePaths", () => {
+    const manifest = withPage({
+      kind: "meterSource",
+      label: "Energy",
+      source: "GET /api/hello/pools",
+      valueKey: "energy",
+      maxKey: "energyMax",
+    });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("rejects a meterSource's out-of-scope source, naming the source", () => {
+    const manifest = withPage({
+      kind: "meterSource",
+      label: "Energy",
+      source: "GET /api/bank/accounts",
+      valueKey: "energy",
+      maxKey: "energyMax",
+    });
+    expect(() => validatePlugins([manifest])).toThrow(
+      /plugin "hello".*page "hello\.index".*GET \/api\/bank\/accounts.*outside/s,
+    );
+  });
+
+  // `link.to` is an app-internal client route (`/plugins/:pageId`), not an HTTP
+  // endpoint, so it is deliberately outside containment — `INTERNAL_PATH_RE` is
+  // the rule that applies to it. Containing it would forbid the one link the
+  // reference page actually needs.
+  it("leaves link.to alone — it is a client route, not an endpoint", () => {
+    const manifest = withPage({ kind: "link", label: "Back", to: "/plugins/hello.index" });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  // Likewise `cooldownAction`: the middle segment of `cooldown:<action>:<id>`,
+  // a Redis key segment governed by COOLDOWN_ACTION_RE. It can never be a path.
+  it("leaves cooldownAction alone — it is a Redis key segment", () => {
+    const manifest = withPage({
+      kind: "cooldownButton",
+      label: "Greet",
+      action: "POST /api/hello/greet",
+      cooldownAction: "hello_greet",
+    });
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("accepts an action under a later basePath of the same plugin", () => {
+    const manifest = withPage({ kind: "button", label: "X", action: "POST /api/extra/go" }, [
+      "/api/hello",
+      "/api/extra",
+    ]);
+    expect(() => validatePlugins([manifest])).not.toThrow();
+  });
+
+  it("validates the shipped hello example clean", async () => {
+    const { default: hello } = await import("@gl3/hello-plugin");
+    expect(() => validatePlugins([hello])).not.toThrow();
+  });
+
+  // `VIEW_ACTION_RE` permits `.` in a path — it only fixes the shape, not the
+  // segments — so `containedIn` was being asked whether the raw string
+  // "/api/hello/../bank/withdraw" starts with "/api/hello/", which it does.
+  // The browser's URL parser resolves the `..` before `fetch` sends anything,
+  // so the request that actually leaves the page targets
+  // "/api/bank/withdraw" — a path the raw check never saw. Rejecting outright
+  // (rather than normalising and re-checking containment) means a page author
+  // gets a traversal-shaped error message instead of a confusing "outside
+  // basePaths" one, and it means the last case below fails even though a
+  // normalised read of it would land back inside the basePath: this
+  // vocabulary's endpoints are RPC verbs a plugin author writes literally, so
+  // there is never a legitimate reason to route through a `..` segment, and a
+  // blanket reject is simpler to reason about than "reject unless it
+  // resolves back inside."
+  it("rejects a `..` traversal that escapes the basePath, naming the plugin, page and action", () => {
+    const manifest = withPage({
+      kind: "button",
+      label: "Rob",
+      action: "POST /api/hello/../bank/withdraw",
+    });
+    expect(() => validatePlugins([manifest])).toThrow(
+      /plugin "hello".*page "hello\.index".*POST \/api\/hello\/\.\.\/bank\/withdraw/s,
+    );
+  });
+
+  it("rejects a single-dot segment the same way", () => {
+    const manifest = withPage({ kind: "button", label: "X", action: "POST /api/hello/./greet" });
+    expect(() => validatePlugins([manifest])).toThrow(/POST \/api\/hello\/\.\/greet/);
+  });
+
+  // Even a traversal that resolves back inside the plugin's own basePath is
+  // rejected — see the comment above the first traversal test for why this
+  // suite chose reject-outright over normalise-then-check.
+  it("rejects a traversal that would land back inside the basePath", () => {
+    const manifest = withPage({ kind: "button", label: "X", action: "POST /api/hello/x/../y" });
+    expect(() => validatePlugins([manifest])).toThrow(/POST \/api\/hello\/x\/\.\.\/y/);
+  });
+});
+
+describe("prop world hooks", () => {
+  const page = { id: "t.index", path: "/t", view: { kind: "list" as const, items: [] } };
+  it("refuses a prop without a footprint", () => {
+    const p = definePlugin({ id: "t", version: "1.0.0", basePaths: ["/api/t"], pages: [page],
+      worldHooks: [{ id: "car", kind: "prop", label: "Car", page: "t.index", model: "sedan", order: 1 }] });
+    expect(() => validatePlugins([p])).toThrow(/prop .* must declare a footprint/);
+  });
+  it("refuses a prop with a signageSlot", () => {
+    const p = definePlugin({ id: "t", version: "1.0.0", basePaths: ["/api/t"], pages: [page],
+      providesAssets: [{ slot: "s", label: "S", singleton: true }],
+      worldHooks: [{ id: "car", kind: "prop", label: "Car", page: "t.index", model: "sedan", footprint: { w: 4, d: 2 }, order: 1, signageSlot: "s" }] });
+    expect(() => validatePlugins([p])).toThrow(/prop .* cannot carry a signageSlot/);
+  });
+});
+
+describe("interior world hooks (spec 2026-09-20 casino-interior §3)", () => {
+  const floor = { sceneKey: "floor", bounds: { minX: -12, minY: -9, maxX: 12, maxY: 9 }, spawn: { x: 0, y: -7.5, facing: 0 }, points: [] };
+  const withHook = (hook: Record<string, unknown>) => definePlugin({
+    id: "t", version: "1.0.0", basePaths: ["/api/t"],
+    pages: [{ id: "t.index", path: "/t", view: { kind: "list", items: [] } }],
+    worldHooks: [hook as never],
+  });
+  it("accepts an interior on a building", () => {
+    expect(() => validatePlugins([withHook({ id: "door", kind: "building", label: "Door", page: "t.index", model: "casino", order: 1, interior: floor })])).not.toThrow();
+  });
+  it("refuses an interior on an npc", () => {
+    expect(() => validatePlugins([withHook({ id: "guy", kind: "npc", label: "Guy", page: "t.index", model: "npc-coat", order: 1, interior: floor })])).toThrow(/npc and cannot carry an interior/);
+  });
+  it("names the plugin, hook and rule for a bad floor", () => {
+    expect(() => validatePlugins([withHook({ id: "door", kind: "building", label: "Door", page: "t.index", model: "casino", order: 1, interior: { ...floor, spawn: { x: 99, y: 0, facing: 0 } } })])).toThrow(/plugin "t" world hook "door" interior: spawn lies outside bounds/);
+  });
+});
+
+describe("world hook venues (spec 2026-09-21 town-venues §2)", () => {
+  const base = { id: "t", version: "1.0.0", apiVersion: 1 as const, basePaths: ["/api/t"], pages: [{ id: "t.index", path: "/t", view: { kind: "list" as const, items: [] } }] };
+  const properties = definePlugin({ id: "properties", version: "1.0.0", basePaths: ["/api/properties"], tables: { properties: "p_properties_properties" } });
+  const declarer = definePlugin({ id: "blackjack", version: "1.0.0", basePaths: ["/api/blackjack"], providesProperties: [{ id: "blackjack", name: "Casino", price: 1n, leverLabel: "x" }] });
+  const hook = (venue?: string) => definePlugin({ ...base, worldHooks: [{ id: "door", kind: "building", label: "Door", page: "t.index", model: "casino", order: 1, ...(venue ? { venue } : {}) }] });
+  it("accepts a venue declared by another plugin", () => {
+    expect(() => validatePlugins([properties, declarer, hook("blackjack")])).not.toThrow();
+  });
+  it("refuses a venue no loaded plugin declares", () => {
+    expect(() => validatePlugins([properties, hook("blackjack")])).toThrow(/world hook "door" names venue "blackjack", which no loaded plugin provides/);
+  });
+  it("refuses a venue when the properties plugin is not in the boot", () => {
+    expect(() => validatePlugins([declarer, hook("blackjack")])).toThrow(/world hook "door" names venue "blackjack" but the properties plugin is not loaded/);
+  });
+  it("a hook without a venue needs neither", () => {
+    expect(() => validatePlugins([hook()])).not.toThrow();
+  });
+});

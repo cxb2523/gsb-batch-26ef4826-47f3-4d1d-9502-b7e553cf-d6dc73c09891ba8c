@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# Web image: the built Vite bundle served by apps/web/serve.mjs (a
+# zero-dependency Node static server).
+#
+# Vite resolves `@gl3/shared` and `@gl3/client` through their package.json
+# exports maps, which point at packages/shared/dist and packages/client/dist
+# — NOT at TypeScript source (the src alias is a vitest-only concern; see
+# vitest.workspace.ts). So both MUST be built before the web build, unlike
+# the server where tsc does both at once.
+
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-alpine AS builder
+
+WORKDIR /app
+
+# Web's build needs @gl3/shared, and npm ci validates the whole workspace
+# lockfile. plugin-sdk's manifest MUST be here too even though the web build
+# never imports it: apps/server's manifest (below) depends on it, and a
+# workspace member whose folder is absent gets resolved from the REGISTRY
+# instead — which held a published SDK whose `@gl3/shared` range named a
+# version never published, 404ing the whole `npm ci`. The fallback had
+# succeeded silently for as long as the ranges happened to be satisfiable;
+# reproduce any change to this list with a local sim (copy exactly these
+# files into an empty dir, run `npm ci`) before spending a CI round trip.
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/client/package.json packages/client/
+COPY packages/plugin-sdk/package.json packages/plugin-sdk/
+COPY apps/server/package.json apps/server/
+COPY apps/web/package.json apps/web/
+
+RUN npm ci
+
+COPY tsconfig.json tsconfig.base.json ./
+COPY packages/shared/tsconfig.json packages/shared/tsconfig.json
+COPY packages/shared/src packages/shared/src
+COPY packages/client/tsconfig.json packages/client/tsconfig.json
+COPY packages/client/src packages/client/src
+COPY apps/web/ apps/web/
+
+# Build shared first so Vite finds @gl3/shared/dist, then @gl3/client (which
+# imports @gl3/shared/dist itself), then build the web bundle, which
+# typechecks the web sources (tsc --build, noEmit) as a side effect of its
+# own build script.
+RUN npm run build -w @gl3/shared
+RUN npm run build -w @gl3/client
+RUN npm run build -w @gl3/web
+
+# --- runtime stage -----------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# serve.mjs uses only node: built-ins (http, fs, path, url) — no node_modules.
+COPY --from=builder /app/apps/web/dist apps/web/dist
+COPY --from=builder /app/apps/web/serve.mjs apps/web/serve.mjs
+
+USER node
+EXPOSE 8080
+CMD ["node", "apps/web/serve.mjs"]

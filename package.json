@@ -1,0 +1,39 @@
+{
+  "name": "gl3",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "packages/plugins/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --build --force",
+    "test": "vitest run",
+    "test:nodb": "vitest run --project @gl3/server:unit --project @gl3/shared --project @gl3/plugin-sdk --project @gl3/create-plugin --project @gl3/web --project @gl3/client",
+    "verify": "npm run typecheck && npm run test",
+    "verify:ci": "npm run typecheck && npm run test:nodb",
+    "test:related": "vitest related --run",
+    "verify:related": "npm run typecheck && node scripts/verify-related.mjs",
+    "plugins:generate": "node scripts/generate-plugin-map.mjs",
+    "db:clean-clones": "node scripts/drop-stale-test-clones.mjs",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down -v",
+    "docs:generate": "npm run build -w @gl3/shared && node scripts/generate-reference.mjs && node scripts/generate-errors.mjs",
+    "docs:dev": "npm run docs:generate && vitepress dev manual",
+    "docs:build": "npm run docs:generate && vitepress build manual",
+    "docs:preview": "vitepress preview manual"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "playwright": "^1.62.1",
+    "typescript": "^5.6.3",
+    "vitepress": "^1.6.4",
+    "vitest": "^2.1.8"
+  }
+}

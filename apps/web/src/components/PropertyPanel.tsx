@@ -1,0 +1,263 @@
+import { useEffect, useRef, useState } from "react";
+import { useMe, useProperties, useBuyProperty, useSetLever, useTransferProperty, useDropProperty, useResetProperty } from "@gl3/client";
+import { ErrorText, Money } from "./ui.js";
+import styles from "../pages/pages.module.css";
+import type { PropertyRow } from "@gl3/shared";
+import { GameImage } from "./GameImage.js";
+
+/** The rows a page owns: `GET /api/properties` lists the whole town, and each
+ *  page shows only the type its plugin declares. */
+export function rowsFor(rows: readonly PropertyRow[], pluginId: string): PropertyRow[] {
+  return rows.filter((row) => row.pluginId === pluginId);
+}
+
+/**
+ * Which side of the panel a page wants. `"buy"` keeps the owner tools off a
+ * public page (the row still shows, with its owner); `"owned"` keeps the
+ * panel off the screen entirely for anyone but the owner. Undefined shows
+ * whichever side the viewer is on.
+ */
+export type PanelShow = "buy" | "owned";
+
+export type RowAction =
+  | { kind: "buy"; price: string }
+  | { kind: "owned"; lever: string; profit: string; leverLabel: string }
+  | { kind: "none" };
+
+export function rowAction(
+  row: PropertyRow,
+  viewerUsername: string | undefined,
+  show?: PanelShow,
+): RowAction {
+  const action = ((): RowAction => {
+    if (viewerUsername !== undefined && row.ownerName === viewerUsername) {
+      return { kind: "owned", lever: row.lever, profit: row.profit, leverLabel: row.leverLabel };
+    }
+    // "" price means the row's type is not installed — nothing to buy.
+    if (row.ownerName === "—" && row.price !== "") return { kind: "buy", price: row.price };
+    return { kind: "none" };
+  })();
+  return show === undefined || action.kind === show || action.kind === "none" ? action : { kind: "none" };
+}
+
+/** The rows a page draws: under `show: "owned"` only the viewer's own. */
+export function visibleRows(rows: readonly PropertyRow[], viewerUsername: string | undefined, show?: PanelShow): PropertyRow[] {
+  if (show !== "owned") return [...rows];
+  return rows.filter((row) => rowAction(row, viewerUsername, show).kind === "owned");
+}
+
+/** Mirrors the server's `NonNegativeIntegerString`: digits only. */
+function isValidLever(raw: string): boolean {
+  return /^\d+$/.test(raw);
+}
+
+/**
+ * Half the declared price, floored — the same figure the server pays back
+ * (`dropRefund` in the properties plugin). `""` price means the declaring
+ * plugin is not installed, so there is no price to halve and the refund is
+ * nothing; the warning still has to say so, which is why this answers "0"
+ * rather than refusing.
+ */
+export function dropRefundOf(price: string): string {
+  if (!/^\d+$/.test(price)) return "0";
+  return (BigInt(price) / 2n).toString();
+}
+
+function OwnedControls({
+  propertyId, leverLabel, lever, profit, price,
+}: {
+  propertyId: string; leverLabel: string; lever: string; profit: string; price: string;
+}): JSX.Element {
+  const setLever = useSetLever(propertyId);
+  const transfer = useTransferProperty(propertyId);
+  const drop = useDropProperty(propertyId);
+  const reset = useResetProperty(propertyId);
+  const [leverValue, setLeverValue] = useState(lever);
+  const [username, setUsername] = useState("");
+  // Dropping is irreversible and pays back only half, so the first click asks
+  // rather than acts. Two-step in the row, not `window.confirm` — nothing else
+  // in this app opens a native dialog.
+  const [confirmingDrop, setConfirmingDrop] = useState(false);
+  const validLever = isValidLever(leverValue);
+  const validUsername = username.length >= 1;
+
+  // Swapping Drop for Confirm/Cancel unmounts the focused button, which dumps
+  // keyboard focus to <body>. Follow the swap in both directions.
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
+  const dropRef = useRef<HTMLButtonElement | null>(null);
+  const wasConfirming = useRef(false);
+  useEffect(() => {
+    if (confirmingDrop) confirmRef.current?.focus();
+    else if (wasConfirming.current) dropRef.current?.focus();
+    wasConfirming.current = confirmingDrop;
+  }, [confirmingDrop]);
+
+  return (
+    <span className={styles.actions}>
+      <span className={styles.meta}>P&amp;L <Money value={profit} /></span>
+      <label>
+        <span className={styles.meta}>{leverLabel} </span>
+        <input
+          inputMode="numeric"
+          value={leverValue}
+          onChange={(e) => { setLeverValue(e.target.value.trim()); }}
+          aria-label={leverLabel}
+        />
+      </label>
+      <button
+        type="button"
+        disabled={!validLever || setLever.isPending}
+        onClick={() => setLever.mutate(leverValue)}
+      >
+        Set
+      </button>
+      <input
+        maxLength={30}
+        value={username}
+        placeholder="Transfer to"
+        onChange={(e) => { setUsername(e.target.value.trim()); }}
+        aria-label="Transfer to username"
+      />
+      <button
+        type="button"
+        disabled={!validUsername || transfer.isPending}
+        onClick={() => transfer.mutate(username, { onSuccess: () => { setUsername(""); } })}
+      >
+        Transfer
+      </button>
+      {confirmingDrop ? (
+        <>
+          <span className={styles.meta} role="alert">
+            Drop it for good? You get back <Money value={dropRefundOf(price)} /> — half its price.
+          </span>
+          <button
+            ref={confirmRef}
+            type="button"
+            disabled={drop.isPending}
+            onClick={() => drop.mutate(undefined, { onSettled: () => { setConfirmingDrop(false); } })}
+          >
+            Confirm drop
+          </button>
+          <button type="button" onClick={() => { setConfirmingDrop(false); }}>Cancel</button>
+        </>
+      ) : (
+        <button ref={dropRef} type="button" disabled={drop.isPending} onClick={() => { setConfirmingDrop(true); }}>
+          Drop
+        </button>
+      )}
+      <button type="button" disabled={reset.isPending} onClick={() => reset.mutate()}>
+        Reset
+      </button>
+      <ErrorText error={setLever.error ?? transfer.error ?? drop.error ?? reset.error} />
+    </span>
+  );
+}
+
+/**
+ * The Buy side of a row. Quiet chip styling, not the theme's solid button —
+ * this panel sits on pages whose own solid Buy button spends pocket money,
+ * and a property costs orders of magnitude more, so the two must not look
+ * alike. Two-step for the same reason, mirroring Drop: one stray click must
+ * not be able to move property-scale money.
+ */
+function BuyControl({ row }: { row: PropertyRow }): JSX.Element {
+  const buy = useBuyProperty();
+  const [confirming, setConfirming] = useState(false);
+
+  // Same focus-follow as Drop's confirm: swapping the button unmounts the
+  // focused element, which dumps keyboard focus to <body>.
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
+  const buyRef = useRef<HTMLButtonElement | null>(null);
+  const wasConfirming = useRef(false);
+  useEffect(() => {
+    if (confirming) confirmRef.current?.focus();
+    else if (wasConfirming.current) buyRef.current?.focus();
+    wasConfirming.current = confirming;
+  }, [confirming]);
+
+  return (
+    <span className={styles.actions}>
+      {confirming ? (
+        <>
+          <span className={styles.meta} role="alert">
+            Buy {row.typeName} for <Money value={row.price} />?
+          </span>
+          <button
+            ref={confirmRef}
+            type="button"
+            className={styles.chip}
+            disabled={buy.isPending}
+            onClick={() => buy.mutate(
+              { pluginId: row.pluginId, locationId: row.locationId },
+              { onSettled: () => { setConfirming(false); } },
+            )}
+          >
+            Confirm purchase
+          </button>
+          <button type="button" className={styles.chip} onClick={() => { setConfirming(false); }}>
+            Cancel
+          </button>
+        </>
+      ) : (
+        <button
+          ref={buyRef}
+          type="button"
+          className={styles.chip}
+          disabled={buy.isPending}
+          onClick={() => { setConfirming(true); }}
+        >
+          Buy property
+        </button>
+      )}
+      <ErrorText error={buy.error} />
+    </span>
+  );
+}
+
+/**
+ * One plugin's properties in the caller's town, embedded on that plugin's own
+ * page — the replacement for the retired /properties tab. Shows the owner,
+ * offers Buy when nobody owns it, and the full owner tools when the viewer
+ * does. Renders nothing when the town has no row of this type: the surrounding
+ * page already says where the player is. `show` narrows the panel to one
+ * side — see `PanelShow`.
+ */
+export function PropertyPanel({ pluginId, show }: { pluginId: string; show?: PanelShow }): JSX.Element | null {
+  const properties = useProperties();
+  const me = useMe();
+
+  // Silent while loading or on error: this is a side panel, and the page it
+  // sits on has its own loading and error surfaces for its own data.
+  const rows = visibleRows(rowsFor(properties.data?.rows ?? [], pluginId), me.data?.username, show);
+  if (rows.length === 0) return null;
+
+  return (
+    <ul className={styles.rows}>
+      {rows.map((row) => {
+        const action = rowAction(row, me.data?.username, show);
+        return (
+          <li key={row.id} className={styles.row}>
+            <GameImage url={row.imageUrl} alt={row.typeName} size="md" />
+            <span>
+              {row.typeName}
+              {action.kind === "buy" ? (
+                <span className={styles.muted}> &middot; <Money value={action.price} /></span>
+              ) : null}
+              {" "}&middot; owner {row.ownerName}
+            </span>
+            {action.kind === "buy" ? <BuyControl row={row} /> : null}
+            {action.kind === "owned" ? (
+              <OwnedControls
+                propertyId={row.id}
+                leverLabel={action.leverLabel}
+                lever={action.lever}
+                profit={action.profit}
+                price={row.price}
+              />
+            ) : null}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}

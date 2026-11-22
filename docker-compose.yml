@@ -1,0 +1,165 @@
+# One file, two modes.
+#
+#   docker compose up -d --wait              # dev: Postgres + Redis only
+#   docker compose --profile app up          # first boot: the whole game
+#
+# The dev mode is what `npm run db:up` runs and is unchanged: databases on
+# their usual host ports, nothing else. The `app` profile layers the published
+# images on top — the migrate one-shot (manual/operators/first-boot.md's
+# init-container pattern; idempotent, so it also asserts schema on every later
+# `up`), the server, the web image, and an nginx router that keeps the browser
+# same-origin: /api, /ws and /assets to the server, everything else to the web
+# bundle (deploy/nginx.conf). First player to register through the router
+# becomes Administrator.
+#
+# Two knobs for the app profile, both optional:
+#   GL3_PUBLIC_ORIGIN - the URL players reach the game at. Feeds the CORS
+#     allowlist (which the WS gateway also validates Origin against) and the
+#     links in outbound mail. Set it when you host on another origin; the
+#     default matches the default port below.
+#   GL3_PORT - the host port the router listens on (default 8080).
+#
+# postgres-data is a named volume so an operator's game survives
+# `docker compose down`; `npm run db:down` (`down -v`) still wipes it for dev.
+# Uploads (game art) land in ./var/assets next to this file — already
+# gitignored — for the same reason.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gl3
+      POSTGRES_PASSWORD: gl3
+      POSTGRES_DB: gl3
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gl3 -d gl3"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Compose has no init containers; first-boot.md's migrate-before-server is a
+  # one-shot service the server waits on. `restart: "no"` keeps `up` from
+  # reviving it after it exits 0.
+  migrate:
+    profiles: ["app"]
+    image: ghcr.io/gl3pbbg/gl3-server:latest
+    command: ["node", "apps/server/dist/db/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://gl3:gl3@postgres:5432/gl3
+      # The migrator only talks to Postgres, but it loads the full config
+      # schema, which refuses to boot without REDIS_URL — same from-source
+      # behaviour as npm run db:migrate.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  # Optional plugins install here (manual/operators/installing-plugins.md's
+  # init-container pattern): idempotent `npm install` into the plugins-data
+  # volume on every `up`, so bumping a version is just `up` again. The token
+  # is needed only for premium packages. An empty PLUGIN_PACKAGES skips the
+  # install entirely, so the free game boots without credentials. The scope
+  # mappings must ride along or npm falls back to npmjs.org and 404s.
+  plugins:
+    profiles: ["app"]
+    image: node:22-alpine
+    working_dir: /data/plugins
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        set -f
+        set -- $$(printf '%s' "$$PLUGIN_PACKAGES" | tr ',' ' ')
+        if [ "$$#" -eq 0 ]; then
+          echo 'No optional plugins selected; starting the free game.'
+          exit 0
+        fi
+        umask 077
+        printf '%s\n' '@gl3:registry=https://npm.gl3.dev' '@gl3-plugins:registry=https://npm.gl3.dev' > .npmrc
+        if [ -n "$$GL3_NPM_TOKEN" ]; then
+          printf '%s\n' "//npm.gl3.dev/:_authToken=$$GL3_NPM_TOKEN" >> .npmrc
+        fi
+        npm install --no-save --no-audit --no-fund --prefix /data/plugins -- "$$@"
+    environment:
+      PLUGIN_PACKAGES: ${PLUGIN_PACKAGES:-}
+      GL3_NPM_TOKEN: ${GL3_NPM_TOKEN:-}
+    volumes:
+      - plugins-data:/data/plugins
+    restart: "no"
+
+  server:
+    profiles: ["app"]
+    image: ghcr.io/gl3pbbg/gl3-server:latest
+    environment:
+      DATABASE_URL: postgres://gl3:gl3@postgres:5432/gl3
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGINS: ${GL3_PUBLIC_ORIGIN:-http://localhost:8080}
+      APP_BASE_URL: ${GL3_PUBLIC_ORIGIN:-http://localhost:8080}
+      # gl3 (default) = the hybrid flagship; v2 = the GL2 port (formerly
+      # "full"); mccodes = the MCCodes-parity set; framework = the
+      # game-agnostic engine, gameplay plugins addable via PLUGIN_IDS.
+      GL3_PROFILE: ${GL3_PROFILE:-gl3}
+      # Premium/out-of-image plugins, resolved from the plugins service's
+      # volume — never PLUGIN_IDS, which only picks among plugins compiled
+      # into the image. Naming a package here is the enabling act.
+      PLUGIN_PACKAGES: ${PLUGIN_PACKAGES:-}
+      PLUGIN_DIR: /data/plugins
+      # EMAIL_DRIVER defaults to log: verification links print to
+      # `docker compose --profile app logs server`, which is the whole signup
+      # flow for a private instance. Switch to resend for real mail (see
+      # .env.example).
+    volumes:
+      - ./var/assets:/app/var/assets
+      - plugins-data:/data/plugins:ro
+    depends_on:
+      plugins:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    profiles: ["app"]
+    image: ghcr.io/gl3pbbg/gl3-web:latest
+    restart: unless-stopped
+    environment:
+      # Android App Links (optional): the JSON served at
+      # /.well-known/assetlinks.json, naming the mobile app's package and
+      # signing-certificate fingerprints. Unset means the path 404s.
+      ASSETLINKS_JSON: ${ASSETLINKS_JSON:-}
+
+  router:
+    profiles: ["app"]
+    image: nginx:alpine
+    ports:
+      - "${GL3_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      server:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  plugins-data:

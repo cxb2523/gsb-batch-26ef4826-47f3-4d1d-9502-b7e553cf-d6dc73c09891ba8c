@@ -1,0 +1,589 @@
+import { randomBytes } from "node:crypto";
+import { asc, eq, inArray } from "drizzle-orm";
+import { uuidv7 } from "uuidv7";
+import { z } from "zod";
+import {
+  isInsufficientFundsError, PluginError, route, type PluginCtx, type PluginTx,
+} from "@gl3/plugin-sdk";
+import {
+  escrow, guardGame, NonNegativeIntegerString, parseAction, resolveHouse,
+} from "./engine.js";
+import { stationsFor } from "./floor.js";
+import { boundMoves, buildTableRegistry, type TableGameDef } from "./games.js";
+import { casinoSeats, casinoTables, locations, players, playerStats } from "./schema.js";
+import { fromStorableState } from "./state.js";
+import {
+  readMaxBet, readMinBet, readTableBetSeconds, readTableMaxSeats,
+} from "./settings.js";
+import {
+  advanceTable, applyStep, assertTableCanCover, clockLapsed, dealIfReady, lockTable,
+  publishTableTick, readTableUnlocked, refundTableCredits,
+  type LockedTable, type SeatRow,
+} from "./table-engine.js";
+
+/** The caller's current town, `play`'s idiom: 409 when nowhere. */
+async function locationOf(tx: PluginTx, playerId: string): Promise<string> {
+  const [stats] = await tx.db.select({ locationId: playerStats.locationId })
+    .from(playerStats).where(eq(playerStats.playerId, playerId));
+  const locationId = stats?.locationId;
+  if (locationId === null || locationId === undefined) throw new PluginError("no_location", 409);
+  return locationId;
+}
+
+/** The caller's seat + its table, unlocked pre-read. */
+async function seatOf(tx: PluginTx, playerId: string): Promise<{ seatId: string; tableId: string; locationId: string } | null> {
+  const [row] = await tx.db
+    .select({ seatId: casinoSeats.id, tableId: casinoSeats.tableId, locationId: casinoTables.locationId })
+    .from(casinoSeats)
+    .innerJoin(casinoTables, eq(casinoTables.id, casinoSeats.tableId))
+    .where(eq(casinoSeats.playerId, playerId));
+  return row ?? null;
+}
+
+const sitRoute = route({
+  method: "POST",
+  path: "/api/casino/table/sit",
+  accessInJail: false,
+  accessInHospital: true,
+  body: z.object({
+    gameId: z.string().min(1).max(80),
+    station: z.number().int().min(0).max(99).optional(),
+  }).strict(),
+  handler: async (ctx, { body }) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
+    const game = registry.get(body.gameId);
+    if (game === undefined) throw new PluginError("no_such_game", 404);
+    const maxSeats = readTableMaxSeats(ctx.settings);
+    const declared = stationsFor(body.gameId);
+    if (body.station !== undefined && !declared.includes(body.station)) throw new PluginError("unknown_station", 400);
+
+    return ctx.transaction(async (tx) => {
+      // Unlocked pre-read for the clean refusal; the authoritative check is
+      // the re-read below under the caller's own player lock (two sits by one
+      // player serialize on that row — the solo one-open shape), and the
+      // p_casino_seats_one_seat unique index is the backstop.
+      if (await seatOf(tx, player.id) !== null) throw new PluginError("already_seated", 409);
+
+      const locationId = await locationOf(tx, player.id);
+      // Spec 2026-09-21 town-venues §5: a NEW hand needs the town's casino;
+      // an existing one settles regardless (a row can be removed mid-hand).
+      // Checked on the unlocked pre-read, `wrong_location`'s idiom, so a
+      // refusal takes no lock.
+      if (!(await tx.venues.has(locationId, "blackjack"))) throw new PluginError("no_venue", 409);
+      await tx.locks.location(locationId);
+
+      // Candidate table BEFORE the player lock? No — lockTable needs the seat
+      // set, which is stable only under the location lock we now hold, and the
+      // player-lock step needs the owner. Find the table, then lock.
+      const tables = await tx.db.select().from(casinoTables)
+        .where(eq(casinoTables.locationId, locationId))
+        .orderBy(asc(casinoTables.createdAt));
+      let target: string | null = null;
+      if (body.station !== undefined) {
+        // A named station: THAT table or a fresh one there — never a neighbour.
+        const at = tables.find((t) => t.gameId === body.gameId && t.station === body.station);
+        if (at !== undefined) target = at.id;
+      } else {
+        for (const t of tables) {
+          if (t.gameId !== body.gameId) continue;
+          const seats = await tx.db.select({ id: casinoSeats.id }).from(casinoSeats)
+            .where(eq(casinoSeats.tableId, t.id));
+          if (seats.length < maxSeats) { target = t.id; break; }
+        }
+      }
+
+      if (target === null) {
+        // A fresh table. The house is frozen NOW (the play-time freeze's
+        // sibling): resolveHouse reads unlocked, payOwner re-reads FOR UPDATE.
+        const house = await resolveHouse(tx, body.gameId, locationId, readMaxBet(ctx.settings));
+        await tx.locks.player(house.ownerId === null || house.ownerId === player.id
+          ? [player.id] : [player.id, house.ownerId]);
+        if (await seatOf(tx, player.id) !== null) throw new PluginError("already_seated", 409);
+        const tableId = uuidv7();
+        // The named station if one was given; otherwise the lowest station the
+        // floor declares that no live table of this game already occupies —
+        // `null` once every declared station is taken (or the game has none).
+        const live = new Set(tables.filter((t) => t.gameId === body.gameId && t.station !== null).map((t) => t.station));
+        const station = body.station ?? declared.find((s) => !live.has(s)) ?? null;
+        await tx.db.insert(casinoTables).values({
+          id: tableId, gameId: body.gameId, locationId,
+          propertyId: house.propertyId, seed: randomBytes(16).toString("hex"), station,
+        });
+        await tx.db.insert(casinoSeats).values({
+          id: uuidv7(), tableId, playerId: player.id, seatNo: 0,
+        });
+        // A table of one, so the caller is the whole seat set — the tick still
+        // fires, because it refreshes the LOBBY too (`invalidates: ["casino"]`)
+        // and a fresh table is the lobby's most visible change.
+        await publishTableTick(tx, ctx, [{ playerId: player.id }], tableId);
+        return { status: 200, body: { tableId, seat: 0, station } };
+      }
+
+      const locked = await lockTable(tx, ctx, target, [player.id]);
+      if (locked === null) throw new PluginError("no_such_table", 404);
+      // Copied BEFORE the clock runs, because the clock can free seats: an
+      // idle sweep kicks whoever sat the deal out, and `dealIfReady` swaps
+      // `locked.seats` for a filtered array rather than mutating this one.
+      // Those players are half the reason the tick's recipient set is a union.
+      const before = [...locked.seats];
+      // THE CLOCK BEFORE THE SEAT ROW EXISTS. A lapsed betting deadline deals
+      // to whoever bet and bumps the idle count of whoever did not, and a
+      // newcomer who was not at the table when that deadline ran must not be
+      // counted among them — today the sweep iterates the snapshot `lockTable`
+      // took, so the INSERT would have to move above a re-read before it could
+      // do that damage, but the ordering is what makes it true rather than
+      // incidental. What it decides OUTRIGHT is the three lines below: the
+      // sweep and the settle both free seats, so a table that reads full
+      // before the clock runs can have a place at it after, and the seat
+      // number handed out has to come from the post-advance seat set.
+      const advanced = await advanceTable(tx, ctx, locked, game);
+      // The hand it just settled emptied the table, which deleted the row.
+      // 404 rather than silently opening a new table: `sit` picked THIS one,
+      // and a retry lands on the fresh-table branch above.
+      if (advanced === null) throw new PluginError("no_such_table", 404);
+      if (await seatOf(tx, player.id) !== null) throw new PluginError("already_seated", 409);
+      if (advanced.seats.length >= maxSeats) throw new PluginError("table_full", 409);
+      const taken = new Set(advanced.seats.map((s) => s.seatNo));
+      let seatNo = 0;
+      while (taken.has(seatNo)) seatNo += 1;
+      await tx.db.insert(casinoSeats).values({
+        id: uuidv7(), tableId: target, playerId: player.id, seatNo,
+      });
+      // Pre ∪ post: everyone who was at the table when this transaction took
+      // the lock, everyone `advanceTable` left there, and the caller — whose
+      // seat row was inserted one line ago and so appears in neither set.
+      await publishTableTick(
+        tx, ctx, [...before, ...advanced.seats, { playerId: player.id }], target,
+      );
+      return { status: 200, body: { tableId: target, seat: seatNo, station: advanced.table.station } };
+    });
+  },
+});
+
+/**
+ * Frees a seat that holds no stake, and the table with it when it was the
+ * last one. Both of `leave`'s non-deferred exits end here, so "an emptied
+ * table is deleted" is stated once.
+ */
+async function freeSeat(
+  tx: PluginTx, ctx: PluginCtx, locked: LockedTable, mine: SeatRow,
+  /** Seats that were at the table earlier in this transaction and are not in
+   *  `locked.seats` any more — the clock's casualties, when `leave` ran it. */
+  alsoTell: readonly { playerId: string }[] = [],
+): Promise<{ status: 200; body: { left: boolean; deferred: boolean } }> {
+  await refundTableCredits(tx, locked.table, mine);
+  await tx.db.delete(casinoSeats).where(eq(casinoSeats.id, mine.id));
+  if (locked.seats.length === 1) {
+    await tx.db.delete(casinoTables).where(eq(casinoTables.id, locked.table.id));
+  }
+  // `locked.seats` is the seat set BEFORE this delete, and freeing a seat only
+  // ever removes from it — so with `alsoTell` it is the full pre ∪ post union.
+  // The leaver is therefore told about the leave that freed them, and the last
+  // player out is told the table is gone: their client holds a `casinoTable`
+  // cache entry that no read will correct until the poll comes round.
+  await publishTableTick(tx, ctx, [...alsoTell, ...locked.seats], locked.table.id);
+  return { status: 200, body: { left: true, deferred: false } };
+}
+
+const leaveRoute = route({
+  method: "POST",
+  path: "/api/casino/table/leave",
+  accessInJail: false,
+  accessInHospital: true,
+  handler: async (ctx) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    // Built where `bet` and `act` build it — outside the transaction, so no
+    // filter chain ever runs while this request holds a lock (`properties`'
+    // `leverSet` splits a route in two for that reason). It is CONSULTED only
+    // on the in-hand path below.
+    const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
+    return ctx.transaction(async (tx) => {
+      const seat = await seatOf(tx, player.id);
+      if (seat === null) throw new PluginError("not_seated", 404);
+      // The SEAT'S table's town, not the caller's — leave works from anywhere
+      // (spec: travelling away is resolved by leaving, never by a
+      // two-location transaction).
+      await tx.locks.location(seat.locationId);
+      const locked = await lockTable(tx, ctx, seat.tableId);
+      if (locked === null) throw new PluginError("not_seated", 404);
+      // The seat set before the clock runs (`sit`'s `before`, same reason):
+      // `advanceTable` can idle-kick or settle seats away, and those players
+      // are precisely who the union half of the tick's recipient set is for.
+      const before = [...locked.seats];
+      const mine = locked.seats.find((s) => s.playerId === player.id);
+      if (mine === undefined) throw new PluginError("not_seated", 404);
+
+      if (mine.wager === 0n || (mine.credits !== null && locked.table.phase === "betting")) {
+        // THE WAGER-0 FAST EXIT, and it is a safety property rather than an
+        // optimisation. `leave` is the ONLY way out of a seat and
+        // `p_casino_seats`' UNIQUE(player_id) is game-wide, so a leave that
+        // cannot complete strands the player at every table in the game.
+        // Consulting the game would make that outcome reachable three ways —
+        // the plugin uninstalled (404 `no_such_game`), an `autoAct` that
+        // throws (400 `game_error`), one that never advances the turn (500
+        // `invalid_turn`) — and a seat with no stake needs none of it: it
+        // holds no money, it is in no hand, and the only thing the clock could
+        // ever do to it is idle-kick it, which deletes the row this branch is
+        // about to delete anyway. So: no registry lookup, no `advanceTable`.
+        return freeSeat(tx, ctx, locked, mine);
+      }
+
+      const game = registry.get(locked.table.gameId);
+      if (game === undefined) throw new PluginError("no_such_game", 404);
+      // The clock FIRST, so a leaver is deferred only by a hand that is
+      // genuinely still live. A table everybody walked away from settles here
+      // and frees the seat in this same request — without it, leaving a hand
+      // whose deadlines all lapsed would set `leaving` and wait for a read
+      // that may never come.
+      const advanced = await advanceTable(tx, ctx, locked, game);
+      // The settle emptied the table and deleted it, taking the seat with it:
+      // the caller is, accurately, no longer seated anywhere.
+      if (advanced === null) throw new PluginError("not_seated", 404);
+      const post = advanced.seats.find((s) => s.playerId === player.id);
+      if (post === undefined) throw new PluginError("not_seated", 404);
+
+      if (post.wager > 0n) {
+        // Still in hand — wager escrowed, whether the deal has fired (acting)
+        // or is still pending (betting): the stake stays in play, spec §5's
+        // "no money is ever dropped by leaving". Mark leaving; the deal
+        // includes this seat, the turn clock auto-stands its turns, and the
+        // settle pays it normally and frees the seat at hand end. The wager-0
+        // test is the spec's in-hand definition — NEVER phase.
+        await tx.db.update(casinoSeats).set({ leaving: true }).where(eq(casinoSeats.id, post.id));
+        // Pre ∪ post: the caller's seat is still there, marked, so it is in
+        // both — but the clock ran on the way here and may have settled a hand
+        // that freed somebody else's.
+        await publishTableTick(
+          tx, ctx, [...before, ...advanced.seats], advanced.table.id,
+        );
+        return { status: 200, body: { left: true, deferred: true } };
+      }
+      // The clock settled the hand on the way through, so the stake is paid
+      // out and the seat frees NOW rather than at some later read.
+      return freeSeat(tx, ctx, advanced, post, before);
+    });
+  },
+});
+
+/** The view payload GET, bet and act all answer with (Task 12's DTO). */
+export async function renderTablePayload(
+  tx: PluginTx, ctx: PluginCtx, locked: LockedTable, game: TableGameDef, viewerId: string,
+): Promise<Record<string, unknown>> {
+  const { table, seats, house } = locked;
+  const [loc] = await tx.db.select({ name: locations.name })
+    .from(locations).where(eq(locations.id, table.locationId));
+  const ids = seats.map((s) => s.playerId);
+  const names = new Map<string, string>();
+  if (ids.length > 0) {
+    const rows = await tx.db.select({ id: players.id, username: players.username })
+      .from(players).where(inArray(players.id, ids));
+    for (const row of rows) names.set(row.id, row.username);
+  }
+  const mine = seats.find((s) => s.playerId === viewerId);
+  const viewerSeat = mine === undefined ? null : mine.seatNo;
+  const inHand = mine !== undefined && mine.wager > 0n;
+  return {
+    tableId: table.id,
+    gameId: table.gameId,
+    gameName: game.name,
+    bankroll: game.bankroll === true || seats.some((s) => s.credits !== null),
+    locationId: table.locationId,
+    locationName: loc?.name ?? "",
+    station: table.station,
+    phase: table.phase,
+    handNo: table.handNo,
+    deadlineAt: table.deadlineAt === null ? null : table.deadlineAt.toISOString(),
+    turnSeat: table.turnSeat,
+    mySeat: viewerSeat,
+    minBet: readMinBet(ctx.settings).toString(),
+    maxBet: house.maxBet.toString(),
+    seats: seats.map((s) => ({
+      seat: s.seatNo,
+      playerId: s.playerId,
+      username: names.get(s.playerId) ?? "",
+      wager: s.wager.toString(),
+      credits: s.credits?.toString() ?? null,
+      leaving: s.leaving,
+      idleHands: s.idleHands,
+    })),
+    view: table.state === null
+      ? null
+      : guardGame(table.gameId, "view", () =>
+          game.view(fromStorableState(table.state), inHand ? viewerSeat : null)),
+    // `null` — not `[]` — when the game does not implement `moves` at all:
+    // that is the client's signal to fall back to its own hardcoded UI
+    // (blackjack). A game that DOES implement it gets a bounded array,
+    // possibly empty, whenever there is a hand to compute it against; there
+    // is nothing to call it against before the first deal.
+    moves: game.moves === undefined
+      ? null
+      : (table.state === null
+          ? []
+          : boundMoves(guardGame(table.gameId, "moves", () =>
+              game.moves!(fromStorableState(table.state), inHand ? viewerSeat : null)))),
+  };
+}
+
+const readRoute = route({
+  method: "GET",
+  path: "/api/casino/table",
+  accessInJail: false,
+  accessInHospital: true,
+  handler: async (ctx) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
+    return ctx.transaction(async (tx) => {
+      const seat = await seatOf(tx, player.id);
+      if (seat === null) return { status: 200, body: { table: null } };
+
+      // THE FAST PATH. Every seated player polls this route every 2.5 seconds
+      // (spec §8) and almost every one of those reads owes the table nothing,
+      // so a table whose clock has not lapsed is rendered from plain SELECTs
+      // with ZERO locks taken — no location lock, no player locks, no `FOR
+      // UPDATE` on the table row. Making a poll queue behind the player who is
+      // acting would be a self-inflicted lock convoy at exactly the moment the
+      // table is busiest.
+      //
+      // The price, stated plainly: these are three SEPARATE statements under
+      // READ COMMITTED, so they are not one consistent snapshot — a hand that
+      // commits between them can be rendered with the new table row and the
+      // old seat wagers. Nothing is decided from it (every write re-reads
+      // under `lockTable`), it is a view a player looks at for 2.5 seconds,
+      // and the next poll corrects it. A `REPEATABLE READ` transaction would
+      // close the window at the cost of serialization failures on a route
+      // that must never fail.
+      const unlocked = await readTableUnlocked(tx, ctx, seat.tableId);
+      if (unlocked === null) return { status: 200, body: { table: null } };
+      const game = registry.get(unlocked.table.gameId);
+      if (game === undefined) throw new PluginError("no_such_game", 404);
+      const deadline = unlocked.table.deadlineAt;
+      if (deadline === null || deadline.getTime() > Date.now()) {
+        return {
+          status: 200,
+          body: { table: await renderTablePayload(tx, ctx, unlocked, game, player.id) },
+        };
+      }
+
+      // THE SLOW PATH: this read owes the table a deal, an auto-stand or a
+      // settle, so it takes the full lock order and pays it. The unlocked read
+      // above is discarded — it is a snapshot of a table that is about to
+      // move, and `advanceTable` returns the authoritative one.
+      await tx.locks.location(seat.locationId);
+      const locked = await lockTable(tx, ctx, seat.tableId);
+      if (locked === null) return { status: 200, body: { table: null } };
+      // ASKED UNDER THE LOCK, before the clock runs. A READ that publishes is
+      // unusual, and this is what keeps it honest: another transaction can have
+      // advanced the table while this one queued for the location lock, in
+      // which case `advanceTable` returns on its first test having changed
+      // nothing, and a tick for a table that did not move would be a lie every
+      // seat pays for with a refetch. `clockLapsed` is that first test, shared
+      // rather than restated so the two cannot drift apart.
+      const owed = clockLapsed(locked.table);
+      const before = [...locked.seats];
+      const advanced = await advanceTable(tx, ctx, locked, game);
+      if (advanced === null) {
+        // The settle emptied the table and deleted it. `before` is the whole
+        // union — every one of those seats is gone, and this reader is the only
+        // request that will ever know it happened.
+        if (owed) await publishTableTick(tx, ctx, before, seat.tableId);
+        return { status: 200, body: { table: null } };
+      }
+      if (owed) await publishTableTick(tx, ctx, [...before, ...advanced.seats], advanced.table.id);
+      return {
+        status: 200,
+        body: { table: await renderTablePayload(tx, ctx, advanced, game, player.id) },
+      };
+    });
+  },
+});
+
+/**
+ * What `bet` and `act` answer with: the table as it stands AFTER the write,
+ * read back under the locks this transaction already holds.
+ *
+ * A fresh `lockTable` rather than the pre-write snapshot, because a settle can
+ * delete the caller's `leaving` seat or the whole table — the same envelope
+ * GET uses, so one client schema parses all three routes, and a table that is
+ * gone answers `{ table: null }` rather than a snapshot of something that no
+ * longer exists.
+ */
+async function renderAfter(
+  tx: PluginTx, ctx: PluginCtx, tableId: string, game: TableGameDef, viewerId: string,
+): Promise<{
+  result: { status: 200; body: { table: Record<string, unknown> | null } };
+  /** The post-write seat set, for `publishTableTick`. Empty when the table is gone. */
+  seats: readonly SeatRow[];
+}> {
+  const after = await lockTable(tx, ctx, tableId);
+  if (after === null) return { result: { status: 200, body: { table: null } }, seats: [] };
+  return {
+    result: { status: 200, body: { table: await renderTablePayload(tx, ctx, after, game, viewerId) } },
+    seats: after.seats,
+  };
+}
+
+/**
+ * The caller's seat and its table, under the full lock order, with the phase
+ * the route requires already checked. Shared by `bet` and `act` because the
+ * two open identically — and because the `wrong_location` refusal has to
+ * happen on the UNLOCKED pre-read (`play`'s idiom): a player who travelled
+ * away must be refused before this transaction takes a single lock, and the
+ * town it would lock is the table's, never theirs.
+ */
+async function lockedSeat(
+  tx: PluginTx, ctx: PluginCtx, playerId: string, registry: Map<string, TableGameDef>,
+  phase: "betting" | "acting",
+): Promise<{
+  locked: LockedTable; game: TableGameDef; mine: SeatRow;
+  /** The seat set as `lockTable` read it, BEFORE the clock ran — the pre half
+   *  of the tick's recipient union, and the only record of a seat the clock
+   *  idle-kicked or settled away inside this call. */
+  before: readonly SeatRow[];
+}> {
+  const seat = await seatOf(tx, playerId);
+  if (seat === null) throw new PluginError("not_seated", 404);
+  if (await locationOf(tx, playerId) !== seat.locationId) {
+    throw new PluginError("wrong_location", 409);
+  }
+
+  await tx.locks.location(seat.locationId);
+  const locked = await lockTable(tx, ctx, seat.tableId);
+  if (locked === null) throw new PluginError("not_seated", 404);
+  const before = [...locked.seats];
+  const game = registry.get(locked.table.gameId);
+  if (game === undefined) throw new PluginError("no_such_game", 404);
+  // THE CLOCK, before a single check below reads the table. A deadline can
+  // lapse while the request queues on the location lock, and everything the
+  // two routes decide — phase, whose turn it is, whether the caller still has
+  // a seat — has to be decided against the table the clock leaves behind.
+  // The refusals it produces are the right ones: a bet arriving after the
+  // betting deadline dealt without the caller gets `wrong_phase`, an act
+  // arriving after the caller's turn was auto-stood gets `not_your_turn`, and
+  // a swept-or-settled seat gets `not_seated`.
+  const advanced = await advanceTable(tx, ctx, locked, game);
+  if (advanced === null) throw new PluginError("not_seated", 404);
+  const mine = advanced.seats.find((s) => s.playerId === playerId);
+  if (mine === undefined) throw new PluginError("not_seated", 404);
+  if (advanced.table.phase !== phase) throw new PluginError("wrong_phase", 409);
+  return { locked: advanced, game, mine, before };
+}
+
+const betRoute = route({
+  method: "POST",
+  path: "/api/casino/table/bet",
+  accessInJail: false,
+  accessInHospital: true,
+  body: z.object({ wager: NonNegativeIntegerString }).strict(),
+  handler: async (ctx, { body }) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    let wager = BigInt(body.wager);
+    const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
+
+    return ctx.transaction(async (tx) => {
+      const { locked, game, mine, before } = await lockedSeat(tx, ctx, player.id, registry, "betting");
+      // One stake per seat per hand. Raising it is the game's business
+      // (`wagerDelta`, mid-hand and bounded), never a second bet.
+      if (mine.wager > 0n) throw new PluginError("already_bet", 409);
+
+      // Existing legacy stakes finish using their original money model.
+      const legacyHand = locked.seats.some((s) => s.wager > 0n && s.credits === null);
+      const bankrolled = mine.credits !== null || (game.bankroll === true && !legacyHand);
+      if (bankrolled && legacyHand) throw new PluginError("mixed_escrow", 409);
+      const retained = bankrolled && mine.credits !== null && mine.credits > 0n;
+      if (retained) wager = mine.credits!;
+      const minBet = retained ? 1n : readMinBet(ctx.settings);
+      if (wager < minBet) throw new PluginError("wager_below_min", 400);
+      // The FROZEN house's lever (`lockTable` resolved it from the table's own
+      // `property_id`), so a table sold mid-hand keeps the bounds it was
+      // dealt under.
+      if (!retained && wager > locked.house.maxBet) throw new PluginError("wager_above_max", 400);
+
+      if (!bankrolled) await assertTableCanCover(
+        tx, locked.house, locked.seats, game.maxPayoutMultiplier,
+        { seat: mine.seatNo, amount: wager },
+      );
+      try {
+        if (bankrolled) {
+          if (!retained) await tx.economy.applyBalanceChange({
+            playerId: player.id, amount: -wager, kind: "cash", reason: `casino.${locked.table.gameId}.credits`,
+          });
+          mine.credits = wager;
+          await tx.db.update(casinoSeats).set({ credits: wager }).where(eq(casinoSeats.id, mine.id));
+        } else await escrow(tx, locked.house, player.id, wager, locked.table.gameId);
+      } catch (error) {
+        // The GUARD, never `instanceof` — see `applyStep`'s twin.
+        if (isInsufficientFundsError(error)) throw new PluginError("insufficient_funds", 409);
+        throw error;
+      }
+      // `idle_hands` measures CONSECUTIVE deals sat out (spec §3), so betting
+      // clears it whether or not this bet is the one that deals.
+      await tx.db.update(casinoSeats).set({ wager, idleHands: 0 })
+        .where(eq(casinoSeats.id, mine.id));
+      mine.wager = wager;
+      mine.idleHands = 0;
+
+      // The FIRST bet at a table starts the betting clock; later ones do not
+      // restart it, so one seat cannot hold the table open indefinitely.
+      if (locked.table.deadlineAt === null) {
+        const deadlineAt = new Date(Date.now() + readTableBetSeconds(ctx.settings) * 1000);
+        await tx.db.update(casinoTables).set({ deadlineAt })
+          .where(eq(casinoTables.id, locked.table.id));
+        locked.table.deadlineAt = deadlineAt;
+      }
+
+      // Not forced: this deals only if every non-leaving seat has now bet.
+      // The lapsed-deadline deal is the clock's (Task 11).
+      await dealIfReady(tx, ctx, locked, game, false);
+
+      // Pre ∪ post. The post half is read back AFTER the write
+      // (`renderAfter`'s re-read), because a bet that completes the table
+      // deals and a deal that settles on the spot frees seats — those players
+      // are in `before` and nowhere else.
+      const { result, seats } = await renderAfter(tx, ctx, locked.table.id, game, player.id);
+      await publishTableTick(tx, ctx, [...before, ...seats], locked.table.id);
+      return result;
+    });
+  },
+});
+
+const actRoute = route({
+  method: "POST",
+  path: "/api/casino/table/act",
+  accessInJail: false,
+  accessInHospital: true,
+  // The envelope only; the game's own `action` schema validates the payload
+  // once the table tells us which game it is (spec §4.2).
+  body: z.object({ action: z.unknown() }).strict(),
+  handler: async (ctx, { body }) => {
+    const player = ctx.player;
+    if (player === null) throw new PluginError("unauthorized", 401);
+    const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
+
+    return ctx.transaction(async (tx) => {
+      const { locked, game, mine, before } = await lockedSeat(tx, ctx, player.id, registry, "acting");
+      if (locked.table.turnSeat !== mine.seatNo) throw new PluginError("not_your_turn", 409);
+      // Unreachable while `phase` and `state` move together (`applyStep` writes
+      // both, `settleHand` clears both), but the column is nullable and a game
+      // cannot be handed `null` as its state.
+      if (locked.table.state === null) throw new PluginError("wrong_phase", 409);
+
+      const action = parseAction(game.action, body.action);
+      const step = guardGame(locked.table.gameId, "act", () =>
+        game.act(fromStorableState(locked.table.state), mine.seatNo, action));
+      // The acting seat, so a `wagerDelta` from THIS seat (a double) is
+      // allowed and one naming any other seat is refused.
+      await applyStep(tx, ctx, locked, game, step, mine.seatNo);
+
+      const { result, seats } = await renderAfter(tx, ctx, locked.table.id, game, player.id);
+      await publishTableTick(tx, ctx, [...before, ...seats], locked.table.id);
+      return result;
+    });
+  },
+});
+
+export const tableRoutes = [sitRoute, leaveRoute, readRoute, betRoute, actRoute];

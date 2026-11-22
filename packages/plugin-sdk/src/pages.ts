@@ -1,0 +1,457 @@
+import {
+  checkViewBounds,
+  COOLDOWN_ACTION_RE,
+  INTERNAL_PATH_RE,
+  MoneySchema,
+  NAV_CATEGORIES,
+  VIEW_ACTION_RE,
+  ViewWhenSchema,
+} from "@gl3/shared";
+import { z } from "zod";
+
+/**
+ * The view vocabulary is twelve node kinds and grows only when a plugin-contributed
+ * page needs data the static vocabulary cannot carry, as `table` did for admin
+ * lists. A core page that needs more than this gets a bespoke React override.
+ * Ten of the twelve are leaves; `panel` and `list` nest and so live on
+ * `ViewNodeSchema` below.
+ *
+ * Every node is `.strict()`. A typo'd prop on a node would otherwise be
+ * silently dropped by the renderer, which is the failure mode hardest to spot
+ * from the page that renders wrong.
+ */
+/** Shared by `table.source` and select `optionsSource`: a GET against an app-internal absolute path. */
+const GET_SOURCE_RE = /^GET \/(?![/\\])[^\s\\]*$/;
+
+const leafOptions = [
+  z.object({ kind: z.literal("text"), value: z.string() }).strict(),
+  // MoneySchema, not z.string(): the web renderer hands this to `formatAmount`,
+  // which throws on anything outside `/^-?\d+$/`, and the client has no
+  // ErrorBoundary — so a decimal string here unmounts the React root and blanks
+  // the app mid-render. Constrained at authoring time so a plugin declaring
+  // "10.00" fails the boot that loads it. Kept identical to the DTO's `money`
+  // leaf: the two diverging is how a value passes boot and then fails the
+  // browser.
+  z.object({ kind: z.literal("money"), value: MoneySchema }).strict(),
+  z.object({ kind: z.literal("error"), value: z.string() }).strict(),
+  z
+    .object({
+      kind: z.literal("link"),
+      label: z.string(),
+      to: z.string().regex(INTERNAL_PATH_RE, "link.to must be an app-internal absolute path"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("button"),
+      label: z.string(),
+      action: z.string().regex(VIEW_ACTION_RE, "action must be `METHOD /absolute/path`"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("cooldownButton"),
+      label: z.string(),
+      action: z.string().regex(VIEW_ACTION_RE, "action must be `METHOD /absolute/path`"),
+      cooldownAction: z
+        .string()
+        .regex(COOLDOWN_ACTION_RE, "cooldownAction must be a bare cooldown key segment"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("keyValue"),
+      rows: z.array(z.object({ label: z.string(), value: z.string() }).strict()),
+    })
+    .strict(),
+  z
+    .object({ kind: z.literal("meter"), label: z.string().min(1), value: z.number(), max: z.number().positive() })
+    .strict(),
+  // GET-only, same rule and reason as `table.source`: the value renders on
+  // mount and must never mutate. The response's `values: Record<string,string>`
+  // (`FormValuesResponseSchema`) is read as `Number(values[valueKey])` /
+  // `Number(values[maxKey])`.
+  z
+    .object({
+      kind: z.literal("meterSource"),
+      label: z.string().min(1),
+      source: z.string().regex(GET_SOURCE_RE, "meterSource source must be `GET /absolute/path`"),
+      valueKey: z.string().min(1),
+      maxKey: z.string().min(1),
+    })
+    .strict(),
+  // GET-only, same rule as `meterSource`. Renders one row per entry whose
+  // `key` is present in the response's `values`; zero present keys (or a 404)
+  // renders `emptyText` instead.
+  z
+    .object({
+      kind: z.literal("keyValueSource"),
+      source: z.string().regex(GET_SOURCE_RE, "keyValueSource source must be `GET /absolute/path`"),
+      entries: z.array(z.object({ label: z.string().min(1), key: z.string().min(1) }).strict()).min(1),
+      emptyText: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("form"),
+      action: z.string().regex(VIEW_ACTION_RE, "action must be `METHOD /absolute/path`"),
+      submitLabel: z.string(),
+      // Optional prefill: a GET whose response's `values` object seeds the
+      // form's fields by name (`{ values: Record<string, string> }`,
+      // `FormValuesResponseSchema` in @gl3/shared). Same GET-only rule and
+      // loader containment treatment as `table.source`.
+      valuesSource: z
+        .string()
+        .regex(GET_SOURCE_RE, "valuesSource must be `GET /absolute/path`")
+        .optional(),
+      // Three strict branches: select carries its options wiring, hidden
+      // carries its constant, the basic branch carries neither — so a
+      // branch-only property cannot ride on a text field and silently vanish
+      // in the renderer.
+      fields: z.array(
+        z.union([
+          z
+            .object({
+              name: z.string(),
+              label: z.string(),
+              type: z.literal("select"),
+              presentation: z.literal("list").optional(),
+              descriptionKey: z.string().optional(),
+              priceKey: z.string().optional(),
+              originalPriceKey: z.string().optional(),
+              // Same rule and same reason as `table.source`: options render on
+              // mount, so the fetch must never mutate, and the loader's
+              // containment pass treats it as a view action.
+              optionsSource: z
+                .string()
+                .regex(GET_SOURCE_RE, "optionsSource must be `GET /absolute/path`"),
+              valueKey: z.string(),
+              labelKey: z.string(),
+              allowEmpty: z.boolean().optional(),
+              /**
+               * Choosing an option seeds the form's OTHER fields from the
+               * chosen option's own row, by field name — the edit-a-row UX
+               * without a bespoke page. The rows are the select's own
+               * optionsSource payload, so no extra fetch happens, and only
+               * keys those rows actually carry are seeded: a field the row
+               * lacks keeps whatever value it already had. Only meaningful
+               * when the sibling fields share names with the row's keys.
+               */
+              prefillForm: z.boolean().optional(),
+              when: ViewWhenSchema.optional(),
+            })
+            .strict(),
+          z
+            .object({
+              name: z.string(),
+              // No `label`: the field draws nothing, so there is nowhere to
+              // put one. It submits a constant the route requires — a
+              // discriminator the admin would otherwise have to type by hand,
+              // where one typo is a 400.
+              type: z.literal("hidden"),
+              value: z.string(),
+              when: ViewWhenSchema.optional(),
+            })
+            .strict(),
+          z
+            .object({
+              name: z.string(),
+              label: z.string(),
+              // `decimal` is `number` for fractional values. `number` renders
+              // as `<input type="number">`, whose default `step` of 1 makes
+              // the browser reject 1.5 before it is ever submitted.
+              type: z.enum(["text", "number", "decimal", "money", "password"]),
+              /**
+               * Inclusive bounds for `number`/`decimal`, passed straight to
+               * the input's min/max so the browser refuses an out-of-range
+               * value before submit. Advisory only — the route still checks;
+               * a hand-built request never sees the form.
+               */
+              min: z.number().optional(),
+              max: z.number().optional(),
+              /**
+               * Progression-model gate, shared by every field branch and by
+               * table columns: the server prunes the non-matching ones at
+               * boot and strips the key (a page is static data, but which
+               * model a boot runs is boot-static too). `ViewWhenSchema` in
+               * @gl3/shared is the one definition.
+               */
+              when: ViewWhenSchema.optional(),
+            })
+            .strict(),
+        ]),
+      ),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("table"),
+      /**
+       * GET-only: a table renders data, it must never mutate on mount. The
+       * loader's containment pass treats this as a view action, so it must
+       * live under the plugin's basePaths like any button/form action.
+       */
+      source: z.string().regex(GET_SOURCE_RE, "table source must be `GET /absolute/path`"),
+      columns: z.array(
+        z.object({
+          key: z.string(),
+          label: z.string(),
+          // Default (absent) renders the cell as text. `image` treats the cell
+          // value as a URL and renders an `<img>` — additive, so every column
+          // written before this existed is unaffected. `countdown` treats the
+          // value as an ISO timestamp and ticks the remaining time down live
+          // client-side, refetching the table once when it reaches zero (so a
+          // lazily-settled row shows its outcome); a non-date value ("—")
+          // renders verbatim.
+          render: z.enum(["image", "countdown"]).optional(),
+          // Thumbnail size for `render: "image"`, ignored otherwise. Defaults
+          // to `sm`, which is right for a dense table and too small for a page
+          // whose whole point is the picture (the garage) — hence the choice.
+          imageSize: z.enum(["sm", "md", "lg"]).optional(),
+          // Progression-model gate — see the form field note above.
+          when: ViewWhenSchema.optional(),
+        }).strict(),
+      ).min(1),
+      // Per-row mutations (delete, mostly). Every `:token` in the action's
+      // path is replaced by the renderer with the row's field of that name —
+      // `:id` for most tables, `:locationId/:itemId` where the row's key is
+      // composite — which the table-source endpoint already carries even when
+      // no column shows it, because selects consume ids as their `valueKey`.
+      // The loader's containment pass collects these like any button action
+      // (`:` is charset-legal under VIEW_ACTION_RE and `startsWith`
+      // containment never reaches the placeholder). `confirm` makes the
+      // button two-step in place — first click arms, second fires — the same
+      // shape the property board uses instead of `window.confirm`.
+      rowActions: z.array(
+        z.object({
+          label: z.string().min(1),
+          action: z.string().regex(VIEW_ACTION_RE, "action must be `METHOD /absolute/path`"),
+          confirm: z.string().min(1).optional(),
+          /** Row field name; the button renders disabled when the row's value is the string "true". */
+          disabledKey: z.string().min(1).optional(),
+          /** Row field name holding an ISO timestamp or "": until it passes the button is disabled
+           *  and shows a live countdown, and the table refetches once when it reaches zero. */
+          cooldownKey: z.string().min(1).optional(),
+        }).strict(),
+      ).optional(),
+    })
+    .strict(),
+  // A hand of playing cards. Values are @letele/playing-cards component names:
+  // suit initial (H/D/C/S) + rank (a, 2-10, j, q, k), plus J1/J2 jokers and
+  // B1/B2 backs. Constrained at authoring time rather than at render, for the
+  // reason this file's header gives: an unmapped code is silently dropped by
+  // the renderer, which is the failure mode hardest to spot from the page.
+  // Game art. Display only: binding art to an entity is an admin action and
+  // goes through `assetBinder` below, never through this.
+  z
+    .object({
+      kind: z.literal("image"),
+      url: z.string().min(1),
+      // Required, not optional. It is the one accessibility decision that costs
+      // nothing at authoring time and cannot be retrofitted across every
+      // installed plugin later.
+      alt: z.string().min(1),
+      // `banner` is the page-chrome size: natural width capped at the content
+      // edge, the size core's own route banners render at. The three below
+      // are fixed boxes for list rows. Not on `cards` or `table.imageSize`,
+      // which have no natural-width rendering.
+      size: z.enum(["sm", "md", "lg", "banner"]).optional(),
+    })
+    .strict(),
+  /**
+   * The town's property row for one declared type — Buy when the state holds
+   * it, the owner tools (lever, transfer, drop, reset) when it is the
+   * viewer's. The property board page was retired for per-page panels
+   * (`cc7978f`), which left a manifest-declared page with no way to sell the
+   * franchise it declares; this node is that way. `pluginId` must be a
+   * property type some plugin in the boot declares (`validatePlugins`).
+   *
+   * `show` narrows the panel to one side. A plugin whose owner tools live on
+   * an owner-only page (a nav entry hidden per player through
+   * `MenuBadge.hidden`) puts `show: "buy"` on its public page and
+   * `show: "owned"` on the owner's: the public page then never draws the
+   * lever, Transfer or Drop, and the owner's page draws nothing at all for
+   * anyone who is not the owner. Absent, both sides show — the pre-1.0.8
+   * behaviour.
+   */
+  z
+    .object({
+      kind: z.literal("propertyPanel"),
+      pluginId: z.string().min(1),
+      show: z.enum(["buy", "owned"]).optional(),
+    })
+    .strict(),
+  // The admin upload widget: pick an entity, choose a file, and the renderer
+  // does the two-step POST /api/admin/assets then PUT /api/admin/assets/bind.
+  //
+  // Its own node kind rather than a `form` with a file field, because a form's
+  // `action` must live under the declaring plugin's basePaths (the loader's
+  // containment pass) and binding is a CORE route. A node the renderer knows
+  // the target of costs less than an exception in that pass.
+  //
+  // `scope` is absent on purpose: the loader fills it from the declaring
+  // plugin's id, so a plugin cannot declare a widget that rebinds another
+  // plugin's art. Valid in `adminPages` only.
+  // A singleton slot's image, resolved at render time.
+  //
+  // Needed because a page's view is STATIC data built at boot: it cannot carry
+  // a URL that depends on what an admin uploaded afterwards. The node names its
+  // slot and the renderer asks `GET /api/assets/slot/:scope/:slot`. `scope` is
+  // stamped by the loader, exactly as on `assetBinder`.
+  z
+    .object({
+      kind: z.literal("slotImage"),
+      slot: z.string().min(1),
+      alt: z.string().min(1),
+      // Absent means `banner` — a page banner is what this node is for.
+      size: z.enum(["sm", "md", "lg", "banner"]).optional(),
+      scope: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("assetBinder"),
+      slot: z.string().min(1),
+      // GET-only for the same reason `table.source` is: the entity list renders
+      // on mount and must never mutate.
+      //
+      // Both entity fields are omitted for a `singleton: true` slot: there is
+      // one image and therefore nothing to pick.
+      entitySource: z.string().regex(GET_SOURCE_RE, "entitySource must be `GET /absolute/path`").optional(),
+      /** Which field of a row to show in the picker. Its id is always `id`. */
+      entityLabelKey: z.string().min(1).optional(),
+      /**
+       * Never written by a plugin author. The loader OVERWRITES it with the
+       * declaring plugin's id on the way to the wire — unconditionally, so
+       * setting it here buys nothing and cannot be used to rebind another
+       * plugin's art. Optional only so the authoring type and the wire type can
+       * be the same shape.
+       */
+      scope: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("cards"),
+      cards: z.array(z.string().regex(/^([HDCS](a|[2-9]|10|j|q|k)|J[12]|B[12])$/, "card must be a playing-card code")),
+      // How big to draw the hand. Absent is `md`, the size every hand drawn
+      // before this field existed was. A multiplayer table needs the other
+      // sizes: its own hand wants to be read at a glance (`lg`) and four
+      // opponents' hands have to sit side by side in one content column
+      // (`sm`).
+      size: z.enum(["sm", "md", "lg"]).optional(),
+      // A line under the hand saying whose it is — the only way to tell four
+      // hands in a row apart, since a `cards` node carries no title of its own
+      // and a panel per hand would stack them vertically again.
+      caption: z.string().min(1).optional(),
+    })
+    .strict(),
+] as const;
+
+/** Type-level only: `ViewNode` infers its twelve non-nesting members from here. */
+const Leaf = z.discriminatedUnion("kind", [...leafOptions]);
+
+export type ViewNode =
+  | z.infer<typeof Leaf>
+  // `| undefined` on the optional member, not a bare `?`: the repo compiles
+  // with `exactOptionalPropertyTypes`, under which zod's own inferred
+  // `.optional()` shape (which does include `undefined`) is not assignable to
+  // a bare optional property.
+  // The panel's fields live here by hand as well as in the schema below;
+  // `view-node-parity.test.ts` pins the two together at compile time.
+  | { kind: "panel"; title: string; children: ViewNode[]; layout?: "row" | undefined; collapsed?: boolean | undefined }
+  | { kind: "list"; items: ViewNode[] };
+
+/**
+ * `panel` and `list` nest, so the schema is recursive and needs the explicit
+ * type annotation zod requires for `z.lazy` — inference cannot close the loop
+ * on its own.
+ *
+ * One flat `discriminatedUnion` over all fourteen kinds, rather than
+ * `union([Leaf, panel, list])`. The two are equivalent in what they accept and
+ * reject; they are not equivalent in what they report. `ZodUnion` aborts on
+ * failure and emits a single `invalid_union` issue at the path of the
+ * *outermost* union — always `view` — burying the real cause in `unionErrors`,
+ * which `definePlugin` discards because it maps only `error.issues`. Every
+ * authoring mistake below the top level therefore came out as
+ * `pages.0.view: Invalid input`. Dispatching on `kind` picks one branch and
+ * reports that branch's own issues at their own paths, so a bad node three
+ * levels down names itself.
+ */
+export const ViewNodeSchema: z.ZodType<ViewNode> = z.lazy(() =>
+  z.discriminatedUnion("kind", [
+    ...leafOptions,
+    z
+      .object({
+        kind: z.literal("panel"),
+        title: z.string(),
+        children: z.array(ViewNodeSchema),
+        // How the panel's own children are laid out. Absent stacks them, which
+        // is what every panel authored before this field did. `row` lays them
+        // out horizontally and wraps — for a run of LEAF children only, since
+        // the renderer flattens a nested panel to a sibling one and a nested
+        // panel inside a row would break out of it (see PageRenderer's
+        // `PanelGroup` comment).
+        layout: z.literal("row").optional(),
+        // A collapsible panel: the title becomes a disclosure the reader
+        // opens and closes. `true` starts closed, `false` starts open; absent
+        // is the plain titled panel every page authored before this field
+        // got. For explainer text a page must carry but a returning player
+        // should not have to scroll past.
+        collapsed: z.boolean().optional(),
+      })
+      .strict(),
+    z.object({ kind: z.literal("list"), items: z.array(ViewNodeSchema) }).strict(),
+  ]),
+);
+
+/**
+ * A page's nav entry. `category` is where the page asks to live — the six ids
+ * in `NAV_CATEGORIES` (@gl3/shared), checked here so a typo fails at boot with
+ * the declaring plugin's id in the message rather than quietly filing the page
+ * under the client's catch-all "More".
+ *
+ * Optional, and deliberately so: the client keeps its `PLUGIN_CATEGORY` map as
+ * the fallback for pages authored before this field, so an existing manifest
+ * needs no edit and lands exactly where it did.
+ */
+export const MenuEntrySchema = z
+  .object({
+    label: z.string().min(1),
+    order: z.number().int(),
+    category: z.enum(NAV_CATEGORIES).optional(),
+  })
+  .strict();
+
+/**
+ * What a page's `view` is authored against: the size bound (`checkViewBounds`,
+ * from `@gl3/shared`) runs first and aborts the pipeline before the recursive
+ * node schema can descend, so an over-deep view fails validation instead of
+ * overflowing the stack inside `z.lazy`.
+ */
+export const BoundedViewNodeSchema: z.ZodType<ViewNode, z.ZodTypeDef, unknown> = z
+  .unknown()
+  .superRefine(checkViewBounds)
+  .pipe(ViewNodeSchema);
+
+export const PageSchemaSchema = z
+  .object({
+    id: z.string().min(1),
+    /**
+     * Two rules, both load-bearing. `INTERNAL_PATH_RE` is the DTO's rule, so a
+     * path that boots here also parses on the client — the strict object over
+     * `pages[]` means one path the DTO rejects takes down parsing of the whole
+     * payload, in the browser, which is the failure this schema exists to move
+     * to boot time. The charset is the narrower SDK-only rule on top.
+     */
+    path: z
+      .string()
+      .regex(INTERNAL_PATH_RE, "page path must be an app-internal absolute path")
+      .regex(/^[a-z0-9\-/:]*$/, "page path must be lowercase"),
+    menu: MenuEntrySchema.optional(),
+    view: BoundedViewNodeSchema,
+  })
+  .strict();
+
+export type MenuEntry = z.infer<typeof MenuEntrySchema>;
+export type PageSchema = z.infer<typeof PageSchemaSchema>;

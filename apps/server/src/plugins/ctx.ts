@@ -1,0 +1,774 @@
+import type {
+  AssetSlot, AttributePoolDecl, BoundFilterSubscription, CoreEventInput, ExpApplier, JobContext,
+  PlayerAttributes, PlayerSnapshot, PluginCtx, PluginEventInput, PluginTx, Pool,
+  PropertyTypeDecl, TrainedAttr, WorldHook,
+} from "@gl3/plugin-sdk";
+import {
+  InsufficientFundsError as SdkInsufficientFundsError,
+  InsufficientGangFundsError as SdkInsufficientGangFundsError,
+  JobAlreadyAppliedError,
+  PluginError,
+  runFilterChain,
+  settlePool,
+} from "@gl3/plugin-sdk";
+import { GameEventSchema, IdSchema, type GameEvent, type LeaderboardKind, type ProgressionModel } from "@gl3/shared";
+import type { Queue } from "bullmq";
+import { and, eq, sql } from "drizzle-orm";
+import type { Redis } from "ioredis";
+import { uuidv7 } from "uuidv7";
+import type { StorageDriver } from "../assets/driver.js";
+import { resolveAssets, resolveSingletonAsset } from "../assets/service.js";
+import { deliverAndClear, type OutboxDispatchDeps } from "../bus/outbox.js";
+import type { Db } from "../db/client.js";
+import { outbox, players, playerStats, playerTimers, pluginJobRuns } from "../db/schema/index.js";
+import {
+  addExp, applyBalanceChange, applyGangBalanceChange, InsufficientFundsError,
+  InsufficientGangFundsError, lockGangAndPlayerForUpdate, lockLocationForUpdate,
+  lockLocationsForUpdate, lockPlayersForUpdate, type Tx,
+} from "../economy/ledger.js";
+import { applyExpAndRankUp, syncRankToLevel } from "../economy/ranks.js";
+import { expScore } from "../game/leaderboard/service.js";
+import { appendGangLog } from "../game/gangs/logs.js";
+import { GANG_PERMISSIONS, hasGangPermission, type GangPermission } from "../game/gangs/permissions.js";
+import {
+  acquireCooldown, cooldownKey, peekCooldown, releaseCooldown,
+} from "../game/cooldown.js";
+import { sendToHospital } from "../game/hospital/status.js";
+import { sendToJail } from "../game/jail/status.js";
+import { insertNotification } from "../game/notifications/service.js";
+import { newSeed } from "../game/rng.js";
+import { slotKey } from "./asset-slots.js";
+import { memberRegenMultiplier } from "./attribute-pools.js";
+
+export interface PluginCtxDeps {
+  db: Db;
+  redis: Redis;
+  /** Per-plugin BullMQ queues, keyed `<pluginId>:<jobName>`. Task 11 fills it. */
+  queues: Map<string, Queue>;
+  settings: Record<string, string>;
+  /**
+   * Required, not optional-with-a-default: an omitted prefix silently means
+   * the production `leaderboard:*` keys, and `bootTestServer` namespaces its
+   * own per boot so concurrent test files do not collide on shared Redis.
+   * `buildApp` applies the `?? DEFAULT_LEADERBOARD_PREFIX` default at the one
+   * place that already owns that decision.
+   */
+  leaderboardPrefix: string;
+  /**
+   * Object storage behind `ctx.assets`. Reads only from a plugin's side — the
+   * driver is here rather than a whole asset service because `resolveAssets`
+   * needs `urlFor` to turn a stored hash into something a browser can fetch.
+   */
+  assetDriver: StorageDriver;
+}
+
+export interface PluginCtxOptions {
+  pluginId: string;
+  player: PlayerSnapshot | null;
+  job: JobContext | null;
+  filters: readonly BoundFilterSubscription[];
+  propertyTypes: ReadonlyMap<string, PropertyTypeDecl>;
+  attributePools: ReadonlyMap<Pool, AttributePoolDecl>;
+  /** The single exp-routing claimant, or null (collectExpRouters). */
+  expRouter: ExpApplier | null;
+  /**
+   * Explicit progression model. Defaults to whatever `expRouter` implies;
+   * the one caller that must set it is core-filters, whose ctxs carry no
+   * router (display-only) but still run on a routed boot.
+   */
+  progression?: ProgressionModel;
+  installedPluginIds: ReadonlySet<string>;
+  /** Keyed `<scope>:<slot>` by `slotKey`, from `collectAssetSlots`. */
+  assetSlots: ReadonlyMap<string, AssetSlot>;
+  /**
+   * Optional with the `progression?` precedent — a dozen test call sites
+   * build a ctx and none needs a hook list; production sites pass the
+   * loader's.
+   */
+  worldHooks?: readonly WorldHook[];
+}
+
+/**
+ * The transaction's delivery buffers. Envelopes are minted (id and all) at
+ * PUSH time, not flush time, because the outbox row and any later dispatcher
+ * retry must carry byte-identical frames — the client dedupes on `event.id`,
+ * which only works if the id is the same on every delivery attempt.
+ *
+ * One array holds both event kinds so a handler's relative call order
+ * survives to the wire. `game/crimes/worker.ts` publishes `crime.resolved`
+ * before `player.jailed` deliberately — "so a client that reacts to
+ * player.jailed can already cross-reference the crime that caused it" — and
+ * a ported crimes module must be able to keep that.
+ */
+
+export function createPluginCtx(deps: PluginCtxDeps, options: PluginCtxOptions): PluginCtx {
+  // Built once per ctx and memoized, so two filter subscribers owned by the
+  // same plugin (or two calls into the same one) reuse the same sibling ctx
+  // rather than each paying a fresh `createPluginCtx` — and, because the
+  // Map is closed over rather than module-level, siblings never leak across
+  // requests. Self short-circuits to the ctx already under construction
+  // instead of recursing into a second copy of it.
+  const siblings = new Map<string, PluginCtx>();
+  const ctxFor = (ownerId: string): PluginCtx => {
+    if (ownerId === options.pluginId) return ctx;
+    let sibling = siblings.get(ownerId);
+    if (sibling === undefined) {
+      sibling = createPluginCtx(deps, { ...options, pluginId: ownerId });
+      siblings.set(ownerId, sibling);
+    }
+    return sibling;
+  };
+
+  // The outbox delivery deps shared by every transaction on this ctx: the
+  // queues resolver matches the queue key `ctx.jobs` itself derives, and the
+  // error sink is the console fallback that survives a silenced
+  // test-environment logger (the 3e3e5d7 precedent) — a delivery failure is
+  // reported loudly but never escalates, because the dispatcher owns retry.
+  const outboxDispatchDeps: OutboxDispatchDeps = {
+    redis: deps.redis,
+    queueResolver: (pluginId, jobName) => deps.queues.get(`${pluginId}:${jobName}`),
+    onError: (error, context) => {
+      console.error(
+        { plugin: options.pluginId, ...context },
+        error instanceof Error ? error.message : String(error),
+      );
+    },
+  };
+
+  const ctx: PluginCtx = {
+    pluginId: options.pluginId,
+    player: options.player,
+    job: options.job,
+
+    async transaction<T>(fn: (tx: PluginTx) => Promise<T>): Promise<T> {
+      // The buffers live in this call's closure, so two concurrent requests
+      // on the same ctx factory cannot see each other's pending rows.
+      const events: GameEvent[] = [];
+      const jobs: { id: string; kind: "job"; payload: { pluginId: string; jobName: string; data: Record<string, unknown>; seed: string } }[] = [];
+
+      // Keyed so a second change to the same player+kind replaces the first:
+      // the leaderboard wants the FINAL balance, not each intermediate one.
+      const scores = new Map<string, { kind: LeaderboardKind; playerId: string; score: bigint }>();
+      const bufferScore = (kind: LeaderboardKind, playerId: string, score: bigint): void => {
+        scores.set(`${kind}:${playerId}`, { kind, playerId, score });
+      };
+
+      // Filled inside the transaction after the handler returns, delivered
+      // after it commits. Empty on rollback — see below.
+      let outboxRows: { id: string; kind: string; payload: unknown }[] = [];
+
+      const result = await deps.db.transaction(async (tx) => {
+        if (options.job !== null) {
+          // NOTES.md rule 1, made structural: FIRST statement in the
+          // transaction, before any handler code. A retry of an already-
+          // committed job conflicts here and aborts before re-applying
+          // anything. A plugin cannot forget this because it never writes it.
+          const claimed = await tx
+            .insert(pluginJobRuns)
+            .values({ pluginId: options.pluginId, jobId: options.job.id })
+            .onConflictDoNothing()
+            .returning({ jobId: pluginJobRuns.jobId });
+          if (claimed.length === 0) {
+            throw new JobAlreadyAppliedError(options.pluginId, options.job.id);
+          }
+        }
+        const pluginTx: PluginTx = {
+          db: tx,
+          economy: {
+            applyBalanceChange: async (change) => {
+              let after: bigint;
+              try {
+                after = await applyBalanceChange(tx, change);
+              } catch (error) {
+                // Only this call is wrapped, and only this one error is
+                // translated: a plugin package cannot import core's class, so
+                // without this every overdraft escapes the loader's
+                // PluginError catch and Fastify 500s. Everything else
+                // propagates untouched.
+                if (error instanceof InsufficientFundsError) {
+                  throw new SdkInsufficientFundsError(change.playerId, change.kind);
+                }
+                throw error;
+              }
+              // Deliberately outside the try: a leg that threw must buffer no
+              // score. `points` has no leaderboard — LeaderboardKind is
+              // cash/bank/exp.
+              if (change.kind !== "points") bufferScore(change.kind, change.playerId, after);
+              return after;
+            },
+            // The gang-side mirror of the applyBalanceChange wrap above, and
+            // the same reason: a plugin package cannot import core's class,
+            // so without this every gang overdraft escapes the loader's
+            // PluginError catch and Fastify 500s where core's withdraw route
+            // answered 400 insufficient_gang_funds. Everything else
+            // propagates untouched.
+            //
+            // No bufferScore, unlike the player wrap: gang balances have no
+            // leaderboard — LeaderboardKind is cash/bank/exp on a PLAYER.
+            applyGangBalanceChange: async (change) => {
+              try {
+                return await applyGangBalanceChange(tx, change);
+              } catch (error) {
+                if (error instanceof InsufficientGangFundsError) {
+                  throw new SdkInsufficientGangFundsError(change.gangId, change.kind);
+                }
+                throw error;
+              }
+            },
+            addExp: async (playerId, amount) => {
+              await addExp(tx, playerId, amount);
+              // A zero gain is core's own no-op (economy/ledger.ts) — no
+              // UPDATE runs, so no row lock is taken. Reading playerStats
+              // here anyway would be an unlocked read that can observe a
+              // stale snapshot and ZADD it over a newer value after commit.
+              // Nothing was written, so there is nothing to record.
+              if (amount === 0n) return;
+              const fresh = await freshStats(tx, playerId);
+              if (fresh) bufferScore("exp", playerId, expScore(fresh.level, fresh.exp, Boolean(options.expRouter)));
+            },
+            applyExpAndRankUp: async (playerId, expGain) => {
+              // Exp routing (C spec §3.2/§3.4): a claimant applies exp to its
+              // own level ladder INSIDE this transaction — `player_stats.exp`
+              // becomes WITHIN-level exp once routed, not lifetime exp, and
+              // the rank ladder's own threshold path never runs. The GL3
+              // rank ladder still exists on a routed boot, though: it is
+              // reconciled to the player's new level's ORDINAL position
+              // (`syncRankToLevel`, level-derived, not exp-threshold-
+              // derived), so reward-bearing ranks still pay out and a
+              // crossing still returns a `RankUpResult` — the caller
+              // publishes `player.rankedUp` exactly as it would on an
+              // unrouted boot. The claimant separately publishes its own
+              // `player.levelUp` events; this path never does.
+              if (options.expRouter) {
+                if (expGain === 0n) return null;
+                const [before] = await tx
+                  .select({ level: playerStats.level })
+                  .from(playerStats)
+                  .where(eq(playerStats.playerId, playerId));
+                await options.expRouter(pluginTx, playerId, expGain);
+                const fresh = await freshStats(tx, playerId);
+                if (!fresh) return null;
+                const promotion = await syncRankToLevel(tx, playerId, {
+                  pay: fresh.level > (before?.level ?? 0),
+                });
+                bufferScore("exp", playerId, expScore(fresh.level, fresh.exp, true));
+                // A promotion pays its cash reward through syncRankToLevel's own
+                // internal applyBalanceChange, invisible to this wrapper — same
+                // reasoning as the unrouted arm below, so re-read post-sync and
+                // buffer cash too, or the board goes stale by the reward amount.
+                if (promotion) {
+                  const paid = await freshStats(tx, playerId);
+                  if (paid) bufferScore("cash", playerId, paid.cash);
+                }
+                return promotion;
+              }
+              const result = await applyExpAndRankUp(tx, playerId, expGain);
+              // Same reasoning as addExp above: core's applyExpAndRankUp
+              // (economy/ranks.ts) is itself a no-op on a zero gain — no
+              // UPDATE, no row lock — so skip the unlocked read/buffer here
+              // too and return core's own null unchanged.
+              if (expGain === 0n) return result;
+              // Both kinds: a rank-up pays its cash reward through core's own
+              // internal applyBalanceChange (economy/ranks.ts), which this
+              // wrapper never sees, so buffering exp alone leaves cash stale.
+              const fresh = await freshStats(tx, playerId);
+              if (fresh) {
+                bufferScore("exp", playerId, expScore(fresh.level, fresh.exp, Boolean(options.expRouter)));
+                bufferScore("cash", playerId, fresh.cash);
+              }
+              return result;
+            },
+          },
+          jail: { sendToJail: (playerId, seconds) => sendToJail(tx, playerId, seconds) },
+          hospital: { sendToHospital: (playerId, seconds) => sendToHospital(tx, playerId, seconds) },
+          locks: {
+            player: (playerIds) => lockPlayersForUpdate(tx, playerIds),
+            gangAndPlayer: (gangId, playerId) => lockGangAndPlayerForUpdate(tx, gangId, playerId),
+            location: (locationId) => lockLocationForUpdate(tx, locationId),
+            locations: (locationIds) => lockLocationsForUpdate(tx, locationIds),
+          },
+          timers: {
+            get: async (playerId, key) => {
+              const [row] = await tx
+                .select({ expiresAt: playerTimers.expiresAt })
+                .from(playerTimers)
+                .where(and(eq(playerTimers.playerId, playerId), eq(playerTimers.key, key)));
+              return row?.expiresAt ?? null;
+            },
+            set: async (playerId, key, expiresAt) => {
+              await tx
+                .insert(playerTimers)
+                .values({ playerId, key, expiresAt })
+                .onConflictDoUpdate({
+                  target: [playerTimers.playerId, playerTimers.key],
+                  set: { expiresAt },
+                });
+            },
+            clear: async (playerId, key) => {
+              const deleted = await tx
+                .delete(playerTimers)
+                .where(and(eq(playerTimers.playerId, playerId), eq(playerTimers.key, key)))
+                .returning({ playerId: playerTimers.playerId });
+              return deleted.length > 0;
+            },
+          },
+          venues: { has: (locationId, venue) => venueExists(tx, options.installedPluginIds, locationId, venue) },
+          // See PluginTx's `attributes` doc comment (packages/plugin-sdk/src/ctx.ts):
+          // the caller already holds the player row via `tx.locks.player`, so
+          // nothing here takes a lock of its own. Written as explicit
+          // per-pool/per-attr blocks rather than a loop over computed column
+          // names — a dynamic `row[pool]` / `row[`${pool}Max`]` lookup fights
+          // strict mode for no real gain here, and three short blocks are
+          // easier to typecheck AND read than one clever one.
+          attributes: (() => {
+            const settleAll = async (playerId: string): Promise<PlayerAttributes> => {
+              const [row] = await tx.select().from(playerStats).where(eq(playerStats.playerId, playerId));
+              if (!row) throw new Error(`player_stats row missing for ${playerId}`);
+
+              const now = new Date();
+              // Membership regen bonuses (C spec §1.3): a declaration may set
+              // memberMultiplier and it applies only while the framework
+              // membership timer is live. One timer read per settle, and only
+              // when some declaration opted in — a game with no member-priced
+              // pool never touches the timers table. The raw read (not
+              // membershipUntil) is deliberate: expiry notification stays
+              // membership's job wherever it already runs; a stale past-date
+              // row simply fails the liveness check here.
+              const anyMemberPriced = [...options.attributePools.values()]
+                .some((d) => d.memberMultiplier !== undefined);
+              // Direct select, not the plugin-facing tx.timers facade this
+              // object is still building — same two statements as timers.get.
+              const [memberRow] = anyMemberPriced
+                ? await tx.select({ expiresAt: playerTimers.expiresAt })
+                    .from(playerTimers)
+                    .where(and(eq(playerTimers.playerId, playerId), eq(playerTimers.key, "membership")))
+                : [];
+              const memberLive = memberRow !== undefined && memberRow.expiresAt.getTime() > now.getTime();
+              const multFor = (decl: { memberMultiplier?: number | undefined } | null): number =>
+                memberRegenMultiplier(decl, memberLive);
+              const energyDecl = options.attributePools.get("energy") ?? null;
+              const willDecl = options.attributePools.get("will") ?? null;
+              const braveDecl = options.attributePools.get("brave") ?? null;
+              const energyOut = settlePool(row.energy, row.energyMax, row.energyRegenAt, now, energyDecl, multFor(energyDecl));
+              const willOut = settlePool(row.will, row.willMax, row.willRegenAt, now, willDecl, multFor(willDecl));
+              const braveOut = settlePool(row.brave, row.braveMax, row.braveRegenAt, now, braveDecl, multFor(braveDecl));
+
+              const patch: Partial<{
+                energy: number; energyMax: number; energyRegenAt: Date | null;
+                will: number; willMax: number; willRegenAt: Date | null;
+                brave: number; braveMax: number; braveRegenAt: Date | null;
+              }> = {};
+              if (energyOut.value !== row.energy) patch.energy = energyOut.value;
+              if (energyOut.max !== row.energyMax) patch.energyMax = energyOut.max;
+              if (energyOut.stamp?.getTime() !== row.energyRegenAt?.getTime()) patch.energyRegenAt = energyOut.stamp;
+              if (willOut.value !== row.will) patch.will = willOut.value;
+              if (willOut.max !== row.willMax) patch.willMax = willOut.max;
+              if (willOut.stamp?.getTime() !== row.willRegenAt?.getTime()) patch.willRegenAt = willOut.stamp;
+              if (braveOut.value !== row.brave) patch.brave = braveOut.value;
+              if (braveOut.max !== row.braveMax) patch.braveMax = braveOut.max;
+              if (braveOut.stamp?.getTime() !== row.braveRegenAt?.getTime()) patch.braveRegenAt = braveOut.stamp;
+
+              if (Object.keys(patch).length > 0) {
+                await tx.update(playerStats).set(patch).where(eq(playerStats.playerId, playerId));
+              }
+
+              return {
+                energy: energyOut.value, energyMax: energyOut.max,
+                will: willOut.value, willMax: willOut.max,
+                brave: braveOut.value, braveMax: braveOut.max,
+                level: row.level,
+                strength: row.strength, agility: row.agility,
+                guard: row.guard, labour: row.labour,
+                iq: row.iq,
+              };
+            };
+
+            return {
+              read: settleAll,
+              spend: async (playerId: string, pool: Pool, amount: number) => {
+                if (amount < 0) throw new PluginError("invalid_amount", 400);
+                if (amount === 0) return;
+                const current = await settleAll(playerId);
+                switch (pool) {
+                  case "energy": {
+                    if (current.energy < amount) throw new PluginError("insufficient_energy", 409);
+                    await tx.update(playerStats).set({ energy: current.energy - amount }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  case "will": {
+                    if (current.will < amount) throw new PluginError("insufficient_will", 409);
+                    await tx.update(playerStats).set({ will: current.will - amount }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  case "brave": {
+                    if (current.brave < amount) throw new PluginError("insufficient_brave", 409);
+                    await tx.update(playerStats).set({ brave: current.brave - amount }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  default:
+                    assertUnreachableAttribute("invalid_pool", pool);
+                }
+              },
+              grant: async (playerId: string, pool: Pool, amount: number) => {
+                if (amount < 0) throw new PluginError("invalid_amount", 400);
+                if (amount === 0) return;
+                const current = await settleAll(playerId);
+                switch (pool) {
+                  case "energy": {
+                    const next = Math.min(current.energyMax, current.energy + amount);
+                    await tx.update(playerStats).set({ energy: next }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  case "will": {
+                    const next = Math.min(current.willMax, current.will + amount);
+                    await tx.update(playerStats).set({ will: next }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  case "brave": {
+                    const next = Math.min(current.braveMax, current.brave + amount);
+                    await tx.update(playerStats).set({ brave: next }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  }
+                  default:
+                    assertUnreachableAttribute("invalid_pool", pool);
+                }
+              },
+              setMax: async (playerId: string, pool: Pool, value: number) => {
+                if (value < 0) throw new PluginError("invalid_amount", 400);
+                switch (pool) {
+                  case "energy":
+                    await tx.update(playerStats).set({ energyMax: value }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  case "will":
+                    await tx.update(playerStats).set({ willMax: value }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  case "brave":
+                    await tx.update(playerStats).set({ braveMax: value }).where(eq(playerStats.playerId, playerId));
+                    return;
+                  default:
+                    assertUnreachableAttribute("invalid_pool", pool);
+                }
+              },
+              train: async (playerId: string, attr: TrainedAttr, delta: bigint) => {
+                switch (attr) {
+                  case "strength": {
+                    const [updated] = await tx.update(playerStats)
+                      .set({ strength: sql`${playerStats.strength} + ${delta}` })
+                      .where(eq(playerStats.playerId, playerId))
+                      .returning({ value: playerStats.strength });
+                    if (!updated) throw new Error(`player_stats row missing for ${playerId}`);
+                    return updated.value;
+                  }
+                  case "agility": {
+                    const [updated] = await tx.update(playerStats)
+                      .set({ agility: sql`${playerStats.agility} + ${delta}` })
+                      .where(eq(playerStats.playerId, playerId))
+                      .returning({ value: playerStats.agility });
+                    if (!updated) throw new Error(`player_stats row missing for ${playerId}`);
+                    return updated.value;
+                  }
+                  case "guard": {
+                    const [updated] = await tx.update(playerStats)
+                      .set({ guard: sql`${playerStats.guard} + ${delta}` })
+                      .where(eq(playerStats.playerId, playerId))
+                      .returning({ value: playerStats.guard });
+                    if (!updated) throw new Error(`player_stats row missing for ${playerId}`);
+                    return updated.value;
+                  }
+                  case "labour": {
+                    const [updated] = await tx.update(playerStats)
+                      .set({ labour: sql`${playerStats.labour} + ${delta}` })
+                      .where(eq(playerStats.playerId, playerId))
+                      .returning({ value: playerStats.labour });
+                    if (!updated) throw new Error(`player_stats row missing for ${playerId}`);
+                    return updated.value;
+                  }
+                  case "iq": {
+                    const [updated] = await tx.update(playerStats)
+                      .set({ iq: sql`${playerStats.iq} + ${delta}` })
+                      .where(eq(playerStats.playerId, playerId))
+                      .returning({ value: playerStats.iq });
+                    if (!updated) throw new Error(`player_stats row missing for ${playerId}`);
+                    return updated.value;
+                  }
+                  default:
+                    assertUnreachableAttribute("invalid_attribute", attr);
+                }
+              },
+            };
+          })(),
+          /**
+           * `tx`, never `db`. Defined inside this closure, so every call
+           * reads through the live transaction — which is what makes a
+           * post-lock recheck observe post-lock state (SDK ctx.ts, and
+           * core's former withdraw route, now ported to @gl3/plugin-gangs).
+           *
+           * A guard rather than a cast: `hasGangPermission` takes core's
+           * `GangPermission` union, the SDK hands over a `string`, and
+           * `packages/*` forbids casts. An unknown permission answers false,
+           * which is what the underlying query would have answered.
+           */
+          gangs: {
+            hasPermission: async (gangId, playerId, permission) => {
+              if (!isGangPermission(permission)) return false;
+              return await hasGangPermission(tx, gangId, playerId, permission);
+            },
+          },
+          gangLog: (entry) => appendGangLog(tx, entry.gangId, entry.playerId, entry.message),
+          /**
+           * The row AND the event, always. `events.ts` documents
+           * notification.created as "actor = the notified player" — the
+           * recipient, not whoever triggered it — matching every other
+           * privately-audienced event, and matching what core's own gang
+           * routes publish. `awaitOwnEvent(subscriber, actorId)` is the
+           * mandated rule-4 filter, so the wrong actor here silently breaks
+           * every caller waiting on the recipient's own id.
+           */
+          notify: async (playerId, body) => {
+            const notificationId = uuidv7();
+            await insertNotification(tx, { id: notificationId, playerId, body });
+            const [target] = await tx
+              .select({ username: players.username })
+              .from(players)
+              .where(eq(players.id, playerId));
+            // Minted here, inside the transaction: a malformed core event now
+            // rolls the whole transaction back instead of surfacing after
+            // commit at flush time, where the facts were already durable.
+            events.push(toCoreEvent({
+              type: "notification.created",
+              actorId: playerId,
+              // "unknown" is the fallback every other event-publishing site
+              // in this codebase uses (gangs/routes.ts).
+              actorName: target?.username ?? "unknown",
+              audience: { kind: "player", playerId },
+              notificationId,
+              body,
+            }));
+          },
+          events: {
+            publish: async (event) => { events.push(toEnvelope(options.pluginId, event)); },
+            publishCore: async (event) => { events.push(toCoreEvent(event)); },
+          },
+          jobs: {
+            /**
+             * The transactional twin of `ctx.jobs.enqueue` (below): the job's
+             * outbox row commits WITH the facts, so a crash can never leave
+             * committed state that no worker will ever act on — the window
+             * the three post-commit enqueue sites used to paper over with
+             * hand-written compensations. The seed and jobId are minted here,
+             * synchronously, so the caller can echo the jobId in its response
+             * exactly as before, and a dispatcher re-delivery re-adds the
+             * same BullMQ job id as a no-op.
+             */
+            enqueue: async (name, data) => {
+              // No queue-existence check here, unlike ctx.jobs below: the
+              // outbox row commits with the facts and DELIVERY decides — a
+              // queue that does not exist (plugin not loaded, a typo'd job
+              // name) is dropped loudly by the dispatcher rather than thrown
+              // mid-transaction, where it would roll back committed gameplay.
+              // economy-invariant's empty-queues construction depends on
+              // exactly that: the hire debits, the resolve is logged-lost.
+              const jobId = uuidv7();
+              jobs.push({
+                id: jobId, kind: "job",
+                payload: { pluginId: options.pluginId, jobName: name, data, seed: newSeed() },
+              });
+              return jobId;
+            },
+          },
+        };
+        const value = await fn(pluginTx);
+
+        // The outbox insert: every buffered side effect becomes durable IN
+        // this transaction, atomically with the facts it describes. On
+        // rollback none of this executes — the buffers die with the closure,
+        // exactly the discard semantics the in-memory flush had (NOTES.md
+        // rule 5 holds: nothing is PUBLISHED inside the transaction). The
+        // rows are assigned to the outer binding so the post-commit fast
+        // path delivers — and deletes — exactly what was inserted, ids and
+        // all: a mismatched id would leave the row stranded for the
+        // dispatcher to double-deliver.
+        if (events.length > 0 || scores.size > 0 || jobs.length > 0) {
+          outboxRows = [
+            // Scores first, then events — the order the pre-outbox flush
+            // used ("the order game/crimes/worker.ts uses"), so a client
+            // reacting to an event still finds the leaderboard already
+            // written. The dispatcher's recovery ordering is by id, which
+            // interleaves the two — acceptable on the degraded path.
+            ...[...scores.values()].map((entry) => ({
+              id: uuidv7(),
+              kind: "score",
+              payload: {
+                leaderboard: entry.kind,
+                playerId: entry.playerId,
+                // Decimal string, never a JSON number — money rules apply to
+                // the outbox payload too.
+                score: entry.score.toString(),
+                prefix: deps.leaderboardPrefix,
+              },
+            })),
+            ...events.map((event) => ({ id: event.id, kind: "event", payload: event })),
+            ...jobs,
+          ];
+          await tx.insert(outbox).values(outboxRows);
+        }
+        return value;
+      });
+
+      // Only reached on commit (a throw above leaves `outboxRows` empty and
+      // the delivery below a no-op). The rows are already durable — this
+      // flush is the LATENCY path, identical in shape to the pre-outbox
+      // publish-after-commit, not the durability path: anything it cannot
+      // deliver, the outbox dispatcher retries with backoff. That is why it
+      // no longer throws — the old let-it-500 stance existed because a
+      // failed flush was a lost event, and now it is a delayed one. The
+      // player's work is committed and WILL be heard about.
+      await deliverAndClear(deps.db, outboxDispatchDeps, outboxRows);
+      return result;
+    },
+
+    // Delegates to the core helpers rather than re-deriving the key, so a
+    // ported module's Redis keys are unchanged and `SET NX EX` stays the
+    // only write shape available (NOTES.md rule 2 — there is no read-then-
+    // write pair on this surface to misuse).
+    cooldown: {
+      acquire: (action, playerId, ttlSeconds) =>
+        acquireCooldown(deps.redis, cooldownKey(playerId, action), ttlSeconds),
+      peek: (action, playerId) =>
+        peekCooldown(deps.redis, cooldownKey(playerId, action)),
+      release: (action, playerId) =>
+        releaseCooldown(deps.redis, cooldownKey(playerId, action)),
+    },
+    jobs: {
+      // The immediate, outside-a-transaction enqueue. For enqueueing FROM a
+      // transaction, `tx.jobs.enqueue` (above) is the right tool: it commits
+      // the job with the facts via the outbox instead of racing a fast
+      // worker against an uncommitted state change.
+      enqueue: async (name, data) => {
+        const queue = deps.queues.get(`${options.pluginId}:${name}`);
+        if (queue === undefined) throw new Error(`plugin "${options.pluginId}" has no job "${name}"`);
+        // The seed is generated here, at enqueue time (spec: ctx API), so a
+        // retry replays the same seed and the outcome is reproducible.
+        const job = await queue.add(name, { ...data, seed: newSeed() });
+        return String(job.id);
+      },
+    },
+
+    filters: {
+      apply: (point, value) => runFilterChain(options.filters, point, ctxFor, value),
+    },
+    settings: {
+      get: (key) => deps.settings[`${options.pluginId}.${key}`] ?? null,
+    },
+    propertyTypes: {
+      get: (id) => options.propertyTypes.get(id) ?? null,
+      list: () => [...options.propertyTypes.values()],
+    },
+    venues: { has: (locationId, venue) => venueExists(deps.db, options.installedPluginIds, locationId, venue) },
+    attributePools: {
+      get: (pool) => options.attributePools.get(pool) ?? null,
+      list: () => [...options.attributePools.values()],
+    },
+    installedPluginIds: options.installedPluginIds,
+    progression: options.progression ?? (options.expRouter ? "level" : "exp"),
+    assetSlots: {
+      get: (scope, slot) => options.assetSlots.get(slotKey(scope, slot)) ?? null,
+      list: () => [...options.assetSlots.values()],
+    },
+    worldHooks: {
+      list: () => [...(options.worldHooks ?? [])],
+    },
+    assets: {
+      resolve: (scope, entityIds, slot) => resolveAssets(deps.db, deps.assetDriver, scope, entityIds, slot),
+      mine: (entityIds, slot) => resolveAssets(deps.db, deps.assetDriver, options.pluginId, entityIds, slot),
+      singleton: (scope, slot) => resolveSingletonAsset(deps.db, deps.assetDriver, scope, slot),
+    },
+    log: {
+      info: (message, fields) => console.log({ plugin: options.pluginId, ...fields }, message),
+      warn: (message, fields) => console.warn({ plugin: options.pluginId, ...fields }, message),
+      error: (message, fields) => console.error({ plugin: options.pluginId, ...fields }, message),
+    },
+  };
+  return ctx;
+}
+
+/**
+ * Read inside the transaction, so the buffered score is the one the
+ * transaction is about to commit rather than whatever a concurrent writer
+ * leaves behind. `addExp` returns void and `applyExpAndRankUp` returns only
+ * the promotion, so there is nothing to buffer without this read.
+ */
+async function freshStats(tx: Tx, playerId: string): Promise<{ exp: bigint; cash: bigint; level: number } | undefined> {
+  const [row] = await tx
+    .select({ exp: playerStats.exp, cash: playerStats.cash, level: playerStats.level })
+    .from(playerStats)
+    .where(eq(playerStats.playerId, playerId));
+  return row;
+}
+
+/** Narrows the SDK's `string` to core's `GangPermission` without a cast. */
+function isGangPermission(value: string): value is GangPermission {
+  return GANG_PERMISSIONS.some((permission) => permission === value);
+}
+
+/**
+ * Spec 2026-09-21 town-venues §2: the row IS the venue. Raw SQL by table
+ * name — core never imports a plugin's schema — and false without the
+ * `properties` plugin installed or on a malformed `locationId` (never a
+ * 500 from a bad id reaching Postgres).
+ */
+async function venueExists(exec: Db | Tx, installed: ReadonlySet<string>, locationId: string, venue: string): Promise<boolean> {
+  if (!installed.has("properties")) return false;
+  if (!IdSchema.safeParse(locationId).success) return false;
+  const rows = await exec.execute(
+    sql`select 1 from p_properties_properties where location_id = ${locationId} and plugin_id = ${venue} limit 1`,
+  );
+  return [...rows].length > 0;
+}
+
+/**
+ * `pool`/`attr` arrive as SDK-typed `Pool`/`TrainedAttr`, but nothing
+ * zod-validates them between a plugin route body and `spend`/`grant`/
+ * `setMax`/`train` below — an out-of-union string is a live runtime
+ * possibility, not just a type-level one. Without a `default` case, each
+ * switch fell through silently: the action ran, matched no case, and
+ * returned as if it had succeeded — a free action, unspent and unlogged.
+ * This throws instead, and doubles as a compile-time exhaustiveness check:
+ * TS only accepts `value` as `never` once every real case above is already
+ * handled, so deleting a case without updating the switch is a type error
+ * here too, not just a silent runtime gap.
+ */
+function assertUnreachableAttribute(code: string, value: never): never {
+  throw new PluginError(code, 400, { value: String(value) });
+}
+
+/**
+ * `id`/`at` are built exactly as core's own emitters built them — uuidv7 and
+ * an ISO string — so a plugin event is indistinguishable in shape from a
+ * core one on the wire.
+ */
+function toEnvelope(pluginId: string, event: PluginEventInput): GameEvent {
+  return {
+    id: uuidv7(),
+    at: new Date().toISOString(),
+    actorId: event.actorId,
+    actorName: event.actorName,
+    audience: event.audience,
+    type: "plugin.event",
+    pluginId,
+    name: event.name,
+    payload: event.payload,
+  };
+}
+
+/**
+ * `id`/`at` are built exactly as `toEnvelope` and core's own emitters build
+ * them. The `GameEventSchema.parse` is what supplies the `GameEvent` return
+ * type without a cast — `Omit` distributed over a union does not spread back
+ * into the union by inference, and `apps/*` prefers a zod parse to a cast.
+ * `publishEvent` parses again; that second parse is a few microseconds and
+ * buys the type honesty here.
+ */
+function toCoreEvent(event: CoreEventInput): GameEvent {
+  return GameEventSchema.parse({ id: uuidv7(), at: new Date().toISOString(), ...event });
+}

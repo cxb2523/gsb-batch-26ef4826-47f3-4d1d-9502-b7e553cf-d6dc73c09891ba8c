@@ -1,0 +1,266 @@
+/* ---- Ledger lines ---------------------------------------------------------
+   A list of things — crimes, players, items, mail — is a column in the books:
+   hairline-ruled entries, no boxes inside boxes. The current entry gets a
+   brass margin tick, the way a clerk marks the line they are on. */
+.rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.65rem 0.6rem;
+  border-top: 1px solid var(--line-soft);
+  border-radius: 2px;
+  background: transparent;
+  transition: background-color var(--dur-fast);
+}
+.rows > .row:first-child { border-top: 0; }
+.row:hover { background: color-mix(in oklab, var(--fg) 3%, transparent); }
+.rowCurrent { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent), inset 14px 0 18px -14px var(--accent-glow); }
+/* In a narrow panel — a phone, or beside the sidebar — a row's lead cell
+   takes the whole first line and the figures and buttons regroup on the
+   next, left-aligned, instead of five cells fighting for 340px and a
+   button's label being cut mid-figure. */
+@container (max-width: 560px) {
+  .row { flex-wrap: wrap; justify-content: flex-start; gap: 0.5rem 0.6rem; }
+  .row > :first-child { flex: 1 1 100%; min-width: 0; }
+  .row > span { white-space: nowrap; font-size: 0.92rem; }
+  .row > button { flex: 0 0 auto; padding: 0.38rem 0.6rem 0.34rem; font-size: 0.8rem; letter-spacing: 0.06em; }
+}
+.rowLead { display: flex; align-items: center; gap: 0.75rem; }
+.rowLead > img, .rowLead > span:first-child { flex-shrink: 0; }
+/* Middle cell of an image · text · button row: absorb the free space so the
+   text left-aligns beside the image instead of floating centered (space-
+   between treats three children as evenly spread otherwise). */
+.rowGrow { flex: 1; min-width: 0; }
+.meta { color: var(--muted); font-size: 0.88rem; }
+.muted { color: var(--muted); }
+/* The page's headline figure — cash on hand, a bounty, a bank balance — set
+   in the ledger face at display size. Proportional-looking enough at 500
+   weight that it does not need the tabular override switched off. */
+.big {
+  font: 500 2.1rem/1.1 var(--font-mono);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+/* Gangster preset: the figure itself is gold plate — the badge's ".LAND"
+   treatment — and the words beside it stay plain type. */
+:global([data-theme="gangster"]) .big > span:first-child {
+  color: transparent;
+  background: var(--gold);
+  -webkit-background-clip: text;
+  background-clip: text;
+  filter: drop-shadow(0 1px 0 color-mix(in oklab, black 70%, transparent)) drop-shadow(0 0 14px var(--accent-soft));
+}
+.big .meta, .big > span:not(:first-child) { font-family: var(--font-body); letter-spacing: 0; }
+
+.form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+
+/*
+ * PageRenderer's <form>, and only it — the hand-written pages that wear `.form`
+ * (ProfileCard's stat row, Login) are layout rows, not forms, and boxing them
+ * would be a change nobody asked for.
+ *
+ * `align-items: end` rather than `center`: `.field` is a grid that stacks its
+ * label above the input, so a centred submit button floats between the two
+ * lines instead of sitting on the inputs' baseline. That misalignment is why
+ * the travel section's "Add town" button read as stray chrome under the town
+ * table and got missed entirely. The border makes each form its own control
+ * group, so a page with three of them (add / update / assign) shows three
+ * boxes rather than one run of loose inputs.
+ */
+.formCard {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: end;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--surface-sunk);
+}
+
+/* The rank bar and its kin: a sunk track, a brass fill with a lit top edge. */
+.bar {
+  height: 10px;
+  border-radius: 2px;
+  background: var(--surface-sunk);
+  box-shadow: 0 1px 2px color-mix(in oklab, black 50%, transparent) inset;
+  overflow: hidden;
+  margin: 0.6rem 0;
+}
+.barFill {
+  position: relative;
+  overflow: hidden;
+  height: 100%;
+  background: var(--gold-gloss), var(--gold);
+  box-shadow: 0 0 10px var(--accent-glow);
+  transition: width var(--dur) var(--ease-out);
+}
+.barFill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, color-mix(in oklab, white 45%, transparent) 50%, transparent 70%);
+  transform: translateX(-100%);
+  animation: sweep 4s ease-in-out infinite;
+}
+@keyframes sweep { 0%, 60% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+
+.tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }
+
+/* Write/Preview markdown editor (components/MarkdownEditor.tsx). */
+.editor { display: grid; gap: 0.25rem; }
+.editor .tabs { margin-bottom: 0; }
+.editorTools { display: flex; gap: 0.25rem; margin-left: auto; }
+.editorTools button { min-width: 2rem; }
+.tabActive { background: var(--gold-gloss), var(--gold); color: var(--ink-on-accent); border-color: var(--accent-lo); box-shadow: var(--shadow-press), 0 0 12px var(--accent-soft); }
+.tabIdle {
+  background: var(--surface-sunk);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  box-shadow: none;
+}
+.tabIdle::after, .chip::after { display: none; }
+.tabIdle:hover:not(:disabled) { filter: none; color: var(--fg); border-color: var(--line-strong); box-shadow: none; }
+
+.table { width: 100%; border-collapse: collapse; }
+.table th {
+  text-align: left;
+  color: var(--muted);
+  font: 700 0.72rem/1.2 var(--font-display);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 0.4rem 0.5rem 0.45rem;
+  border-bottom: 1px solid var(--line-strong);
+}
+.table td { padding: 0.45rem 0.5rem; border-top: 1px solid var(--line-soft); font-variant-numeric: tabular-nums; }
+.table tbody tr:first-child td { border-top: 0; }
+.table tbody tr:hover td { background: color-mix(in oklab, var(--fg) 3%, transparent); }
+.numeric { text-align: right; font-family: var(--font-mono); }
+.self { color: var(--accent); }
+
+/* Player-written text (mail bodies, bios, news). pre-wrap keeps the author's
+   line breaks; break-word stops a 5000-character unbroken string from
+   widening the whole layout. */
+.prose { white-space: pre-wrap; overflow-wrap: break-word; margin: 0.5rem 0 0; }
+
+/* Rendered-markdown container (components/Markdown.tsx). No pre-wrap — the
+   text's own newlines are already <br>/<p> by the time it gets here, and
+   pre-wrap would render marked's formatting newlines as phantom blank lines. */
+.markdown { overflow-wrap: break-word; margin: 0.5rem 0 0; }
+.markdown p { margin: 0 0 0.5rem; }
+.markdown p:last-child { margin-bottom: 0; }
+.markdown blockquote {
+  margin: 0 0 0.5rem;
+  padding: 0.1rem 0 0.1rem 0.75rem;
+  border-left: 3px solid var(--accent-lo);
+  opacity: 0.85;
+}
+.markdown ul, .markdown ol { margin: 0 0 0.5rem; padding-left: 1.5rem; }
+.markdown code { font-family: var(--font-mono); font-size: 0.88em; background: var(--surface-sunk); padding: 0 0.25em; border-radius: 2px; }
+.markdown pre { overflow-x: auto; background: var(--surface-sunk); padding: 0.6rem 0.8rem; border-radius: var(--radius); }
+.markdown pre code { background: none; padding: 0; }
+.markdown img { max-width: 100%; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  font-size: 1em;
+  margin: 0 0 0.5rem;
+}
+
+.stack { display: grid; gap: 1rem; }
+.rowStack { display: grid; gap: 0.25rem; min-width: 0; }
+.actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+/* A table row action's armed confirm (plugins/PageRenderer TableBlock): the
+   question, then Confirm / Cancel as one `.actions` run beneath it. The
+   min-width stops a narrow action column folding the sentence into a word
+   per line; the table's own width takes the rest. */
+.confirm { display: grid; gap: 0.35rem; min-width: min(16rem, 70vw); }
+/* A vertical run of control groups. `Panel` puts no space between its
+   children, so the casino table's bet row, hand actions and Leave button sat
+   flush against each other and against the cards above them. `justify-items:
+   start` keeps each group its own width rather than stretching a lone button
+   across the panel. */
+.controls { display: grid; gap: 0.75rem; justify-items: start; margin-top: 0.75rem; }
+.chips { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+/* Also worn by <button> for the editable permission chips, so it has to undo
+   theme.css's brass-plate button — muted text on that fill is unreadable and
+   .chipOn's accent text on it is invisible. Same shape as Login's .toggle. */
+.chip {
+  font: 500 0.74rem/1.5 var(--font-mono);
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 0.05rem 0.5rem;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--muted);
+  white-space: nowrap;
+  box-shadow: none;
+}
+.chipOn { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.unread { box-shadow: inset 3px 0 0 var(--accent); }
+.link { color: var(--accent); text-decoration: none; }
+.link:hover { text-decoration: underline; }
+.field { display: grid; gap: 0.25rem; }
+.field textarea { min-height: 6rem; resize: vertical; font: inherit; }
+.ok { color: var(--success); }
+.bad { color: var(--danger); }
+.danger { border: 1px solid var(--danger); border-radius: 6px; padding: 0.75rem; }
+.dangerButton { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+/*
+ * A row of hands, side by side — the casino table's other seats. `--card-w` is
+ * the single knob the card CSS reads (theme.css); setting it on the wrapper is
+ * what shrinks a whole hand without touching PlayingCard.
+ *
+ * The sizes are chosen so four opponents fit on ONE line. The content column is
+ * 803px inside a Panel on the default top-nav layout (1180 shell − 2rem padding
+ * = 1148; minus the 1.5rem body gap and the sidebar's quarter share = 843;
+ * minus the panel's 1.25rem side padding twice), and 642px under the left-nav
+ * sidebar. A `handSm` hand of five cards is 5×32 + 4×4 = 176px, so four of them
+ * plus three 0.75rem gaps is 740px — inside 803. Four four-card hands are 596px,
+ * inside 642 as well. A fifth seat, or five cards each in sidebar mode, wraps to
+ * a second line rather than overflowing.
+ */
+.handRow { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-start; }
+.handFigure { display: grid; gap: 0.25rem; justify-items: start; margin: 0; }
+.handSm { --card-w: 32px; }
+/* The value in theme.css's :root — restated so `md` is an explicit choice and
+   not "whatever the page happens to inherit". */
+.handMd { --card-w: 56px; }
+.handLg { --card-w: 76px; }
+
+/* A list of things the player can SEE but not act on from here — the casino's
+   other towns. Dimmed rather than hidden: knowing where the action is is the
+   point, and the only control offered is the Travel link beside the list. */
+.remote { opacity: 0.55; }
+
+/* A keyValue label carrying a pool glyph (PageRenderer's PoolLabel). */
+.iconLabel { display: inline-flex; align-items: center; gap: 0.3rem; }
+.iconLabel svg { color: color-mix(in oklab, var(--accent) 65%, var(--muted)); flex: none; }
+
+
+.productOptions { display: grid; gap: 0.75rem; }
+.productOption {
+  display: flex; align-items: center; gap: 1rem; padding: 1rem;
+  border: 1px solid var(--border, #454545); border-radius: 8px; cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+}
+.productOption:hover, .productOption:has(input:checked) {
+  border-color: var(--accent, #c9a65c); background: rgba(201, 166, 92, 0.08);
+}
+.productOption:focus-within { outline: 2px solid var(--accent, #c9a65c); outline-offset: 2px; }
+.productOption input[type="radio"] { width: auto; flex: 0 0 auto; accent-color: var(--accent, #c9a65c); }
+.productDetails { display: grid; gap: 0.25rem; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.productPrice { display: grid; gap: 0.25rem; text-align: right; }
+.productPrice s { opacity: 0.65; font-size: 0.875em; }
+
+.formCard:has(.productOptions) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.formCard:has(.productOptions) > button[type="submit"] {
+  justify-self: start;
+  margin-top: 0.75rem;
+}
