@@ -2,28 +2,132 @@
 // The arena editor: draw collision shapes over your real wall.
 // Tools: select/move/resize, box, circle, wall (angled), spawns, erase.
 
+const HISTORY_LIMIT = 50; // undo steps kept (the editor promises at least 30)
+
 const Editor = {
   tool: 'select',
   selected: null,
   drag: null,
-  history: [],
+  past: [],    // serialized pre-change states (undo stack)
+  future: [],  // serialized states to re-apply on redo
+  _pending: null,   // { data, full } captured at the start of an in-progress change
+  _coalesceT: 0,    // debounce timer for keyboard bursts (nudge / rotate)
   polyDraft: null, // absolute [x,y] points while outlining a polygon
   cursor: null,
 
-  snapshot() {
-    this.history.push(JSON.stringify({ shapes: ArenaStore.current.shapes, spawns: ArenaStore.current.spawns }));
-    if (this.history.length > 50) this.history.shift();
+  // Serializable arena data that undo/redo should track. showGeo/heads/corners
+  // are view settings, not layout edits, so they stay out of history.
+  _data() {
+    const a = ArenaStore.current;
+    return { shapes: a.shapes, spawns: a.spawns, playerScale: a.playerScale };
+  },
+  _dataJSON() { return JSON.stringify(this._data()); },
+  _fullJSON() {
+    const a = ArenaStore.current;
+    return JSON.stringify(Object.assign(this._data(), {
+      sel: this.selected ? a.shapes.indexOf(this.selected) : -1,
+    }));
+  },
+
+  // Start a change. Nested calls within one gesture keep the first baseline so
+  // a whole drag (many pointermove events) collapses to a single undo step.
+  // `focus` is the shape the action targets; it is re-selected when this state
+  // is later restored, so undo keeps the property panel on that object.
+  begin(focus) {
+    if (this._pending) return;
+    const a = ArenaStore.current;
+    const target = focus !== undefined ? focus : this.selected;
+    const idx = target ? a.shapes.indexOf(target) : -1;
+    this._pending = {
+      data: this._dataJSON(),
+      full: JSON.stringify(Object.assign(this._data(), { sel: idx })),
+    };
+  },
+  // Finish a change: push the pre-change state only if the data actually moved.
+  // Selection-only changes don't create history entries.
+  commit() {
+    if (!this._pending) return;
+    const p = this._pending;
+    this._pending = null;
+    if (p.data === this._dataJSON()) return;
+    this.past.push(p.full);
+    if (this.past.length > HISTORY_LIMIT) this.past.shift();
+    this.future.length = 0;
+    this.updateHistoryUI();
+  },
+  // Commit any debounced keyboard burst, then open a fresh transaction. Used by
+  // discrete actions so they don't merge with a preceding nudge/rotate burst.
+  beginNew(focus) {
+    this.flushCoalesce();
+    this.begin(focus);
+  },
+  flushCoalesce() {
+    if (this._coalesceT) { clearTimeout(this._coalesceT); this._coalesceT = 0; }
+    this.commit();
+  },
+  scheduleCommit() {
+    if (this._coalesceT) clearTimeout(this._coalesceT);
+    this._coalesceT = setTimeout(() => { this._coalesceT = 0; this.commit(); }, 450);
+  },
+  clearHistory() {
+    this.past.length = 0;
+    this.future.length = 0;
+    this._pending = null;
+    if (this._coalesceT) { clearTimeout(this._coalesceT); this._coalesceT = 0; }
+    this.updateHistoryUI();
+  },
+  updateHistoryUI() {
+    const u = document.getElementById('btnUndo');
+    const r = document.getElementById('btnRedo');
+    if (u) u.disabled = this.past.length === 0;
+    if (r) r.disabled = this.future.length === 0;
+  },
+
+  _restore(raw) {
+    const d = JSON.parse(raw);
+    const a = ArenaStore.current;
+    a.shapes = Array.isArray(d.shapes) ? d.shapes : [];
+    if (Array.isArray(d.spawns)) a.spawns = d.spawns;
+    if (typeof d.playerScale === 'number') a.playerScale = d.playerScale;
+    this.polyDraft = null;
+    this.drag = null;
+    this._pending = null; // a half-open gesture must not straddle a restore
+    this._scaleActive = false;
+    this._propActive = null;
+    // Don't leave a property field focused on a stale value: updateProps skips
+    // the focused element, so drop focus first so the panel tracks the restore.
+    const af = document.activeElement;
+    if (af && af.closest && af.closest('#props')) af.blur();
+    // Selection always comes from the restored array, never a stale object.
+    const idx = typeof d.sel === 'number' ? d.sel : -1;
+    this.selected = (idx >= 0 && a.shapes[idx]) ? a.shapes[idx] : null;
+    if (G.state === 'play') G.resetToEdit(); // never leave a live match on old geometry
+    ArenaStore.save();
+    this.syncUI();
+    this.updateProps();
   },
   undo() {
-    const raw = this.history.pop();
-    if (!raw) return;
-    const d = JSON.parse(raw);
-    ArenaStore.current.shapes = d.shapes;
-    ArenaStore.current.spawns = d.spawns;
-    this.selected = null;
-    this.drag = null;
-    ArenaStore.save();
-    this.updateProps();
+    this.flushCoalesce();
+    if (!this.past.length) {
+      if (G.state === 'play') G.resetToEdit(); // Ctrl+Z in play always returns to a clean editor
+      return false;
+    }
+    this.future.push(this._fullJSON());
+    this._restore(this.past.pop());
+    this.updateHistoryUI();
+    return true;
+  },
+  redo() {
+    this.flushCoalesce();
+    if (!this.future.length) {
+      if (G.state === 'play') G.resetToEdit();
+      return false;
+    }
+    this.past.push(this._fullJSON());
+    if (this.past.length > HISTORY_LIMIT) this.past.shift();
+    this._restore(this.future.pop());
+    this.updateHistoryUI();
+    return true;
   },
 
   init() {
@@ -34,32 +138,51 @@ const Editor = {
       btn.addEventListener('pointerdown', e => e.preventDefault()); // keep focus off buttons
     });
     document.getElementById('btnClear').addEventListener('click', () => {
-      if (ArenaStore.current.shapes.length) this.snapshot();
+      this.beginNew();
       ArenaStore.current.shapes = [];
       this.selected = null;
+      this.commit();
       ArenaStore.save();
+      this.updateProps();
     });
     document.getElementById('btnDemo').addEventListener('click', () => {
-      this.snapshot();
+      this._pending = null; // don't fold the demo swap into an undo step
       ArenaStore.current = ArenaStore.demo();
       this.selected = null;
+      this.drag = null;
+      this.polyDraft = null;
       ArenaStore.save();
       this.syncUI();
+      this.updateProps();
+      this.clearHistory(); // new layout: no undo across arenas
     });
     document.getElementById('btnExport').addEventListener('click', () => ArenaStore.export());
     document.getElementById('btnImport').addEventListener('click', () => document.getElementById('importFile').click());
     document.getElementById('importFile').addEventListener('change', e => {
       if (e.target.files[0]) {
-        this.snapshot();
-        ArenaStore.import(e.target.files[0], () => { this.selected = null; this.syncUI(); });
+        ArenaStore.import(e.target.files[0], () => {
+          this.selected = null;
+          this.drag = null;
+          this.polyDraft = null;
+          this.clearHistory(); // imported layout: start a fresh history
+          this.syncUI();
+          this.updateProps();
+        });
       }
       e.target.value = '';
     });
     document.getElementById('scale').addEventListener('input', e => {
+      if (!this._scaleActive) { this.beginNew(); this._scaleActive = true; } // whole slider drag = one step
       ArenaStore.current.playerScale = parseFloat(e.target.value);
       ArenaStore.save();
       document.getElementById('scaleVal').textContent = Number(ArenaStore.current.playerScale).toFixed(2) + 'x';
     });
+    document.getElementById('scale').addEventListener('change', () => {
+      this._scaleActive = false;
+      this.commit();
+    });
+    document.getElementById('btnUndo').addEventListener('click', () => this.undo());
+    document.getElementById('btnRedo').addEventListener('click', () => this.redo());
     // per-player head photos
     Heads.load();
     HeadEditor.init();
@@ -100,15 +223,22 @@ const Editor = {
         if (p && p.catch) p.catch(blocked);
       } catch (e) { blocked(); }
     });
-    // properties panel
+    // properties panel: one history step per focus session / select change,
+    // so typing "42" is a single undo rather than one per keystroke
     const bindProp = (id, apply) => {
       const el = document.getElementById(id);
-      el.addEventListener('focus', () => this.snapshot());
+      el.addEventListener('focus', () => {
+        this._propActive = el;
+        this.beginNew(this.selected);
+      });
+      el.addEventListener('blur', () => {
+        if (this._propActive === el) { this._propActive = null; this.commit(); }
+      });
       el.addEventListener('input', () => {
         const s = this.selected;
         if (!s) return;
         const v = parseFloat(el.value);
-        if (!isNaN(v)) { apply(s, v); ArenaStore.save(); }
+        if (!isNaN(v)) { this.begin(); apply(s, v); ArenaStore.save(); }
       });
     };
     bindProp('pX', (s, v) => { s.x = v; });
@@ -120,9 +250,10 @@ const Editor = {
     document.getElementById('pKind').addEventListener('change', e => {
       const s = this.selected;
       if (!s) return;
-      this.snapshot();
+      this.beginNew(s);
       if (e.target.value === 'solid') delete s.k;
       else s.k = e.target.value;
+      this.commit();
       ArenaStore.save();
     });
     document.getElementById('pDup').addEventListener('click', () => this.duplicate());
@@ -133,7 +264,15 @@ const Editor = {
 
     window.addEventListener('pointerdown', e => { this.onDown(e); this.updateProps(); });
     window.addEventListener('pointermove', e => this.onMove(e));
-    window.addEventListener('pointerup', () => { this.drag = null; });
+    // ending a gesture commits it as a single undo step
+    const endDrag = () => {
+      if (!this.drag) return;
+      this.drag = null;
+      this.commit();
+      this.updateProps();
+    };
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
     // double-click a selected polygon's edge to insert a corner there
     window.addEventListener('dblclick', e => this.insertVertex(e));
     // right-click a selected polygon's corner to remove it
@@ -152,12 +291,14 @@ const Editor = {
     if (!pts || pts.length < 3) return;
     const cx = pts.reduce((a, q) => a + q[0], 0) / pts.length;
     const cy = pts.reduce((a, q) => a + q[1], 0) / pts.length;
-    this.snapshot();
+    this.beginNew();
     const s = { t: 'p', x: cx, y: cy, pts: pts.map(([x, y]) => [x - cx, y - cy]) };
     ArenaStore.current.shapes.push(s);
+    this.selected = s; // ready for corner tweaking (part of the same step)
+    this.commit();
     ArenaStore.save();
     this.setTool('select');
-    this.selected = s; // ready for corner tweaking
+    this.selected = s; // setTool cleared it; keep the new shape selected
     this.updateProps();
   },
   cancelPoly() { this.polyDraft = null; },
@@ -192,8 +333,9 @@ const Editor = {
       if (d2 < bestD2) { bestD2 = d2; best = i; }
     }
     if (best < 0) return;
-    this.snapshot();
+    this.beginNew();
     s.pts.splice(best, 0, [p.x - s.x, p.y - s.y]);
+    this.commit();
     ArenaStore.save();
     this.updateProps();
   },
@@ -204,8 +346,9 @@ const Editor = {
     const p = this.world(e);
     const i = this.vertexAt(s, p.x, p.y);
     if (i < 0) return false;
-    this.snapshot();
+    this.beginNew();
     s.pts.splice(i, 1);
+    this.commit();
     ArenaStore.save();
     this.updateProps();
     return true;
@@ -214,10 +357,11 @@ const Editor = {
   deleteSelected() {
     const s = this.selected;
     if (!s) return;
-    this.snapshot();
+    this.beginNew();
     const i = ArenaStore.current.shapes.indexOf(s);
     if (i >= 0) ArenaStore.current.shapes.splice(i, 1);
     this.selected = null;
+    this.commit();
     ArenaStore.save();
     this.updateProps();
   },
@@ -225,12 +369,13 @@ const Editor = {
   duplicate() {
     const s = this.selected;
     if (!s) return;
-    this.snapshot();
+    this.beginNew();
     const c = JSON.parse(JSON.stringify(s));
     c.x = clamp(c.x + 24, 0, W);
     c.y = clamp(c.y + 24, 0, H);
     ArenaStore.current.shapes.push(c);
     this.selected = c;
+    this.commit();
     ArenaStore.save();
     this.updateProps();
   },
@@ -271,9 +416,11 @@ const Editor = {
     document.getElementById('scale').value = ArenaStore.current.playerScale;
     document.getElementById('scaleVal').textContent = Number(ArenaStore.current.playerScale).toFixed(2) + 'x';
     document.getElementById('showGeo').checked = !!ArenaStore.current.showGeo;
+    this.updateHistoryUI();
   },
 
   setTool(t) {
+    this.flushCoalesce(); // close any open gesture before switching modes
     this.tool = t;
     this.selected = null;
     this.polyDraft = null;
@@ -302,15 +449,15 @@ const Editor = {
       if (this.selected) {
         if (this.selected.t === 'p') {
           const vi = this.vertexAt(this.selected, p.x, p.y);
-          if (vi >= 0) { this.snapshot(); this.drag = { mode: 'vertex', vi }; return; }
+          if (vi >= 0) { this.beginNew(this.selected); this.drag = { mode: 'vertex', vi }; return; }
         }
         const h = this.handlePos(this.selected);
-        if (h && dist2(p.x, p.y, h.x, h.y) < 14 * 14) { this.snapshot(); this.drag = { mode: 'resize' }; return; }
+        if (h && dist2(p.x, p.y, h.x, h.y) < 14 * 14) { this.beginNew(this.selected); this.drag = { mode: 'resize' }; return; }
       }
       for (let i = 0; i < 2; i++) { // spawn markers are draggable too
         const [sx, sy] = ArenaStore.current.spawns[i];
         if (dist2(p.x, p.y, sx, sy) < 18 * 18) {
-          this.snapshot();
+          this.beginNew(null); // no shape selected while dragging a spawn
           this.selected = null;
           this.drag = { mode: 'spawn', idx: i };
           return;
@@ -318,35 +465,39 @@ const Editor = {
       }
       for (let i = shapes.length - 1; i >= 0; i--) {
         if (pointInShape(p.x, p.y, shapes[i], 2)) {
-          this.snapshot();
+          this.beginNew(shapes[i]);
           this.selected = shapes[i];
           this.drag = { mode: 'move', ox: p.x - shapes[i].x, oy: p.y - shapes[i].y };
           return;
         }
       }
       this.selected = null;
+      this.updateProps();
     } else if (this.tool === 'erase') {
       for (let i = shapes.length - 1; i >= 0; i--) {
         if (pointInShape(p.x, p.y, shapes[i], 2)) {
-          this.snapshot();
+          this.beginNew(shapes[i]); // undo re-selects what was erased
           if (shapes[i] === this.selected) this.selected = null;
           shapes.splice(i, 1);
+          this.commit();
           ArenaStore.save();
           return;
         }
       }
     } else if (this.tool === 'spawn1' || this.tool === 'spawn2') {
-      this.snapshot();
+      this.beginNew(null);
       ArenaStore.current.spawns[this.tool === 'spawn1' ? 0 : 1] = [p.x, p.y];
+      this.commit();
       ArenaStore.save();
     } else {
-      this.snapshot();
+      this.beginNew();
       let s;
       if (this.tool === 'box') s = { t: 'b', x: p.x, y: p.y, w: 10, h: 10, a: 0 };
       else if (this.tool === 'circle') s = { t: 'c', x: p.x, y: p.y, r: 6 };
       else s = { t: 'b', x: p.x, y: p.y, w: 12, h: 10, a: 0 }; // wall
       shapes.push(s);
       this.selected = s;
+      // the create gesture stays open until pointerup so the whole drag is one step
       this.drag = { mode: 'create', sx: p.x, sy: p.y, kind: this.tool };
     }
   },
@@ -398,32 +549,43 @@ const Editor = {
   key(e) {
     if (G.state !== 'edit' || Calib.active) return;
     if (this.polyDraft && (e.code === 'Backspace' || e.code === 'Delete')) { this.popDraftPoint(); return; }
-    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ') { this.undo(); return; }
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ') {
+      if (e.preventDefault) e.preventDefault();
+      if (e.shiftKey) this.redo(); else this.undo();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyY') {
+      if (e.preventDefault) e.preventDefault();
+      this.redo();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.code === 'KeyD') {
       if (e.preventDefault) e.preventDefault(); // don't bookmark
       this.duplicate();
       return;
     }
     const tools = { KeyV: 'select', KeyB: 'box', KeyO: 'circle', KeyW: 'wall', KeyP: 'poly', KeyX: 'erase', Digit1: 'spawn1', Digit2: 'spawn2' };
-    if (!e.ctrlKey && !e.metaKey && tools[e.code]) { this.setTool(tools[e.code]); return; }
+    if (!e.ctrlKey && !e.metaKey && tools[e.code]) { this.flushCoalesce(); this.setTool(tools[e.code]); return; }
     const s = this.selected;
     if (!s) return;
     if (e.code === 'Delete' || e.code === 'Backspace') { this.deleteSelected(); return; }
     const nudge = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.code];
     if (nudge) {
-      if (performance.now() - (this._nudgeT || 0) > 600) this.snapshot(); // one undo step per nudge burst
-      this._nudgeT = performance.now();
+      this.begin(); // a burst of key-repeat moves collapses into one undo step
       const step = e.shiftKey ? 10 : 1;
       s.x += nudge[0] * step;
       s.y += nudge[1] * step;
       ArenaStore.save();
       this.updateProps();
+      this.scheduleCommit();
       return;
     }
     if (s.t === 'b' && (e.code === 'KeyQ' || e.code === 'KeyE')) {
+      this.begin();
       s.a = (s.a || 0) + (e.code === 'KeyE' ? 1 : -1) * Math.PI / 60;
       ArenaStore.save();
       this.updateProps();
+      this.scheduleCommit();
     }
   },
 

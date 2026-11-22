@@ -48,6 +48,19 @@ const G = {
       if (e.code === 'Enter') HeadEditor.apply();
       return;
     }
+    // Undo/redo works in edit and play; in play it first tears the match down.
+    if (this.state !== 'title' && (e.ctrlKey || e.metaKey) && !e.altKey) {
+      if (e.code === 'KeyZ') {
+        e.preventDefault();
+        if (e.shiftKey) Editor.redo(); else Editor.undo();
+        return;
+      }
+      if (e.code === 'KeyY') {
+        e.preventDefault();
+        Editor.redo();
+        return;
+      }
+    }
     if (e.code === 'KeyC' && this.state !== 'title') { this.toggleCalib(); return; }
     if (e.code === 'Escape') {
       if (Calib.active) { this.toggleCalib(); return; }
@@ -69,9 +82,9 @@ const G = {
 
   hintFor(state) {
     return state === 'edit'
-      ? 'Tools V/B/O/W/P/X · arrows nudge · Ctrl+Z undo · Ctrl+D duplicate · Del remove · Q/E rotate · Enter or ▶ fight · C calibrate'
+      ? 'Tools V/B/O/W/P/X · arrows nudge · Ctrl+Z undo · Ctrl+Shift+Z / Ctrl+Y redo · Ctrl+D duplicate · Del remove · Q/E rotate · Enter or ▶ fight · C calibrate'
       : state === 'play'
-        ? 'Esc editor · S/↓ aim down · G geometry ghost · M mute'
+        ? 'Esc editor · Ctrl+Z undo (back to editor) · S/↓ aim down · G geometry ghost · M mute'
         : '';
   },
 
@@ -109,6 +122,20 @@ const G = {
     this.round.num = 0;
     this.startRound();
     this.setState('play');
+  },
+
+  // Undo/redo while a match is running: tear the round down completely so no
+  // bullet, crate, or particle from the old layout survives into the new one,
+  // then hand control back to the editor.
+  resetToEdit() {
+    Weapons.reset();
+    if (this.particles) this.particles.arr.length = 0;
+    this.shake = 0;
+    this.scores = [0, 0];
+    this.round = { phase: 'countdown', t: 1, num: 0, banner: '' };
+    for (const p of this.players) p.reset(0, 0);
+    this.setState('edit');
+    this.flashHint('Back to the editor');
   },
 
   startRound() {

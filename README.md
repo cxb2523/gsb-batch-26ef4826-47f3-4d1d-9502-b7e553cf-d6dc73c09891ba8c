@@ -73,8 +73,15 @@ first to 5 wins the wall.
 
 **Editor keys:** `V` select · `B` box · `O` circle · `W` wall · `P` polygon ·
 `X` erase · `1`/`2` spawn tools · arrows nudge 1px (`Shift` = 10px) ·
-`Ctrl+Z` undo · `Ctrl+D` duplicate · `Del` delete · `Q`/`E` rotate box ·
-`Enter` fight · `Esc` back to editor · `C` calibration · `M` mute.
+`Ctrl+Z` undo · `Ctrl+Shift+Z` / `Ctrl+Y` redo · `Ctrl+D` duplicate · `Del` delete ·
+`Q`/`E` rotate box · `Enter` fight · `Esc` back to editor · `C` calibration · `M` mute.
+
+**Undo/redo:** the last 50 edits are kept (draw, delete, drag, rotate, property
+changes, spawns, stick-figure size), with a whole drag counting as one step.
+Undo/redo follows the selection, and pressing it during a match safely drops the
+round back to the editor — bullets, crates, particles, score and the round timer
+are all cleared so nothing from the old layout leaks into the new one. Importing
+an arena or loading the demo starts a fresh history.
 
 **Polygon editing:** with a polygon selected — drag a corner to move it,
 double-click an edge to add a corner, right-click a corner to remove it.
