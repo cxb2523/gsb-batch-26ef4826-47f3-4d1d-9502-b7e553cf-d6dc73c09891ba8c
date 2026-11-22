@@ -47,9 +47,9 @@ The signal processing pipeline implements broadcast standard loudness measuremen
 
 ```
 index.html          — HTML markup (121 lines)
-css/analyzer.css    — Styles, dark theme, responsive (250 lines)
-js/analyzer.js      — App logic, playback, canvas rendering (776 lines)
-js/worker.js        — DSP Web Worker: FFT, LUFS, peaks, BPM, key (443 lines)
+css/analyzer.css    — Styles, dark theme, responsive (252 lines)
+js/analyzer.js      — App logic, playback, canvas rendering (964 lines)
+js/worker.js        — DSP Web Worker: FFT, LUFS, peaks, BPM, key (554 lines)
 ```
 
 No build step. No bundler. No dependencies.

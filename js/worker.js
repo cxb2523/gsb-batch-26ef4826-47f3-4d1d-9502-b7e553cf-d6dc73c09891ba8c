@@ -3,6 +3,61 @@
 // All signal processing runs off the main thread
 // ══════════════════════════════════════════════════════════════════════════════
 
+// ── Cancellation plumbing ────────────────────────────────────────────────
+// The main thread starts every analysis with a generation id and posts
+// { type: 'cancel', analysisId } when that generation is superseded. The DSP
+// loops run in chunks and await a macrotask between them, which is what lets
+// that cancel message actually be delivered mid-stage. A cancelled job
+// therefore stops within one chunk instead of running the whole chain.
+var currentJob = null;
+var CANCELLED = { cancelled: true };
+
+function makeToken(id) {
+    return { id: id, cancelled: false };
+}
+
+function isCancelled(token) {
+    return !!(token && token.cancelled);
+}
+
+function checkCancelled(token) {
+    if (isCancelled(token)) throw CANCELLED;
+}
+
+// A macrotask yield (not a microtask): worker message events are macrotasks,
+// so only this lets a pending cancel message run.
+var yieldChannel = null;
+var yieldQueue = null;
+if (typeof MessageChannel !== 'undefined') {
+    yieldChannel = new MessageChannel();
+    yieldQueue = [];
+    yieldChannel.port1.onmessage = function() {
+        var resolve = yieldQueue.shift();
+        if (resolve) resolve();
+    };
+}
+
+function yieldTask() {
+    if (yieldChannel) {
+        return new Promise(function(resolve) {
+            yieldQueue.push(resolve);
+            yieldChannel.port2.postMessage(0);
+        });
+    }
+    return new Promise(function(resolve) { setTimeout(resolve, 0); });
+}
+
+async function checkpoint(token) {
+    checkCancelled(token);
+    await yieldTask();
+    checkCancelled(token);
+}
+
+// Work-per-chunk. Small enough that a cancel is noticed quickly, large enough
+// that the yielding overhead stays negligible on long files.
+var CHUNK_MASK = 0xFFFF;   // 65536 samples
+var BLOCK_MASK = 0x3F;     // 64 blocks
+
 // ── FFT (Cooley-Tukey radix-2 in-place) ──────────────────────────────────
 function fft(re, im) {
     var n = re.length, j = 0;
@@ -34,10 +89,11 @@ function fft(re, im) {
 }
 
 // ── Biquad filter ────────────────────────────────────────────────────────
-function biquad(input, b0, b1, b2, a1, a2) {
+async function biquad(input, b0, b1, b2, a1, a2, token) {
     var out = new Float32Array(input.length);
     var x1 = 0, x2 = 0, y1 = 0, y2 = 0;
     for (var i = 0; i < input.length; i++) {
+        if (token && (i & CHUNK_MASK) === 0) await checkpoint(token);
         var x0 = input[i];
         var y0 = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2;
         x2 = x1; x1 = x0; y2 = y1; y1 = y0;
@@ -47,7 +103,7 @@ function biquad(input, b0, b1, b2, a1, a2) {
 }
 
 // ── K-weighting filter (EBU R128 / ITU-R BS.1770) ────────────────────────
-function kWeight(samples, fs) {
+async function kWeight(samples, fs, token) {
     // Stage 1: High-shelf pre-filter
     var f1 = 1681.974450955533, G = 3.999843853973347, Q1 = 0.7071752369554196;
     var A = Math.pow(10, G / 40);
@@ -72,14 +128,18 @@ function kWeight(samples, fs) {
     var s2_a1 = -2 * c2 / a0b;
     var s2_a2 = (1 - alpha2) / a0b;
 
-    var filtered = biquad(samples, s1_b0, s1_b1, s1_b2, s1_a1, s1_a2);
-    return biquad(filtered, s2_b0, s2_b1, s2_b2, s2_a1, s2_a2);
+    var filtered = await biquad(samples, s1_b0, s1_b1, s1_b2, s1_a1, s1_a2, token);
+    checkCancelled(token);
+    return biquad(filtered, s2_b0, s2_b1, s2_b2, s2_a1, s2_a2, token);
 }
 
 // ── LUFS (EBU R128 integrated + short-term + LRA) ────────────────────────
-function computeLUFS(channels, fs) {
+async function computeLUFS(channels, fs, token) {
     var kw = [];
-    for (var c = 0; c < channels.length; c++) kw.push(kWeight(channels[c], fs));
+    for (var c = 0; c < channels.length; c++) {
+        checkCancelled(token);
+        kw.push(await kWeight(channels[c], fs, token));
+    }
 
     var n = kw[0].length;
     var blockSize = Math.round(0.4 * fs);   // 400ms momentary
@@ -90,6 +150,7 @@ function computeLUFS(channels, fs) {
     // Compute block loudness (400ms)
     var blockLoud = new Float32Array(nBlocks);
     for (var b = 0; b < nBlocks; b++) {
+        if ((b & BLOCK_MASK) === 0) await checkpoint(token);
         var s = b * hopSize, ms = 0;
         for (var c = 0; c < kw.length; c++) {
             var sum = 0;
@@ -135,6 +196,7 @@ function computeLUFS(channels, fs) {
     var nSt = Math.floor((n - stSize) / stHop) + 1;
     var stVals = [];
     for (var b = 0; b < nSt; b++) {
+        if ((b & BLOCK_MASK) === 0) await checkpoint(token);
         var s = b * stHop, ms = 0;
         for (var c = 0; c < kw.length; c++) {
             var sum = 0;
@@ -156,16 +218,18 @@ function computeLUFS(channels, fs) {
 }
 
 // ── True Peak (4x Catmull-Rom interpolation) ─────────────────────────────
-function computeTruePeak(channels) {
+async function computeTruePeak(channels, token) {
     var peak = 0;
     for (var c = 0; c < channels.length; c++) {
         var ch = channels[c], len = ch.length;
         for (var i = 0; i < len; i++) {
+            if ((i & CHUNK_MASK) === 0) await checkpoint(token);
             var v = Math.abs(ch[i]);
             if (v > peak) peak = v;
         }
         // 4x oversampled interpolation
         for (var i = 1; i < len - 2; i++) {
+            if ((i & CHUNK_MASK) === 0) await checkpoint(token);
             var p0 = ch[i-1], p1 = ch[i], p2 = ch[i+1], p3 = ch[i+2];
             for (var t = 1; t <= 3; t++) {
                 var f = t / 4;
@@ -178,10 +242,11 @@ function computeTruePeak(channels) {
 }
 
 // ── Levels (RMS, Peak, Crest) ────────────────────────────────────────────
-function computeLevels(channels) {
+async function computeLevels(channels, token) {
     var sumSq = 0, peak = 0, count = 0;
     for (var c = 0; c < channels.length; c++) {
         for (var i = 0; i < channels[c].length; i++) {
+            if ((i & CHUNK_MASK) === 0) await checkpoint(token);
             var v = Math.abs(channels[c][i]);
             sumSq += v * v;
             if (v > peak) peak = v;
@@ -195,11 +260,12 @@ function computeLevels(channels) {
 }
 
 // ── Stereo Width + Phase Correlation ─────────────────────────────────────
-function computeStereo(channels) {
+async function computeStereo(channels, token) {
     if (channels.length < 2) return { width: 0, phaseCorr: 1 };
     var L = channels[0], R = channels[1], n = Math.min(L.length, R.length);
     var sumM = 0, sumS = 0, sumLL = 0, sumRR = 0, sumLR = 0;
     for (var i = 0; i < n; i++) {
+        if ((i & CHUNK_MASK) === 0) await checkpoint(token);
         var m = (L[i] + R[i]) * 0.5, s = (L[i] - R[i]) * 0.5;
         sumM += m * m; sumS += s * s;
         sumLL += L[i] * L[i]; sumRR += R[i] * R[i]; sumLR += L[i] * R[i];
@@ -211,7 +277,7 @@ function computeStereo(channels) {
 }
 
 // ── Average Frequency Spectrum (log-spaced bands) ────────────────────────
-function computeSpectrum(channels, fs, numBands) {
+async function computeSpectrum(channels, fs, numBands, token) {
     var fftSize = 8192; // High resolution for accurate low-end (5.9 Hz/bin at 48kHz)
     var win = new Float32Array(fftSize);
     for (var i = 0; i < fftSize; i++) win[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / fftSize));
@@ -219,6 +285,7 @@ function computeSpectrum(channels, fs, numBands) {
     var n = channels[0].length;
     var mono = new Float32Array(n);
     for (var i = 0; i < n; i++) {
+        if ((i & CHUNK_MASK) === 0) await checkpoint(token);
         for (var c = 0; c < channels.length; c++) mono[i] += channels[c][i] / channels.length;
     }
 
@@ -226,6 +293,7 @@ function computeSpectrum(channels, fs, numBands) {
     var hopSize = fftSize / 2; // 50% overlap for smoother averaging
     var frames = 0;
     for (var s = 0; s + fftSize <= n; s += hopSize) {
+        if ((frames & 0x07) === 0) await checkpoint(token);
         var re = new Float32Array(fftSize);
         var im = new Float32Array(fftSize);
         for (var i = 0; i < fftSize; i++) re[i] = mono[s + i] * win[i];
@@ -258,11 +326,12 @@ function computeSpectrum(channels, fs, numBands) {
 }
 
 // ── Waveform Peaks ───────────────────────────────────────────────────────
-function computeWaveform(channels, numPoints) {
+async function computeWaveform(channels, numPoints, token) {
     var n = channels[0].length;
     var spp = Math.ceil(n / numPoints);
     var peaks = [];
     for (var p = 0; p < numPoints && p * spp < n; p++) {
+        if ((p & BLOCK_MASK) === 0) await checkpoint(token);
         var s = p * spp, mn = 0, mx = 0;
         for (var c = 0; c < channels.length; c++) {
             for (var i = s; i < s + spp && i < n; i++) {
@@ -276,11 +345,12 @@ function computeWaveform(channels, numPoints) {
 }
 
 // ── Goniometer Data ──────────────────────────────────────────────────────
-function computeGoniometer(channels, numPoints) {
+async function computeGoniometer(channels, numPoints, token) {
     if (channels.length < 2) {
         var hop = Math.ceil(channels[0].length / numPoints);
         var pts = [];
         for (var i = 0; i < channels[0].length && pts.length < numPoints * 2; i += hop) {
+            if ((pts.length & 0x3FF) === 0) await checkpoint(token);
             pts.push(channels[0][i], 0);
         }
         return pts;
@@ -289,16 +359,20 @@ function computeGoniometer(channels, numPoints) {
     var hop = Math.ceil(n / numPoints);
     var pts = [];
     for (var i = 0; i < n && pts.length < numPoints * 2; i += hop) {
+        if ((pts.length & 0x3FF) === 0) await checkpoint(token);
         pts.push((L[i] + R[i]) * 0.707, (L[i] - R[i]) * 0.707);
     }
     return pts; // flat [m0,s0,m1,s1,...]
 }
 
 // ── BPM Fallback (onset envelope autocorrelation) ────────────────────────
-function detectBPMFallback(channels, fs) {
+async function detectBPMFallback(channels, fs, token) {
     var n = channels[0].length;
     var mono = new Float32Array(n);
-    for (var i = 0; i < n; i++) for (var c = 0; c < channels.length; c++) mono[i] += channels[c][i] / channels.length;
+    for (var i = 0; i < n; i++) {
+        if ((i & CHUNK_MASK) === 0) await checkpoint(token);
+        for (var c = 0; c < channels.length; c++) mono[i] += channels[c][i] / channels.length;
+    }
 
     // Analyze max 90s from center
     var aLen = Math.min(n, Math.round(90 * fs));
@@ -311,6 +385,7 @@ function detectBPMFallback(channels, fs) {
 
     var env = new Float32Array(envLen);
     for (var i = 0; i < envLen; i++) {
+        if ((i & 0x3FF) === 0) await checkpoint(token);
         var s = i * hopS, sum = 0;
         for (var j = s; j < s + winS && j < seg.length; j++) sum += seg[j] * seg[j];
         env[i] = Math.sqrt(sum / winS);
@@ -326,6 +401,7 @@ function detectBPMFallback(channels, fs) {
     var bestP = minP, bestC = 0;
 
     for (var period = minP; period <= maxP; period++) {
+        if ((period & 0x0F) === 0) await checkpoint(token);
         var corr = 0;
         for (var i = 0; i < corrLen - period; i++) corr += df[i] * df[i + period];
         if (corr > bestC) { bestC = corr; bestP = period; }
@@ -337,10 +413,13 @@ function detectBPMFallback(channels, fs) {
 }
 
 // ── Key Fallback (chromagram + Krumhansl-Kessler) ────────────────────────
-function detectKeyFallback(channels, fs) {
+async function detectKeyFallback(channels, fs, token) {
     var n = channels[0].length;
     var mono = new Float32Array(n);
-    for (var i = 0; i < n; i++) for (var c = 0; c < channels.length; c++) mono[i] += channels[c][i] / channels.length;
+    for (var i = 0; i < n; i++) {
+        if ((i & CHUNK_MASK) === 0) await checkpoint(token);
+        for (var c = 0; c < channels.length; c++) mono[i] += channels[c][i] / channels.length;
+    }
 
     var fftSize = 4096;
     var win = new Float32Array(fftSize);
@@ -349,6 +428,7 @@ function detectKeyFallback(channels, fs) {
     var chroma = new Float32Array(12);
     var frames = 0;
     for (var s = 0; s + fftSize <= n; s += fftSize) {
+        if ((frames & 0x07) === 0) await checkpoint(token);
         var re = new Float32Array(fftSize), im = new Float32Array(fftSize);
         for (var i = 0; i < fftSize; i++) re[i] = mono[s + i] * win[i];
         fft(re, im);
@@ -395,49 +475,80 @@ function detectKeyFallback(channels, fs) {
 }
 
 // ── Worker message handler ───────────────────────────────────────────────
+// Jobs are cooperative: the main thread posts { type: 'cancel', analysisId }
+// when a generation is superseded, and the chunked DSP loops notice it at the
+// next checkpoint and abort without emitting a result.
 self.onmessage = function(e) {
-    var channels = e.data.channels;
-    var fs = e.data.sampleRate;
+    var msg = e.data || {};
 
-    try {
-        self.postMessage({ type: 'progress', msg: 'Computing loudness (EBU R128)...' });
-        var lufs = computeLUFS(channels, fs);
-
-        self.postMessage({ type: 'progress', msg: 'Measuring True Peak...' });
-        var tp = computeTruePeak(channels);
-
-        self.postMessage({ type: 'progress', msg: 'Analyzing levels...' });
-        var levels = computeLevels(channels);
-
-        self.postMessage({ type: 'progress', msg: 'Analyzing stereo field...' });
-        var stereo = computeStereo(channels);
-
-        self.postMessage({ type: 'progress', msg: 'Computing frequency spectrum...' });
-        var spectrum = computeSpectrum(channels, fs, 256);
-
-        self.postMessage({ type: 'progress', msg: 'Preparing waveform...' });
-        var waveform = computeWaveform(channels, 1200);
-
-        self.postMessage({ type: 'progress', msg: 'Computing stereo field data...' });
-        var goniometer = computeGoniometer(channels, 8000);
-
-        self.postMessage({ type: 'progress', msg: 'Detecting BPM...' });
-        var bpm = detectBPMFallback(channels, fs);
-
-        self.postMessage({ type: 'progress', msg: 'Detecting key...' });
-        var key = detectKeyFallback(channels, fs);
-
-        self.postMessage({
-            type: 'result',
-            data: {
-                lufs: lufs.integrated, stLufs: lufs.stMax, momLufs: lufs.momentaryMax, lra: lufs.lra,
-                truePeak: tp, rms: levels.rms, peak: levels.peak, crest: levels.crest,
-                width: stereo.width, phaseCorr: stereo.phaseCorr,
-                bpm: bpm, key: key,
-                spectrum: spectrum, waveform: waveform, goniometer: goniometer
-            }
-        });
-    } catch (err) {
-        self.postMessage({ type: 'error', msg: err.message || String(err) });
+    if (msg.type === 'cancel') {
+        if (currentJob && (msg.analysisId === undefined || msg.analysisId === currentJob.id)) {
+            currentJob.cancelled = true;
+        }
+        return;
     }
+
+    if (currentJob) {
+        // A newer job supersedes any job still running in this worker.
+        currentJob.cancelled = true;
+    }
+
+    var token = makeToken(msg.analysisId);
+    currentJob = token;
+
+    var channels = msg.channels;
+    var fs = msg.sampleRate;
+
+    var report = function(text) {
+        self.postMessage({ type: 'progress', analysisId: token.id, msg: text });
+    };
+
+    var STAGES = [
+        ['Computing loudness (EBU R128)...', function() { return computeLUFS(channels, fs, token); }, 'lufs'],
+        ['Measuring True Peak...', function() { return computeTruePeak(channels, token); }, 'tp'],
+        ['Analyzing levels...', function() { return computeLevels(channels, token); }, 'levels'],
+        ['Analyzing stereo field...', function() { return computeStereo(channels, token); }, 'stereo'],
+        ['Computing frequency spectrum...', function() { return computeSpectrum(channels, fs, 256, token); }, 'spectrum'],
+        ['Preparing waveform...', function() { return computeWaveform(channels, 1200, token); }, 'waveform'],
+        ['Computing stereo field data...', function() { return computeGoniometer(channels, 8000, token); }, 'goniometer'],
+        ['Detecting BPM...', function() { return detectBPMFallback(channels, fs, token); }, 'bpm'],
+        ['Detecting key...', function() { return detectKeyFallback(channels, fs, token); }, 'key'],
+    ];
+
+    (async function() {
+        try {
+            var out = {};
+            for (var s = 0; s < STAGES.length; s++) {
+                report(STAGES[s][0]);
+                // Yield after announcing the stage, so a cancel posted by the
+                // main thread is delivered before the DSP work begins.
+                await checkpoint(token);
+                out[STAGES[s][2]] = await STAGES[s][1]();
+            }
+            checkCancelled(token);
+
+            var lufs = out.lufs, levels = out.levels, stereo = out.stereo;
+            self.postMessage({
+                type: 'result',
+                analysisId: token.id,
+                data: {
+                    lufs: lufs.integrated, stLufs: lufs.stMax, momLufs: lufs.momentaryMax, lra: lufs.lra,
+                    truePeak: out.tp, rms: levels.rms, peak: levels.peak, crest: levels.crest,
+                    width: stereo.width, phaseCorr: stereo.phaseCorr,
+                    bpm: out.bpm, key: out.key,
+                    spectrum: out.spectrum, waveform: out.waveform, goniometer: out.goniometer
+                }
+            });
+        } catch (err) {
+            if (err === CANCELLED || isCancelled(token)) {
+                // Acknowledge the cancellation; the main thread may already
+                // have terminated this worker, in which case this is a no-op.
+                try { self.postMessage({ type: 'cancelled', analysisId: token.id }); } catch (e2) {}
+                return;
+            }
+            self.postMessage({ type: 'error', analysisId: token.id, msg: err && (err.message || String(err)) });
+        } finally {
+            if (currentJob === token) currentJob = null;
+        }
+    })();
 };

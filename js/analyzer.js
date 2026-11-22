@@ -14,6 +14,7 @@ var audioCtx = null;
 var sourceNode = null;
 var analyserNode = null;
 var analyserL = null, analyserR = null;
+var splitterNode = null;
 var isPlaying = false;
 var startTime = 0;
 var pauseOffset = 0;
@@ -21,6 +22,14 @@ var rafId = null;
 var worker = null;
 var essentiaInstance = null;
 var essentiaLoaded = false;
+
+// ── Analysis generation ──────────────────────────────────────────────────
+// Every new file (or New File reset) bumps this counter. Anything captured
+// from an older generation — decode results, worker messages, deferred
+// renders — is stale and must never touch the UI.
+var analysisGeneration = 0;
+var analysisInFlight = false;
+var pendingDisplayTimer = null;
 
 /* ═══════════════════════════════════════════════════════════════════════════
    ESSENTIA.JS LOADING (async, non-blocking)
@@ -90,29 +99,109 @@ function fmtTime(s) { return Math.floor(s/60) + ':' + String(Math.floor(s%60)).p
 /* ═══════════════════════════════════════════════════════════════════════════
    DROP ZONE
    ═══════════════════════════════════════════════════════════════════════════ */
+function hasFilePayload(e) {
+    var dt = e.dataTransfer;
+    if (!dt) return false;
+    if (!dt.types) return true;
+    for (var i = 0; i < dt.types.length; i++) {
+        if (dt.types[i] === 'Files') return true;
+    }
+    return false;
+}
+
 function initDropZone() {
     var dz = document.getElementById('azDropZone');
     var fi = document.getElementById('azFileInput');
 
     dz.addEventListener('click', function() { fi.click(); });
-    fi.addEventListener('change', function() { if (fi.files.length) processFile(fi.files[0]); });
+    fi.addEventListener('change', function() {
+        var file = fi.files && fi.files[0];
+        fi.value = ''; // allow re-selecting the same file later
+        if (file) processFile(file);
+    });
 
-    dz.addEventListener('dragover', function(e) { e.preventDefault(); dz.classList.add('drag-over'); });
-    dz.addEventListener('dragleave', function() { dz.classList.remove('drag-over'); });
-    dz.addEventListener('drop', function(e) {
-        e.preventDefault(); dz.classList.remove('drag-over');
-        if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+    // Drops are accepted anywhere on the page — including on top of the
+    // fixed loading overlay — so a second file can supersede an analysis
+    // that is still in flight.
+    document.addEventListener('dragover', function(e) {
+        if (!hasFilePayload(e)) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        dz.classList.add('drag-over');
+    });
+    document.addEventListener('dragleave', function(e) {
+        if (e.target === document || e.target === document.documentElement) {
+            dz.classList.remove('drag-over');
+        }
+    });
+    document.addEventListener('drop', function(e) {
+        if (!hasFilePayload(e)) return;
+        e.preventDefault();
+        dz.classList.remove('drag-over');
+        if (e.dataTransfer.files && e.dataTransfer.files.length) {
+            processFile(e.dataTransfer.files[0]);
+        }
     });
 
     document.getElementById('azNewBtn').addEventListener('click', resetUI);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   ANALYSIS LIFECYCLE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// Invalidate the current generation, tear down the worker and drop any
+// deferred render that has not run yet. Every async callback captures the
+// generation it was started in and is only allowed to touch the UI while it
+// is still the current one.
+function cancelCurrentAnalysis() {
+    var previousGeneration = analysisGeneration;
+    analysisGeneration++;
+    analysisInFlight = false;
+
+    if (pendingDisplayTimer !== null) {
+        clearTimeout(pendingDisplayTimer);
+        pendingDisplayTimer = null;
+    }
+
+    if (worker) {
+        var oldWorker = worker;
+        worker = null;
+
+        // Best-effort cooperative stop (the worker also abandons the DSP
+        // chain when it sees this), followed immediately by terminate().
+        // Terminate is what guarantees the old worker stops consuming CPU
+        // and can never deliver messages into the next generation.
+        try { oldWorker.postMessage({ type: 'cancel', analysisId: previousGeneration }); } catch (e) {}
+        oldWorker.onmessage = null;
+        oldWorker.onerror = null;
+        try { oldWorker.terminate(); } catch (e) {}
+        console.log('[analyzer] worker terminated (generation ' + previousGeneration + ' → ' + analysisGeneration + ')');
+    }
+
+    return analysisGeneration;
+}
+
+// Terminate a worker only if it is still the one the caller owns.
+function releaseWorker(w) {
+    if (!w) return;
+    if (worker === w) worker = null;
+    try { w.terminate(); } catch (e) {}
+    console.log('[analyzer] worker released after use');
+}
+
 function resetUI() {
-    stopPlayback();
-    document.getElementById('azDropZone').classList.remove('az-hidden');
-    document.getElementById('azResults').classList.add('az-hidden');
+    cancelCurrentAnalysis();
+    stopPlayback(true);
     audioBuffer = null;
     analysisData = null;
+    hideLoading();
+    var progress = document.getElementById('azProgressMsg');
+    if (progress) progress.textContent = '';
+    document.getElementById('azDropZone').classList.remove('az-hidden');
+    document.getElementById('azResults').classList.add('az-hidden');
+    document.getElementById('azPlayBtn').textContent = 'Play';
+    document.getElementById('azCurTime').textContent = '0:00';
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -124,20 +213,44 @@ async function processFile(file) {
         alert('File too large (' + sizeMB.toFixed(0) + ' MB). Maximum is 500 MB to avoid browser crashes.');
         return;
     }
+
+    // A new file always starts a new generation: the previous worker is
+    // killed, any deferred render is dropped, late messages become no-ops,
+    // and playback of the old track is torn down from scratch.
+    var gen = cancelCurrentAnalysis();
+    stopPlayback(true);
+    audioBuffer = null;
+    analysisData = null;
+    analysisInFlight = true;
+
+    var progress = document.getElementById('azProgressMsg');
+    if (progress) progress.textContent = '';
+
     if (sizeMB > 200) {
         showLoading('Loading large file (' + sizeMB.toFixed(0) + ' MB) — this may take a moment...');
     } else {
         showLoading('Decoding audio...');
     }
+
+    var buffer;
     try {
         var arrayBuf = await file.arrayBuffer();
+        if (gen !== analysisGeneration) return; // superseded while reading
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+        buffer = await audioCtx.decodeAudioData(arrayBuf);
     } catch (e) {
-        hideLoading();
+        if (gen !== analysisGeneration) return;
+        // Nothing usable was loaded: drop back to the drop zone so the page
+        // is immediately ready for another file.
+        failAnalysis();
         alert('Could not decode this file. Make sure it is a valid audio file.');
         return;
     }
+
+    // Superseded (another drop, or New File) while decoding — discard.
+    if (gen !== analysisGeneration) return;
+
+    audioBuffer = buffer;
 
     // Update file info
     document.getElementById('azFileName').textContent = file.name;
@@ -148,13 +261,13 @@ async function processFile(file) {
 
     // Run analysis
     showLoading('Analyzing...');
-    runAnalysis(audioBuffer);
+    runAnalysis(buffer, gen);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    WORKER ANALYSIS
    ═══════════════════════════════════════════════════════════════════════════ */
-function runAnalysis(buffer) {
+function runAnalysis(buffer, gen) {
     // Prepare channel data
     var channels = [];
     for (var c = 0; c < buffer.numberOfChannels; c++) {
@@ -162,27 +275,45 @@ function runAnalysis(buffer) {
     }
 
     // Create worker from separate file (requires HTTP server, not file://)
-    if (worker) worker.terminate();
+    var w;
     try {
-        worker = new Worker('js/worker.js');
+        w = new Worker('js/worker.js');
     } catch (e) {
-        hideLoading();
+        failAnalysis();
         alert('Web Workers require an HTTP server.\n\nRun: python3 -m http.server\nThen open: http://localhost:8000');
         return;
     }
+    worker = w;
 
-    worker.onmessage = function(e) {
-        if (e.data.type === 'progress') {
+    // Stale-generation guard. A message from an older generation (or from a
+    // worker that has already been replaced) must never reach the UI.
+    function isCurrent() {
+        return gen === analysisGeneration && worker === w;
+    }
+
+    w.onmessage = function(e) {
+        if (!isCurrent()) { // late progress/result/error → ignore
+            console.log('[analyzer] ignored stale worker message', e.data && e.data.type,
+                'from generation', e.data && e.data.analysisId, '(current ' + analysisGeneration + ')');
+            return;
+        }
+        var data = e.data;
+
+        if (data.type === 'progress') {
             var msg = document.getElementById('azProgressMsg');
-            if (msg) msg.textContent = e.data.msg;
-        } else if (e.data.type === 'result') {
-            analysisData = e.data.data;
+            if (msg) msg.textContent = data.msg;
+        } else if (data.type === 'result') {
+            releaseWorker(w);
+
+            var resultData = data.data;
+            analysisData = resultData;
 
             // Try essentia.js for better Key/BPM
             var essentiaResult = essentiaAnalyze(buffer);
+            if (gen !== analysisGeneration) return;
             if (essentiaResult) {
                 if (essentiaResult.key && essentiaResult.key.key) {
-                    analysisData.key = {
+                    resultData.key = {
                         key: essentiaResult.key.key,
                         scale: essentiaResult.key.scale === 'minor' ? 'Minor' : 'Major',
                         strength: Math.round((essentiaResult.key.strength || 0) * 100)
@@ -192,7 +323,7 @@ function runAnalysis(buffer) {
                     var bpm = essentiaResult.bpm.bpm;
                     while (bpm < 60) bpm *= 2;
                     while (bpm > 180) bpm /= 2;
-                    analysisData.bpm = Math.round(bpm * 10) / 10;
+                    resultData.bpm = Math.round(bpm * 10) / 10;
                 }
             }
 
@@ -200,36 +331,42 @@ function runAnalysis(buffer) {
             document.getElementById('azDropZone').classList.add('az-hidden');
             document.getElementById('azResults').classList.remove('az-hidden');
             hideLoading();
-            // Small delay to let layout settle before canvas rendering
-            setTimeout(function() {
-                displayResults(analysisData, buffer);
+            // Small delay to let layout settle before canvas rendering.
+            // Tracked so a new file can cancel it instead of letting a
+            // stale render repaint the UI.
+            pendingDisplayTimer = setTimeout(function() {
+                pendingDisplayTimer = null;
+                if (gen !== analysisGeneration || analysisData !== resultData) return;
+                analysisInFlight = false;
+                displayResults(resultData, buffer);
             }, 50);
-            worker.terminate();
-            worker = null;
-        } else if (e.data.type === 'error') {
-            hideLoading();
-            alert('Analysis error: ' + e.data.msg);
-            worker.terminate();
-            worker = null;
+        } else if (data.type === 'error') {
+            releaseWorker(w);
+            failAnalysis();
+            alert('Analysis error: ' + data.msg);
         }
     };
 
-    worker.onerror = function(e) {
-        hideLoading();
+    w.onerror = function(e) {
+        if (!isCurrent()) return;
+        releaseWorker(w);
+        failAnalysis();
         alert('Worker error: ' + (e.message || 'Unknown error'));
-        worker.terminate();
-        worker = null;
     };
 
     // Transfer channel data to worker
     var transferable = channels.map(function(ch) { return ch.buffer; });
-    worker.postMessage({ channels: channels, sampleRate: buffer.sampleRate }, transferable);
+    w.postMessage({ type: 'analyze', analysisId: gen, channels: channels, sampleRate: buffer.sampleRate }, transferable);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    DISPLAY RESULTS
    ═══════════════════════════════════════════════════════════════════════════ */
 function displayResults(d, buffer) {
+    // New analysis replaces whatever was loaded before: never inherit a
+    // previous file's transport position or running playback.
+    stopPlayback(true);
+
     // LUFS
     var lufsColor = d.lufs > -9 ? 'red' : d.lufs > -14 ? 'yellow' : d.lufs > -23 ? 'green' : 'blue';
     document.getElementById('vLufs').textContent = fmt(d.lufs);
@@ -284,11 +421,8 @@ function displayResults(d, buffer) {
     renderGoniometer(d.goniometer);
     buildStreamingTable(d.lufs, d.truePeak);
 
-    // Setup playback
-    pauseOffset = 0;
-    isPlaying = false;
-    document.getElementById('azPlayBtn').textContent = 'Play';
-    document.getElementById('azCurTime').textContent = '0:00';
+    // Transport stays at 0:00 — stopPlayback(true) above already cleared the
+    // old pause offset, the play label and the clock.
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -601,6 +735,8 @@ var playTransition = false;
 
 async function togglePlay() {
     if (!audioBuffer) return;
+    // Never start playback on top of an analysis that is still running.
+    if (!isPlaying && (analysisInFlight || !document.getElementById('azLoading').classList.contains('az-hidden'))) return;
     if (playTransition) return;
     playTransition = true;
     try {
@@ -623,27 +759,32 @@ function startPlayback() {
     var node = audioCtx.createBufferSource();
     node.buffer = audioBuffer;
 
-    analyserNode = audioCtx.createAnalyser();
-    analyserNode.fftSize = 2048;
-    analyserNode.smoothingTimeConstant = 0.8;
+    var an = audioCtx.createAnalyser();
+    an.fftSize = 2048;
+    an.smoothingTimeConstant = 0.8;
 
-    node.connect(analyserNode);
-    analyserNode.connect(audioCtx.destination);
+    node.connect(an);
+    an.connect(audioCtx.destination);
+    analyserNode = an;
 
     if (audioBuffer.numberOfChannels >= 2) {
         var splitter = audioCtx.createChannelSplitter(2);
-        analyserL = audioCtx.createAnalyser(); analyserL.fftSize = 1024;
-        analyserR = audioCtx.createAnalyser(); analyserR.fftSize = 1024;
+        var aL = audioCtx.createAnalyser(); aL.fftSize = 1024;
+        var aR = audioCtx.createAnalyser(); aR.fftSize = 1024;
         node.connect(splitter);
-        splitter.connect(analyserL, 0);
-        splitter.connect(analyserR, 1);
+        splitter.connect(aL, 0);
+        splitter.connect(aR, 1);
+        splitterNode = splitter;
+        analyserL = aL;
+        analyserR = aR;
     } else {
+        splitterNode = null;
         analyserL = analyserR = null;
     }
 
     sourceNode = node;
     startTime = audioCtx.currentTime;
-    node.start(0, pauseOffset);
+    node.start(0, Math.min(pauseOffset, Math.max(0, audioBuffer.duration - 0.001)));
     isPlaying = true;
     document.getElementById('azPlayBtn').textContent = 'Pause';
 
@@ -652,6 +793,7 @@ function startPlayback() {
         isPlaying = false;
         pauseOffset = 0;
         sourceNode = null;
+        releaseAnalysers();
         document.getElementById('azPlayBtn').textContent = 'Play';
         document.getElementById('azCurTime').textContent = '0:00';
         renderWaveform(0);
@@ -661,7 +803,16 @@ function startPlayback() {
     updatePlaybackUI();
 }
 
-function stopPlayback() {
+function releaseAnalysers() {
+    if (analyserNode) { try { analyserNode.disconnect(); } catch(e) {} analyserNode = null; }
+    if (analyserL) { try { analyserL.disconnect(); } catch(e) {} analyserL = null; }
+    if (analyserR) { try { analyserR.disconnect(); } catch(e) {} analyserR = null; }
+    if (splitterNode) { try { splitterNode.disconnect(); } catch(e) {} splitterNode = null; }
+}
+
+// resetPosition = true means the old track's pause offset must not survive
+// (new file, New File, analysis result arriving).
+function stopPlayback(resetPosition) {
     if (sourceNode) {
         var node = sourceNode;
         sourceNode = null;
@@ -669,15 +820,15 @@ function stopPlayback() {
         try { node.stop(); } catch(e) {}
         try { node.disconnect(); } catch(e) {}
     }
-    if (analyserNode) { try { analyserNode.disconnect(); } catch(e) {} analyserNode = null; }
-    if (analyserL) { try { analyserL.disconnect(); } catch(e) {} analyserL = null; }
-    if (analyserR) { try { analyserR.disconnect(); } catch(e) {} analyserR = null; }
-    if (isPlaying) {
+    releaseAnalysers();
+    if (isPlaying && audioCtx && !resetPosition) {
         pauseOffset += audioCtx.currentTime - startTime;
     }
     isPlaying = false;
-    document.getElementById('azPlayBtn').textContent = 'Play';
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (resetPosition) pauseOffset = 0;
+    document.getElementById('azPlayBtn').textContent = 'Play';
+    document.getElementById('azCurTime').textContent = fmtTime(pauseOffset);
 }
 
 function seekTo(time) {
@@ -747,6 +898,23 @@ function hideLoading() {
     document.getElementById('azLoading').classList.add('az-hidden');
 }
 
+// Failure/cancel cleanup: overlay gone, nothing pending, drop zone usable
+// again so another file can be dragged in.
+function failAnalysis() {
+    analysisInFlight = false;
+    if (pendingDisplayTimer !== null) {
+        clearTimeout(pendingDisplayTimer);
+        pendingDisplayTimer = null;
+    }
+    hideLoading();
+    var progress = document.getElementById('azProgressMsg');
+    if (progress) progress.textContent = '';
+    if (!analysisData) {
+        document.getElementById('azDropZone').classList.remove('az-hidden');
+        document.getElementById('azResults').classList.add('az-hidden');
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    CANVAS RESIZE HANDLER
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -765,6 +933,26 @@ document.addEventListener('DOMContentLoaded', function() {
     initDropZone();
     initPlayback();
     initEssentia(); // async, non-blocking
+
+    // Console-visible state for debugging generation/worker races:
+    //   __azDebug()  → { generation, analysisInFlight, workerAlive, ... }
+    window.__azDebug = function() {
+        return {
+            generation: analysisGeneration,
+            analysisInFlight: analysisInFlight,
+            workerAlive: !!worker,
+            pendingDisplay: pendingDisplayTimer !== null,
+            isPlaying: isPlaying,
+            hasAudioBuffer: !!audioBuffer,
+            hasAnalysisData: !!analysisData,
+            // Decoded buffer facts — the UI must agree with these.
+            audioBuffer: audioBuffer ? {
+                duration: audioBuffer.duration,
+                sampleRate: audioBuffer.sampleRate,
+                channels: audioBuffer.numberOfChannels
+            } : null
+        };
+    };
 
     var resizeTimer;
     window.addEventListener('resize', function() {
