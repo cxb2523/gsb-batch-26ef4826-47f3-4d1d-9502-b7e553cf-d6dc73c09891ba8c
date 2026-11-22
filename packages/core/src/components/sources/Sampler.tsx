@@ -35,6 +35,17 @@ const loadSamplerWorklets = (audioContext: AudioContext) => {
 
 export type PlaybackMode = 'one-shot' | 'gate' | 'loop';
 
+interface SamplingSession {
+  id: number;
+  src: string;
+  element: HTMLAudioElement;
+  sourceNode: MediaElementAudioSourceNode;
+  listeners: Array<{ type: string; handler: EventListener }>;
+  /** True once play() has been requested and before a pause/ended/error event. */
+  playRequested: boolean;
+  disposed: boolean;
+}
+
 export interface SamplerHandle {
   trigger: () => void;
   stop: () => void;
@@ -166,46 +177,174 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const blobUrlRef = useRef<string | null>(null);
   const pitchCvNodeRef = useRef<AudioWorkletNode | null>(null);
   const gateNodeRef = useRef<AudioWorkletNode | null>(null);
   const pitchCvValueRef = useRef(0);
   const gateStateRef = useRef(false);
   const pitchRef = useRef(pitch);
+  const gainRef = useRef(gain);
+  const enabledRef = useRef(enabled);
   const playbackModeRef = useRef<PlaybackMode>(playbackMode);
   const startTimeRef = useRef(startTime);
   const endTimeRef = useRef(endTime);
+  const durationRef = useRef(0);
   const pendingAutoplayRef = useRef(false);
   const unlockListenerRef = useRef<(() => void) | null>(null);
   const stopTimeoutRef = useRef<number | null>(null);
   const playRetryRef = useRef<number | null>(null);
+  const onEndRef = useRef(onEnd);
+
+  // Session bookkeeping. Every src change increments the id; async work (timers,
+  // event handlers, worklet callbacks) checks ownership before touching audio.
+  const sessionIdRef = useRef(0);
+  const activeSessionRef = useRef<SamplingSession | null>(null);
+  // Blob URLs created by this component (via loadFile) and blob URLs that are
+  // currently used by a live session. A URL is revoked only when it was created
+  // here and no live session (including a brand new one) still uses it.
+  const createdBlobUrlsRef = useRef<Set<string>>(new Set());
+  const liveBlobUrlsRef = useRef<Set<string>>(new Set());
 
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
   const FADE_IN_TIME = 0.001;
   const FADE_OUT_TIME = 0.045;
 
+  useEffect(() => {
+    onEndRef.current = onEnd;
+  }, [onEnd]);
+
+  const cancelGainAutomation = (param: AudioParam, now: number) => {
+    const withHold = param as AudioParam & { cancelAndHoldAtTime?: (time: number) => void };
+    if (typeof withHold.cancelAndHoldAtTime === 'function') {
+      try {
+        withHold.cancelAndHoldAtTime(now);
+        return;
+      } catch {
+        // Fall through to cancelScheduledValues
+      }
+    }
+    param.cancelScheduledValues(now);
+  };
+
+  const restoreGain = () => {
+    if (!audioContext || !gainNodeRef.current) return;
+    const now = audioContext.currentTime;
+    const param = gainNodeRef.current.gain;
+    cancelGainAutomation(param, now);
+    param.setValueAtTime(gainRef.current, now);
+  };
+
   const fadeGainTo = (target: number, fadeTime: number) => {
     if (!audioContext || !gainNodeRef.current) return;
     const now = audioContext.currentTime;
     const param = gainNodeRef.current.gain;
-    param.cancelScheduledValues(now);
+    cancelGainAutomation(param, now);
     param.setValueAtTime(param.value, now);
     param.setTargetAtTime(target, now, Math.max(0.001, fadeTime / 3));
   };
 
   const fadeIn = () => {
-    if (!audioContext || !gainNodeRef.current) return;
-    const now = audioContext.currentTime;
-    const param = gainNodeRef.current.gain;
-    param.cancelScheduledValues(now);
-    param.setValueAtTime(param.value, now);
-    param.setTargetAtTime(gain, now, Math.max(0.001, FADE_IN_TIME / 3));
+    fadeGainTo(gainRef.current, FADE_IN_TIME);
+  };
+
+  const clearPlaybackTimers = () => {
+    if (stopTimeoutRef.current !== null) {
+      clearTimeout(stopTimeoutRef.current);
+      stopTimeoutRef.current = null;
+    }
+    if (playRetryRef.current !== null) {
+      clearTimeout(playRetryRef.current);
+      playRetryRef.current = null;
+    }
+  };
+
+  const resetPlaybackState = () => {
+    durationRef.current = 0;
+    setIsReady(false);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setError(null);
+  };
+
+  const releaseSessionBlobUrl = (url: string) => {
+    if (!url.startsWith('blob:')) return;
+    // Defer so a session created for the same URL in the same commit can claim
+    // it first. Only URLs created by this component are ever revoked.
+    queueMicrotask(() => {
+      if (liveBlobUrlsRef.current.has(url)) return;
+      if (!createdBlobUrlsRef.current.has(url)) return;
+      createdBlobUrlsRef.current.delete(url);
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore
+      }
+    });
+  };
+
+  const teardownSession = () => {
+    const session = activeSessionRef.current;
+    if (!session) return;
+    activeSessionRef.current = null;
+    session.disposed = true;
+    const hadStopFade = stopTimeoutRef.current !== null;
+    clearPlaybackTimers();
+
+    session.listeners.forEach(({ type, handler }) => {
+      try {
+        session.element.removeEventListener(type, handler);
+      } catch {
+        // ignore
+      }
+    });
+    try {
+      session.element.pause();
+    } catch {
+      // ignore
+    }
+    try {
+      if (typeof session.element.removeAttribute === 'function') {
+        session.element.removeAttribute('src');
+      } else {
+        session.element.src = '';
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      session.element.load();
+    } catch {
+      // ignore
+    }
+    try {
+      session.sourceNode.disconnect();
+    } catch {
+      // Already disconnected
+    }
+
+    if (audioElementRef.current === session.element) {
+      audioElementRef.current = null;
+    }
+    if (sourceNodeRef.current === session.sourceNode) {
+      sourceNodeRef.current = null;
+    }
+    if (session.src.startsWith('blob:')) {
+      liveBlobUrlsRef.current.delete(session.src);
+      releaseSessionBlobUrl(session.src);
+    }
+
+    // A fade-out from this session must not leave the (shared) gain node at 0
+    // or leak into the next session.
+    if (hadStopFade) {
+      restoreGain();
+    }
   };
 
   const stopWithFade = (resetToStart: boolean) => {
-    if (!audioElementRef.current) return;
+    const session = activeSessionRef.current;
+    if (!session) return;
     if (!audioContext || !gainNodeRef.current) {
-      audioElementRef.current.pause();
+      session.element.pause();
       if (resetToStart) seekToStart();
       return;
     }
@@ -215,15 +354,16 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     }
     fadeGainTo(0, FADE_OUT_TIME);
     stopTimeoutRef.current = window.setTimeout(() => {
-      if (!audioElementRef.current) return;
-      audioElementRef.current.pause();
-      if (resetToStart) seekToStart();
-      if (gainNodeRef.current && audioContext) {
-        const now = audioContext.currentTime;
-        gainNodeRef.current.gain.cancelScheduledValues(now);
-        gainNodeRef.current.gain.setValueAtTime(gain, now);
-      }
       stopTimeoutRef.current = null;
+      // If the source changed while fading, this callback belongs to an old
+      // session and must not pause or rewind the new element.
+      if (activeSessionRef.current !== session || session.disposed) return;
+      session.element.pause();
+      session.playRequested = false;
+      if (resetToStart) seekToStart();
+      // Converge on the *current* gain setting rather than the one captured
+      // when stop() was called.
+      restoreGain();
     }, FADE_OUT_TIME * 1000);
   };
 
@@ -243,7 +383,8 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
       }
       const mode = playbackModeRef.current;
       if ((mode === 'gate' || mode === 'loop') && !gateStateRef.current) return;
-      triggerPlayback();
+      if (!activeSessionRef.current) return;
+      void triggerPlayback();
     };
     unlockListenerRef.current = onUnlock;
     window.addEventListener('pointerdown', onUnlock);
@@ -266,15 +407,26 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
 
   const isAbortPlayError = (err: unknown) => (err as Error)?.name === 'AbortError';
 
-  const getEffectiveStart = () => {
-    if (!duration) return 0;
-    return clamp(startTimeRef.current, 0, duration);
-  };
-
-  const getEffectiveEnd = () => {
-    if (!duration) return 0;
-    const end = endTimeRef.current > 0 ? endTimeRef.current : duration;
-    return clamp(end, 0, duration);
+  /**
+   * Effective playback region. An explicit end that is not greater than the
+   * start is treated as "no end boundary" so playback keeps working instead of
+   * spinning on an impossible loop.
+   */
+  const getEffectiveRegion = () => {
+    const dur = Number.isFinite(durationRef.current) ? Math.max(0, durationRef.current) : 0;
+    if (dur <= 0) return { start: 0, end: 0 };
+    const rawStart = Number.isFinite(startTimeRef.current) ? startTimeRef.current : 0;
+    const start = clamp(rawStart, 0, dur);
+    const rawEnd = Number.isFinite(endTimeRef.current) && endTimeRef.current > 0
+      ? endTimeRef.current
+      : dur;
+    let end = clamp(rawEnd, 0, dur);
+    if (end <= start) {
+      // Invalid region (end <= start): fall back to playing to the end of the
+      // file instead of looping over a zero/negative span.
+      end = dur > start ? dur : start;
+    }
+    return { start, end };
   };
 
   const updatePlaybackRate = () => {
@@ -307,7 +459,7 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
 
   const seekToStart = () => {
     if (!audioElementRef.current) return;
-    audioElementRef.current.currentTime = getEffectiveStart();
+    audioElementRef.current.currentTime = getEffectiveRegion().start;
   };
 
   const stopAtStart = () => {
@@ -315,8 +467,75 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     stopWithFade(true);
   };
 
+  const play = async () => {
+    const session = activeSessionRef.current;
+    if (!session || !audioContext) return;
+    if (stopTimeoutRef.current !== null) {
+      clearTimeout(stopTimeoutRef.current);
+      stopTimeoutRef.current = null;
+    }
+    // A new play request supersedes any queued abort retry.
+    if (playRetryRef.current !== null) {
+      clearTimeout(playRetryRef.current);
+      playRetryRef.current = null;
+    }
+    fadeIn();
+    if (audioContext.state !== 'running') {
+      try {
+        await audioContext.resume();
+      } catch {
+        handleAutoplayBlocked();
+        return;
+      }
+    }
+    if (activeSessionRef.current !== session || session.disposed) return;
+    const isRunning = audioContext.state === 'running';
+    if (!isRunning) {
+      handleAutoplayBlocked();
+      return;
+    }
+    if (session.element.currentTime < getEffectiveRegion().start) {
+      seekToStart();
+    }
+    session.playRequested = true;
+    session.element.play().catch((err) => {
+      if (activeSessionRef.current !== session || session.disposed) return;
+      session.playRequested = false;
+      if (isAutoplayError(err)) {
+        handleAutoplayBlocked();
+        return;
+      }
+      if (isAbortPlayError(err)) {
+        if (playRetryRef.current !== null) {
+          return;
+        }
+        playRetryRef.current = window.setTimeout(() => {
+          playRetryRef.current = null;
+          // The retry belongs to the session that scheduled it.
+          if (activeSessionRef.current !== session || session.disposed) return;
+          session.playRequested = true;
+          session.element.play().catch((retryErr) => {
+            if (activeSessionRef.current !== session || session.disposed) return;
+            session.playRequested = false;
+            if (isAutoplayError(retryErr)) {
+              handleAutoplayBlocked();
+              return;
+            }
+            if (isAbortPlayError(retryErr)) {
+              return;
+            }
+            setError('Playback failed. User interaction may be required.');
+          });
+        }, 0);
+        return;
+      }
+      setError('Playback failed. User interaction may be required.');
+    });
+  };
+
   const triggerPlayback = async () => {
-    if (!audioElementRef.current || !enabled) return;
+    const session = activeSessionRef.current;
+    if (!session || !enabledRef.current) return;
     if (stopTimeoutRef.current !== null) {
       clearTimeout(stopTimeoutRef.current);
       stopTimeoutRef.current = null;
@@ -329,9 +548,17 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     await play();
   };
 
-  useEffect(() => {
-    playbackModeRef.current = playbackMode;
-  }, [playbackMode]);
+  // In gate/loop mode, a freshly loaded sample should resume only when the
+  // gate is actually high (e.g. after a src swap under a held gate).
+  const maybeAutoplayIfGateAllows = (session: SamplingSession) => {
+    if (activeSessionRef.current !== session || session.disposed) return;
+    if (!enabledRef.current) return;
+    const mode = playbackModeRef.current;
+    if (mode !== 'gate' && mode !== 'loop') return;
+    if (!gateStateRef.current) return;
+    if (session.playRequested || !session.element.paused) return;
+    void triggerPlayback();
+  };
 
   useEffect(() => {
     pitchRef.current = pitch;
@@ -346,12 +573,20 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     endTimeRef.current = endTime;
   }, [endTime]);
 
+  useEffect(() => {
+    gainRef.current = gain;
+  }, [gain]);
+
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
+
   // Create output gain once (stable connection for Monitor)
   useEffect(() => {
     if (!audioContext) return;
 
     const gainNode = audioContext.createGain();
-    gainNode.gain.value = gain;
+    gainNode.gain.value = gainRef.current;
     gainNodeRef.current = gainNode;
 
     // Set output ref with stable gain node
@@ -372,190 +607,208 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     };
   }, [audioContext, label]);
 
-  // Handle source changes separately
+  // Each src change is a brand new playback session.
   useEffect(() => {
-    if (!audioContext || !src || !gainNodeRef.current) return;
+    sessionIdRef.current += 1;
+    const sessionId = sessionIdRef.current;
 
-    let audioElement: HTMLAudioElement | null = null;
-    let sourceNode: MediaElementAudioSourceNode | null = null;
+    // Cancel anything the previous session left behind (fade/retry timers,
+    // audio element listeners, loop watcher via isPlaying reset below).
+    if (activeSessionRef.current) {
+      teardownSession();
+    }
+    clearPlaybackTimers();
+    resetPlaybackState();
+
+    if (!audioContext || !gainNodeRef.current || !src) {
+      audioElementRef.current = null;
+      sourceNodeRef.current = null;
+      return;
+    }
+
     const currentSrc = src;
+    let audioElement: HTMLAudioElement;
+    try {
+      audioElement = new Audio();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load audio');
+      return;
+    }
 
-    const setupAudio = async () => {
-      try {
-        // Clean up previous source if it exists
-        if (sourceNodeRef.current) {
-          try {
-            sourceNodeRef.current.disconnect();
-          } catch {
-            // Already disconnected
-          }
-          sourceNodeRef.current = null;
-        }
+    audioElement.loop = false;
+    if (!currentSrc.startsWith('blob:') && !currentSrc.startsWith('data:')) {
+      audioElement.crossOrigin = 'anonymous';
+    }
+    audioElement.preload = 'auto';
+    audioElement.src = currentSrc;
 
-        // Stop and clean up previous audio element
-        if (audioElementRef.current) {
-          const oldElement = audioElementRef.current;
-          oldElement.pause();
-          if (typeof oldElement.removeAttribute === 'function') {
-            oldElement.removeAttribute('src');
-          } else {
-            oldElement.src = '';
-          }
-          oldElement.load();
-          audioElementRef.current = null;
-        }
+    audioElementRef.current = audioElement;
+    updatePlaybackRate();
 
-        // Reset state when loading new audio
-        setIsReady(false);
-        setIsPlaying(false);
-        setError(null);
-        setCurrentTime(0);
-        setDuration(0);
+    let sourceNode: MediaElementAudioSourceNode;
+    try {
+      sourceNode = audioContext.createMediaElementSource(audioElement);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load audio');
+      audioElementRef.current = null;
+      return;
+    }
+    sourceNodeRef.current = sourceNode;
+    sourceNode.connect(gainNodeRef.current);
+    if (currentSrc.startsWith('blob:')) {
+      liveBlobUrlsRef.current.add(currentSrc);
+    }
 
-        // Create fresh audio element
-        audioElement = new Audio();
-        if ('preservesPitch' in audioElement) {
-          audioElement.preservesPitch = false;
-        }
-        if ('mozPreservesPitch' in audioElement) {
-          (audioElement as unknown as { mozPreservesPitch: boolean }).mozPreservesPitch = false;
-        }
-        if ('webkitPreservesPitch' in audioElement) {
-          (audioElement as unknown as { webkitPreservesPitch: boolean }).webkitPreservesPitch = false;
-        }
-        audioElement.loop = false;
-        if (!src.startsWith('blob:') && !src.startsWith('data:')) {
-          audioElement.crossOrigin = 'anonymous';
-        }
-        audioElement.preload = 'auto';
-        audioElement.src = src;
-        audioElementRef.current = audioElement;
-        updatePlaybackRate();
+    const session: SamplingSession = {
+      id: sessionId,
+      src: currentSrc,
+      element: audioElement,
+      sourceNode,
+      listeners: [],
+      playRequested: false,
+      disposed: false,
+    };
+    activeSessionRef.current = session;
 
-        // Create source from audio element
-        sourceNode = audioContext.createMediaElementSource(audioElement);
-        sourceNodeRef.current = sourceNode;
+    // A new session starts from the configured gain, never from a value left
+    // behind by a previous fade.
+    restoreGain();
 
-        // Connect source to existing stable gain node
-        sourceNode.connect(gainNodeRef.current!);
+    const isSessionActive = () => activeSessionRef.current === session && !session.disposed;
 
-        // Set up event listeners
-        audioElement.addEventListener('loadedmetadata', () => {
-          setDuration(audioElement!.duration);
-        });
-
-        audioElement.addEventListener('canplaythrough', () => {
-          setIsReady(true);
-        });
-
-        audioElement.addEventListener('timeupdate', () => {
-          const current = audioElement!.currentTime;
-          const regionStart = getEffectiveStart();
-          const regionEnd = getEffectiveEnd();
-          if (regionEnd > 0 && current >= regionEnd) {
-            if (playbackModeRef.current === 'loop') {
-              audioElement!.currentTime = regionStart;
-              if (!audioElement!.paused) {
-                audioElement!.play().catch((err) => {
-                  if (isAutoplayError(err)) {
-                    handleAutoplayBlocked();
-                    return;
-                  }
-                  if (isAbortPlayError(err)) {
-                    return;
-                  }
-                  setError('Playback failed. User interaction may be required.');
-                });
-              }
-            } else {
-              audioElement!.pause();
-              audioElement!.currentTime = regionStart;
-              setIsPlaying(false);
-              onEnd?.();
-            }
-          } else if (current < regionStart) {
-            audioElement!.currentTime = regionStart;
-          }
-          setCurrentTime(audioElement!.currentTime);
-        });
-
-        audioElement.addEventListener('play', () => setIsPlaying(true));
-        audioElement.addEventListener('pause', () => setIsPlaying(false));
-        audioElement.addEventListener('ended', () => {
-          setIsPlaying(false);
-          onEnd?.();
-        });
-
-        audioElement.addEventListener('error', () => {
-          setError('Failed to load audio file');
-          setIsReady(false);
-        });
-
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load audio');
-        setIsReady(false);
-      }
+    const addListener = (type: string, handler: EventListener) => {
+      audioElement.addEventListener(type, handler);
+      session.listeners.push({ type, handler });
     };
 
-    setupAudio();
+    addListener('loadedmetadata', () => {
+      if (!isSessionActive()) return;
+      const nextDuration = Number.isFinite(audioElement.duration) ? audioElement.duration : 0;
+      durationRef.current = nextDuration;
+      setDuration(nextDuration);
+      maybeAutoplayIfGateAllows(session);
+    });
+
+    addListener('canplaythrough', () => {
+      if (!isSessionActive()) return;
+      setIsReady(true);
+      maybeAutoplayIfGateAllows(session);
+    });
+
+    addListener('timeupdate', () => {
+      if (!isSessionActive()) return;
+      const { start, end } = getEffectiveRegion();
+      const current = audioElement.currentTime;
+      if (end > start && current >= end) {
+        if (playbackModeRef.current === 'loop') {
+          audioElement.currentTime = start;
+          if (!audioElement.paused) {
+            audioElement.play().catch((err) => {
+              if (!isSessionActive()) return;
+              if (isAutoplayError(err)) {
+                handleAutoplayBlocked();
+                return;
+              }
+              if (isAbortPlayError(err)) {
+                return;
+              }
+              setError('Playback failed. User interaction may be required.');
+            });
+          }
+        } else {
+          audioElement.pause();
+          audioElement.currentTime = start;
+          setIsPlaying(false);
+          onEndRef.current?.();
+        }
+      } else if (current < start) {
+        audioElement.currentTime = start;
+      }
+      setCurrentTime(audioElement.currentTime);
+    });
+
+    addListener('play', () => {
+      if (!isSessionActive()) return;
+      setIsPlaying(true);
+    });
+    addListener('pause', () => {
+      if (!isSessionActive()) return;
+      session.playRequested = false;
+      setIsPlaying(false);
+    });
+    addListener('ended', () => {
+      if (!isSessionActive()) return;
+      session.playRequested = false;
+      setIsPlaying(false);
+      onEndRef.current?.();
+    });
+    addListener('error', () => {
+      if (!isSessionActive()) return;
+      setError('Failed to load audio file');
+      setIsReady(false);
+    });
 
     return () => {
-      if (audioElement) {
-        audioElement.pause();
-        if (typeof audioElement.removeAttribute === 'function') {
-          audioElement.removeAttribute('src');
-        } else {
-          audioElement.src = '';
-        }
-        audioElement.load();
-      }
-      if (sourceNode) {
-        sourceNode.disconnect();
-      }
-      if (blobUrlRef.current === currentSrc && currentSrc.startsWith('blob:')) {
-        URL.revokeObjectURL(currentSrc);
-        blobUrlRef.current = null;
+      // Only tear down our own session; a newer one may already be active if
+      // effects were re-ordered by a parent re-render.
+      if (activeSessionRef.current === session) {
+        teardownSession();
+      } else if (liveBlobUrlsRef.current.has(session.src) && session.src.startsWith('blob:')) {
+        liveBlobUrlsRef.current.delete(session.src);
+        releaseSessionBlobUrl(session.src);
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioContext, src]);
 
-  // Update gain when it changes
+  // Keep gain automation in step with the gain setting. While a stop fade is
+  // pending we leave the scheduled fade alone; it converges in its own callback.
   useEffect(() => {
-    if (gainNodeRef.current) {
-      gainNodeRef.current.gain.value = gain;
-    }
-  }, [gain]);
+    if (!gainNodeRef.current) return;
+    if (stopTimeoutRef.current !== null) return;
+    if (!audioContext) return;
+    const now = audioContext.currentTime;
+    const param = gainNodeRef.current.gain;
+    cancelGainAutomation(param, now);
+    param.setValueAtTime(gain, now);
+  }, [gain, audioContext]);
 
-  // Clamp playback position to region when start/end changes
+  // Clamp playback position to the region when start/end changes.
   useEffect(() => {
-    if (!audioElementRef.current || !duration) return;
-    const start = getEffectiveStart();
-    const end = getEffectiveEnd();
-    if (end > 0 && end < start) return;
-    if (audioElementRef.current.currentTime < start || (end > 0 && audioElementRef.current.currentTime > end)) {
-      audioElementRef.current.currentTime = start;
+    const element = audioElementRef.current;
+    if (!element || !duration) return;
+    const { start, end } = getEffectiveRegion();
+    if (end <= start) return;
+    if (element.currentTime < start || element.currentTime > end) {
+      element.currentTime = start;
     }
   }, [startTime, endTime, duration]);
 
-  // Load file from File object
+  // Load file from File object. Revocation of the previous blob URL is left to
+  // the session teardown so a URL still in use is never pulled out from under
+  // the active session.
   const loadFile = (file: File) => {
-    if (blobUrlRef.current) {
-      URL.revokeObjectURL(blobUrlRef.current);
-    }
+    const adopt = (url: string) => {
+      if (url.startsWith('blob:')) {
+        createdBlobUrlsRef.current.add(url);
+      }
+      setFileName(file.name);
+      setSrc(url);
+    };
 
     const reader = new FileReader();
     reader.onload = () => {
       const result = typeof reader.result === 'string' ? reader.result : '';
       if (result) {
-        setFileName(file.name);
-        setSrc(result);
+        adopt(result);
       }
     };
     reader.onerror = () => {
-      const url = URL.createObjectURL(file);
-      blobUrlRef.current = url;
-      setFileName(file.name);
-      setSrc(url);
+      try {
+        adopt(URL.createObjectURL(file));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load audio file');
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -571,18 +824,39 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     };
   }, []);
 
-  // Tighter loop watcher for short regions
+  // Unmount: release every blob URL this component created.
   useEffect(() => {
-    if (!isPlaying || playbackModeRef.current !== 'loop') return;
-    const interval = setInterval(() => {
-      const element = audioElementRef.current;
-      if (!element) return;
-      const regionStart = getEffectiveStart();
-      const regionEnd = getEffectiveEnd();
-      if (regionEnd > 0 && element.currentTime >= regionEnd) {
-        element.currentTime = regionStart;
+    const created = createdBlobUrlsRef.current;
+    const live = liveBlobUrlsRef.current;
+    return () => {
+      created.forEach((url) => {
+        if (live.has(url)) return;
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      });
+      created.clear();
+      live.clear();
+    };
+  }, []);
+
+  // Tighter loop watcher for short regions. Scoped to a single session so a
+  // source swap cancels it, and re-created whenever the region changes.
+  useEffect(() => {
+    if (!isPlaying || playbackMode !== 'loop') return;
+    const session = activeSessionRef.current;
+    if (!session) return;
+    const interval = window.setInterval(() => {
+      if (activeSessionRef.current !== session || session.disposed) return;
+      const element = session.element;
+      const { start, end } = getEffectiveRegion();
+      if (end > start && element.currentTime >= end) {
+        element.currentTime = start;
         if (!element.paused) {
           element.play().catch((err) => {
+            if (activeSessionRef.current !== session || session.disposed) return;
             if (isAutoplayError(err)) {
               handleAutoplayBlocked();
               return;
@@ -593,10 +867,13 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
             setError('Playback failed. User interaction may be required.');
           });
         }
+      } else if (element.currentTime < start) {
+        element.currentTime = start;
       }
     }, 10);
     return () => clearInterval(interval);
-  }, [isPlaying, playbackMode, startTime, endTime, duration]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, playbackMode, startTime, endTime, duration, src]);
 
   // Set up CV/gate worklets
   useEffect(() => {
@@ -613,16 +890,17 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
           channelCount: 1,
         });
         gateNode.port.onmessage = (event) => {
-          if (!enabled) return;
+          if (!enabledRef.current) return;
           const mode = playbackModeRef.current;
           if (event.data?.type === 'gate-on') {
             gateStateRef.current = true;
-            if (mode === 'gate' || mode === 'loop' || mode === 'one-shot') {
-              triggerPlayback();
-            }
+            // Gate high starts (or retriggers) playback in every mode; in
+            // gate/loop the state is what keeps the sample running.
+            void triggerPlayback();
           }
           if (event.data?.type === 'gate-off') {
             gateStateRef.current = false;
+            // One-shot samples must keep playing through a falling edge.
             if (mode === 'gate' || mode === 'loop') {
               stopAtStart();
             }
@@ -668,7 +946,28 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
       }
       setIsWorkletReady(false);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioContext]);
+
+  // Mode changes take effect immediately rather than waiting for the next gate
+  // edge: gated modes stop when the gate is low, resume when it is high, and
+  // one-shot never interrupts an in-flight sample.
+  useEffect(() => {
+    playbackModeRef.current = playbackMode;
+    const session = activeSessionRef.current;
+    if (!session || session.disposed) return;
+    if (!enabledRef.current) return;
+    if (playbackMode === 'one-shot') return;
+
+    if (gateStateRef.current) {
+      if (session.element.paused && !session.playRequested) {
+        void triggerPlayback();
+      }
+    } else if (!session.element.paused || session.playRequested) {
+      stopAtStart();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playbackMode]);
 
   const gateKey = gateInput?.current?.audioNode ? String(gateInput.current.audioNode) : 'null';
   useEffect(() => {
@@ -694,65 +993,12 @@ export const Sampler = React.forwardRef<SamplerHandle, SamplerProps>(({
     };
   }, [pitchCvKey, isWorkletReady]);
 
-  // Playback controls
-  const play = async () => {
-    if (audioElementRef.current && audioContext) {
-      if (stopTimeoutRef.current !== null) {
-        clearTimeout(stopTimeoutRef.current);
-        stopTimeoutRef.current = null;
-      }
-      fadeIn();
-      if (audioContext.state !== 'running') {
-        try {
-          await audioContext.resume();
-        } catch {
-          handleAutoplayBlocked();
-          return;
-        }
-      }
-      const isRunning = audioContext.state === 'running';
-      if (!isRunning) {
-        handleAutoplayBlocked();
-        return;
-      }
-      if (audioElementRef.current.currentTime < getEffectiveStart()) {
-        seekToStart();
-      }
-      audioElementRef.current.play().catch((err) => {
-        if (isAutoplayError(err)) {
-          handleAutoplayBlocked();
-          return;
-        }
-        if (isAbortPlayError(err)) {
-          if (playRetryRef.current !== null) {
-            return;
-          }
-          playRetryRef.current = window.setTimeout(() => {
-            playRetryRef.current = null;
-            audioElementRef.current?.play().catch((retryErr) => {
-              if (isAutoplayError(retryErr)) {
-                handleAutoplayBlocked();
-                return;
-              }
-              if (isAbortPlayError(retryErr)) {
-                return;
-              }
-              setError('Playback failed. User interaction may be required.');
-            });
-          }, 0);
-          return;
-        }
-        setError('Playback failed. User interaction may be required.');
-      });
-    }
-  };
-
   const stop = () => {
     stopWithFade(true);
   };
 
   const triggerCommand = async () => {
-    if (playbackMode === 'gate') {
+    if (playbackMode === 'gate' || playbackMode === 'loop') {
       gateStateRef.current = true;
     }
     await triggerPlayback();
