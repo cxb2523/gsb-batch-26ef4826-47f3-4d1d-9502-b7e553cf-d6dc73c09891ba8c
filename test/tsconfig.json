@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "outDir": "../dist-test",
+    "noEmit": true,
+    "types": [
+      "audioworklet",
+      "node",
+      "vite/client",
+      "vitest/globals"
+    ]
+  },
+  "include": ["./**/*.ts", "../src/**/*.ts"],
+  "exclude": ["node_modules", "../node_modules", "dist", "../dist"]
+}

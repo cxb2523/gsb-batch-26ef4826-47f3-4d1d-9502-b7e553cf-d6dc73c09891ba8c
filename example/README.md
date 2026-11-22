@@ -99,18 +99,39 @@ The HTML entry point is in `index.html`:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Audio Worklet Example</title>
+  <title>Example</title>
 </head>
 <body>
   <h1>audio-worklet-stream example</h1>
-  <div id="output">Ready</div>
+  <table>
+    <tr><th>Status</th><td id="status">Ready</td></tr>
+    <tr><th>Stop position</th><td id="stopPosition">-</td></tr>
+    <tr><th>Underrun events</th><td id="underrunCount">0</td></tr>
+    <tr><th>Accumulated silent frames</th><td id="underrunFrames">0</td></tr>
+  </table>
   <button id="startTimerButton">Start Stream (UI Timer)</button>
   <button id="startWorkerButton">Start Stream (Worker)</button>
   <button id="stopButton">Stop Stream</button>
+  <button id="stopAtPositionButton">Stop at current position + 256 frames</button>
+  <div id="log"></div>
   <script type="module" src="./src/main.ts"></script>
 </body>
 </html>
 ```
+
+### Observing underruns and stop positions
+
+The page makes the stream's edge behavior observable:
+
+- **Underrun events**: when playback runs out of buffered frames it outputs silence; each
+  `UnderrunEvent` reported on recovery (or on stop) is counted, its silent frames are
+  accumulated, and a log line is appended. The manual stream writes only one second of
+  data, so it underruns shortly after starting.
+- **Stop position**: the `StopEvent.stoppedAtFrame` value is shown in the table and log.
+  Use **Stop at current position + 256 frames** to request a stop 256 frames ahead of the
+  current read position and verify that playback stops exactly at the requested frame.
+  If the requested position has already been played, the stream stops immediately on the
+  next render quantum instead of continuing to the next checkpoint.
 
 ## Notes
 

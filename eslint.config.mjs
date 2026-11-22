@@ -5,7 +5,7 @@ import tsEslint from 'typescript-eslint'
 
 export default [
   {
-    ignores: ['**/dist/*', '**/node_modules/*', '**/docs/*'],
+    ignores: ['**/dist/*', '**/dist-test/*', '**/node_modules/*', '**/docs/*'],
   },
   {
     files: ['**/*.ts'],
@@ -14,6 +14,8 @@ export default [
       parserOptions: {
         project: [
           './tsconfig.json',
+          './tsconfig.config.json',
+          './test/tsconfig.json',
           './example/tsconfig.json',
         ],
       },

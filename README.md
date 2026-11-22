@@ -222,6 +222,8 @@ As outlined in the overview, OutputStreamNode requires external audio samples. T
 - The AudioNode continues to operate and consume CPU resources even during silent output.
 - Normal audio output resumes automatically when new audio data is supplied.
 - An UnderrunEvent is emitted upon recovery from an underrun, reporting the duration of silence (note: this is a post-event notification).
+- If the stream is stopped while an underrun has not yet recovered, the accumulated silent duration is emitted as an UnderrunEvent immediately before the StopEvent, so no silence statistics are lost. No further UnderrunEvents are emitted after the stream has stopped.
+- `stop(framePosition)` stops exactly at the requested frame without reading past it; if the requested position has already been played, the stream stops on the next render quantum instead of continuing to a later checkpoint.
 
 ## Details of Configuration Parameters
 

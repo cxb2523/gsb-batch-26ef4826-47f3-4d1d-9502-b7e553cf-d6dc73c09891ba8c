@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed `stop(framePosition)` no longer overshooting the requested frame: the processor now clamps each render quantum so it never reads beyond the stop position, and stops immediately when the requested position has already been read instead of continuing to the next checkpoint.
+- Fixed underrun accounting at the stop boundary: silent frames accumulated during an unrecovered underrun are now flushed as an `UnderrunEvent` before the `StopEvent`, instead of being discarded, and silence caused by stop clamping is no longer misreported as an underrun.
+- Fixed underrun recovery detection so that supplying a partial block after silence reports the accumulated silent duration immediately rather than waiting for a full block.
+- After stopping, no further underrun or stop events are emitted.
+
+### Changed
+
+- Extracted the processor's stateful playback logic into `OutputStreamProcessorEngine` and kept the `AudioWorkletProcessor` wrapper thin. The `StreamState` state machine, `totalReadFrames`/`totalWriteFrames` semantics and the public API are unchanged; timer and worker strategy stops continue through the same `stop(framePosition)` path.
+- The example now displays underrun event counts, accumulated silent frames and the exact stop frame, and adds a button that stops 256 frames after the current read position.
+
+### Added
+
+- Added a Vitest suite covering underrun recovery, stopping during an underrun, stop positions that have already been read, exact future stop positions and repeated underrun cycles.
+
 ## [2.0.3] - 2026-11-20
 
 ### Changed
