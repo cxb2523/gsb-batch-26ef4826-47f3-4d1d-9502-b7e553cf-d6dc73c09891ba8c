@@ -2,6 +2,17 @@
 
 The active workflow is **Shape → Artwork → Print**. Choose dimensions, download the labeled template and prompt, generate the artwork externally in ChatGPT Images, then upload one finished image. Upload fits every face and opens Print automatically. Print offers Fit all faces, image replacement and PDF settings. Manual layers, color editing, face dragging, the Brand/Design steps and PDF brand-book ingestion have been removed from the app. Existing saved images and legacy layers are retained for compatibility; legacy step numbers migrate to the three-step workflow.
 
+## Design/atlas binding (2026-11-23)
+
+A design belongs to exactly one box signature (`shape`, width, depth, height, thickness, window, closure). Switching shape or changing any of those now invalidates the previous box's mapped face canvas, its white-edge repair and the auto-fit crops, then remaps the artwork against the new panels. The same signature reuses the cached canvas, so repainting layers or re-exporting does not remap and re-scan pixels.
+
+- `design-binding.js` centralises the signature, the strict atlas binding (an atlas is usable only when its binding and its manifest signatures both match the live box) and the face cache key, with no DOM or Three.js dependency so it can be audited in Node.
+- `artwork-cache.js` owns the per-face canvas. A lookup only hits when the signature, manifest, face, size, map, crop, adjustment and repair flag all match; a foreign signature drops the canvas first.
+- `engine.js` stamps every built model and every print piece with the signature it was produced for, advances a generation counter on each rebuild, and refuses to draw a print piece from another box. `flatPieces`/`renderPrintPiece`/`printPlan`/`exportPDF` refresh the model for the current signature before reading a face canvas, so the 3D material and the PDF use the same pixels.
+- `face-fit.js` qualifies the fit version with the atlas signature, and `layout-workflow.js`/`face-fit-ui.js` keep manual crop edits bound to the signature they were made against.
+- Artwork upload captures a fingerprint before its awaits and re-checks the signature, generation and upload token before committing; a box switch or a superseding upload discards the late result.
+- `audit-design-binding.mjs` and `audit-browser-binding.mjs` cover the signature scope, cache-key inputs, per-signature invalidation, async staleness, and the live 3D/print agreement.
+
 The remainder below documents earlier construction and implementation history.
 
 # Fold Studio — local working prototype

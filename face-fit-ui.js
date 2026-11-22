@@ -1,8 +1,12 @@
 import * as E from './engine.js';
-import {autoFitFaces,panelBounds,safeCrop} from './face-fit.js';
+import {autoFitFaces,panelBounds,safeCrop,FIT_VERSION} from './face-fit.js';
 import {identityAdjustment} from './artwork-transform.js';
 const $=id=>document.getElementById(id),s=E.state,esc=t=>String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let hooks,beforeChange,draft,editingFace;
+// Manual crop edits keep the fit marked valid for the atlas signature they were
+// made against. The guard rejects edits on an atlas for another box.
+function markFit(atlas){if(!atlas)return false;atlas.fitVersion=FIT_VERSION;atlas.fitSignature=atlas.signature??atlas.manifest?.signature??null;atlas.fitManifestSignature=atlas.manifest?.signature??null;return true;}
+function atlasIsCurrent(){return !!s.designAtlas&&s.designAtlas.manifest?.signature===E.designSignature()&&(!s.designAtlas.signature||s.designAtlas.signature===E.designSignature());}
 export function mountFaceFit(options){
  ({hooks,beforeChange}=options);if(!s.designAtlas||s.step!==2)return;
  if(!$('faceFitDialog')){const d=document.createElement('dialog');d.id='faceFitDialog';d.innerHTML=`<div class="dialog-head"><div><p class="eyebrow">Use the original picture</p><h2>Choose the artwork.</h2></div><button id="closeFaceFit">Close ×</button></div><p id="fitDescription"></p><p>Drag the corners to select this panel.</p><div id="fitStage"><img id="fitSource" alt="Original uploaded artwork"><div id="fitBox"><span id="fitLabel"></span>${['tl','tr','bl','br'].map(k=>`<button class="fit-handle fit-${k}" data-fit-handle="${k}" aria-label="Resize ${k} corner"></button>`).join('')}</div></div><div class="fit-numbers">${[['x','Left'],['y','Top'],['width','Width'],['height','Height']].map(([id,label])=>`<label class="field"><span>${label} · %</span><input id="fit-${id}" type="number" min="0" max="100" step=".1"></label>`).join('')}</div><div class="row"><button id="fitDetect">Find edges again</button><button id="fitOriginal">Original template area</button><button id="fitRotate">Rotate 90°</button></div><p class="microcopy">The selection fills this panel. The box shape stays unchanged.</p><button id="applyFaceFit" class="primary">Stretch to this side ↗</button>`;document.body.appendChild(d);
@@ -12,10 +16,10 @@ export function mountFaceFit(options){
   $('fitRotate').onclick=()=>{draft.rotation=(draft.rotation+90)%360;draw();};
   $('fitOriginal').onclick=()=>{draft=safeCrop(panelBounds(s.designAtlas.manifest,editingFace));draw();};
   $('fitDetect').onclick=()=>{draft=autoFitFaces(E.imageFor(s.designAtlas.assetId),s.designAtlas.manifest)[editingFace];draw();};
-  $('applyFaceFit').onclick=()=>{beforeChange();s.designAtlas.crops||={};s.designAtlas.crops[editingFace]=safeCrop(draft);s.designAtlas.adjustments||={global:identityAdjustment(),faces:{}};s.designAtlas.adjustments.faces||={};s.designAtlas.adjustments.faces[editingFace]=identityAdjustment();hooks.changed();d.close();hooks.render();hooks.toast('The selected picture now fills this side. The original image is unchanged.');};
+  $('applyFaceFit').onclick=()=>{if(!atlasIsCurrent()){hooks.toast('The box changed. Choose the artwork again for this box.');return;}beforeChange();s.designAtlas.crops||={};s.designAtlas.crops[editingFace]=safeCrop(draft);s.designAtlas.adjustments||={global:identityAdjustment(),faces:{}};s.designAtlas.adjustments.faces||={};s.designAtlas.adjustments.faces[editingFace]=identityAdjustment();markFit(s.designAtlas);hooks.changed();d.close();hooks.render();hooks.toast('The selected picture now fills this side. The original image is unchanged.');};
  }
  document.querySelector('.alignment-card h3').insertAdjacentHTML('afterend',`<button id="fitArtworkAll" class="primary" title="Fit the original artwork on every face">Fit all faces ↗</button><details class="dimensions face-fit-tools"><summary>Adjust panel fit</summary><label class="field"><span>Side to fit</span><select id="fitFace">${Object.entries(E.faceNames).filter(([id])=>!id.endsWith('Tab')).map(([id,label])=>`<option value="${id}" ${id===s.activeFace?'selected':''}>${esc(label)}</option>`).join('')}</select></label><button id="fitSelectedFace" class="primary">Select artwork area ↗</button></details>`);
- $('fitArtworkAll').onclick=()=>{beforeChange();const a=s.designAtlas;a.crops=Object.fromEntries(Object.keys(a.manifest.faces).filter(id=>!id.endsWith('Tab')).map(id=>[id,{...panelBounds(a.manifest,id),mode:'fit'}]));a.adjustments={global:identityAdjustment(),faces:{}};hooks.changed();hooks.render();hooks.toast('All faces fitted.');};
+ $('fitArtworkAll').onclick=()=>{if(!atlasIsCurrent()){hooks.toast('The box changed. Choose the artwork again for this box.');return;}beforeChange();const a=s.designAtlas;a.crops=Object.fromEntries(Object.keys(a.manifest.faces).filter(id=>!id.endsWith('Tab')).map(id=>[id,{...panelBounds(a.manifest,id),mode:'fit'}]));a.adjustments={global:identityAdjustment(),faces:{}};markFit(a);hooks.changed();hooks.render();hooks.toast('All faces fitted.');};
  $('fitFace').onchange=e=>{s.activeFace=e.target.value;s.selected=null;hooks.render();};
  $('fitSelectedFace').onclick=()=>open(s.activeFace);
 

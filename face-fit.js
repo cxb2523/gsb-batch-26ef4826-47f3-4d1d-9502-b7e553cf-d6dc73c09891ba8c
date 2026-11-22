@@ -2,13 +2,34 @@ export function faceBounds(m){const xs=[m[4],m[4]+m[0],m[4]+m[2],m[4]+m[0]+m[2]]
 export function panelBounds(manifest,id){const points=manifest.panels?.filter(p=>p.id===id&&!p.glue).flatMap(p=>p.polygons.flat());if(!points?.length)return faceBounds(manifest.faces[id]);const xs=points.map(p=>p[0]/manifest.width),ys=points.map(p=>p[1]/manifest.height);return{x:Math.min(...xs),y:Math.min(...ys),width:Math.max(...xs)-Math.min(...xs),height:Math.max(...ys)-Math.min(...ys),rotation:0};}
 export const FIT_VERSION=3;
 export function needsTemplateFit(manifest){return !!manifest.panels?.some(p=>!p.glue&&p.polygons.some(poly=>poly.length===4&&poly.some((v,i)=>{const b=poly[(i+1)%poly.length];return Math.abs(v[0]-b[0])>1&&Math.abs(v[1]-b[1])>1;})));}
+// The fit result is only meaningful for the box signature it was computed for.
+// Reusing an atlas across a geometry change would carry crops from the old
+// panels, so the version check is qualified by the signature.
+export function fitIsCurrent(atlas){
+ if(!atlas||atlas.fitVersion<FIT_VERSION)return false;
+ // A fit recorded against a different signature is stale; a legacy fit that
+ // recorded none is trusted for the manifest it was derived from.
+ if(atlas.fitSignature&&atlas.signature&&atlas.fitSignature!==atlas.signature)return false;
+ if(atlas.fitManifestSignature&&atlas.manifest?.signature&&atlas.fitManifestSignature!==atlas.manifest.signature)return false;
+ return true;
+}
 export function ensureCurrentFit(atlas,image){
- if(!atlas||!image||atlas.fitVersion>=FIT_VERSION)return false;
- if(atlas.fitVersion===2&&!needsTemplateFit(atlas.manifest)){atlas.fitVersion=FIT_VERSION;return false;}
+ if(!atlas||!image)return false;
+ // Never fit a manifest that belongs to a different box than the atlas binding.
+ if(atlas.signature&&atlas.manifest?.signature&&atlas.signature!==atlas.manifest.signature)return false;
+ if(fitIsCurrent(atlas))return false;
+ if(atlas.fitVersion===2&&!needsTemplateFit(atlas.manifest)&&(!atlas.fitSignature||atlas.fitSignature===atlas.signature)){
+  atlas.fitVersion=FIT_VERSION;atlas.fitSignature=atlas.signature??null;atlas.fitManifestSignature=atlas.manifest?.signature??null;return false;
+ }
  atlas.previousAlignment||={crops:structuredClone(atlas.crops||{}),adjustments:structuredClone(atlas.adjustments||{})};
  atlas.crops=autoFitFaces(image,atlas.manifest);
  atlas.adjustments={global:{x:0,y:0,scale:1,rotation:0},faces:{}};
- atlas.fitVersion=FIT_VERSION;return true;
+ atlas.fitVersion=FIT_VERSION;atlas.fitSignature=atlas.signature??null;atlas.fitManifestSignature=atlas.manifest?.signature??null;return true;
+}
+// Invalidate the fit decision so the next paint recomputes it for this atlas.
+export function invalidateFit(atlas){
+ if(!atlas)return false;
+ atlas.fitVersion=0;atlas.fitSignature=null;atlas.fitManifestSignature=null;return true;
 }
 export function safeCrop(r){const number=(k,d)=>Number.isFinite(+r?.[k])?+r[k]:d,x=Math.max(0,Math.min(.995,number('x',0))),y=Math.max(0,Math.min(.995,number('y',0)));return{x,y,width:Math.max(.005,Math.min(1-x,number('width',1-x))),height:Math.max(.005,Math.min(1-y,number('height',1-y))),rotation:((Math.round(number('rotation',0)/90)*90%360)+360)%360};}
 export function autoFitFaces(image,manifest){

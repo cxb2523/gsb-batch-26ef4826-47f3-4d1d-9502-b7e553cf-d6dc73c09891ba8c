@@ -62,10 +62,12 @@ At handoff 2026-11-16: build and all following commands passed:
 ```powershell
 npm.cmd run audit
 npm.cmd run audit:opening
+npm.cmd run audit:design
 node audit-face-fit.mjs
 node audit-artwork-transform.mjs
 node audit-template-prompt.mjs
 ```
+`npm.cmd run audit:browser` additionally drives the built app in headless Chrome and checks that switching the box updates both the 3D faces and the print pieces, that repeated draws under one signature reuse the face cache, and that an async result arriving after a switch is discarded. It needs a Chrome/Chromium binary (set `CHROME` if it is not in the Playwright cache) and a built `dist/`.
 Computational geometry checks do not establish real paper buildability. Physical assembly, stock, glue, load and closure fit need testing.
 Print at 100% / Actual size. PDF is RGB, not certified CMYK/prepress output.
 AI may shift boundaries, distort text/logos or ignore orientation; fitting cannot repair illustration content.

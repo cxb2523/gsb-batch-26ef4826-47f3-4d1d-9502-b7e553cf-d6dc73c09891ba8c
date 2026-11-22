@@ -57,6 +57,9 @@ export async function readArtworkFile(image){
  if(!saved)throw Error(maps.length?'This box has a different shape or size from your saved template. Restore the original box, or download a new template.':'Download the template for this box first. Its placement map will be remembered automatically.');
  if(!E.constructionCheck().printable)throw Error('This shape is preview-only. Choose a geometry-checked shape.');
  const src=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=()=>rej(Error('Could not read the image.'));r.readAsDataURL(image);});
- await checkArtwork(src,expected);return{src,name:image.name,manifest:expected};
+ const decoded=await checkArtwork(src,expected);return{src,image:decoded,name:image.name,manifest:expected};
 }
-export async function checkArtwork(src,manifest){const im=await E.loadImage(src);if(Math.abs((im.naturalWidth/im.naturalHeight)/(manifest.width/manifest.height)-1)>.005)throw Error('The image proportions changed. Export the full landscape template canvas without cropping or extra borders.');if(im.naturalWidth<1024)throw Error('Use an image at least 1024 pixels wide; 4096 is recommended for print.');return im;}
+// Dimension/resolution checks for an already decoded image, shared by the file
+// reader and the commit path so both enforce the same limits.
+export function validateArtworkImage(im,manifest){if(Math.abs((im.naturalWidth/im.naturalHeight)/(manifest.width/manifest.height)-1)>.005)throw Error('The image proportions changed. Export the full landscape template canvas without cropping or extra borders.');if(im.naturalWidth<1024)throw Error('Use an image at least 1024 pixels wide; 4096 is recommended for print.');return im;}
+export async function checkArtwork(src,manifest){return validateArtworkImage(await E.loadImage(src),manifest);}

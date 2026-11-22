@@ -3,6 +3,8 @@ import {sheetFor} from './print-sheet.js';
 import {panelBounds,safeCrop,ensureCurrentFit} from './face-fit.js';
 import {extendWhiteEdges} from './artwork-edges.js';
 import {adjustmentMatrix} from './artwork-transform.js';
+import {designSignatureOf,atlasMatchesSignature,ensureAtlasBinding,designFingerprint,fingerprintIsStale} from './design-binding.js';
+import {createFaceArtworkCache} from './artwork-cache.js';
 import * as THREE from 'three';
 import {jsPDF} from 'jspdf';
 import {face as drawCharacter} from './upstream-face.js';
@@ -25,6 +27,13 @@ export function faceState(id){return state.faces[id]||(state.faces[id]=blankFace
 const assets=new Map();
 export function registerImage(asset,img){assets.set(asset.id,img);}
 export function imageFor(id){return assets.get(id);}
+// Every geometry change rebuilds the model. In-flight artwork loading compares
+// this counter before and after its awaits so a late result cannot land on a
+// newer box. The counter advances on every rebuild, even when the visible
+// signature repeats, so an A→B→A switch still discards the A-then result.
+let designGeneration=0;
+export function designFingerprintNow(){return designFingerprint(designSignature(),designGeneration);}
+export function designFingerprintIsStale(captured){return fingerprintIsStale(captured,designFingerprintNow());}
 export function loadImage(src){return new Promise((resolve,reject)=>{const i=new Image();i.onload=()=>resolve(i);i.onerror=()=>reject(new Error('This image could not be opened. Try PNG, JPG, WebP or SVG.'));i.src=src;});}
 export function uid(){return crypto.randomUUID();}
 export function addImage(id,faceId=state.activeFace,kind='logo'){
@@ -37,6 +46,8 @@ export function faceDimensions(id){const t=built?.tex[id];return t?{w:t.w,h:t.h}
 
 let canvas,renderer,scene,camera,turntable,flipper,keyLight,shadow,built=null,flatness=1,targetFold=1,angle=-.4,elevation=.6,zoom=1;
 let callbacks={},orbit=null,drag=null,press=null,opening=0,openingVelocity=0,openingTarget=0,requestedFold=1,lastFrame=0,openingBounds=null;
+const artworkCache=createFaceArtworkCache({repairEdgeArtwork:extendWhiteEdges});
+export const artworkStats=artworkCache.stats;
 const reducedMotion=typeof matchMedia==='function'?matchMedia('(prefers-reduced-motion: reduce)'):null;
 const ray=new THREE.Raycaster(),pointer=new THREE.Vector2(),lightOffset=new THREE.Vector3(-240,450,-260);
 const texture=c=>{const t=new THREE.CanvasTexture(c);t.encoding=THREE.sRGBEncoding;t.anisotropy=Math.min(16,renderer?.capabilities.getMaxAnisotropy()||1);if(!renderer?.capabilities.isWebGL2){t.generateMipmaps=false;t.minFilter=THREE.LinearFilter;}return t;};
@@ -82,10 +93,26 @@ export function makeSpec(config=state){
 const verificationCache=new Map();
 export function constructionCheck(config=state){const key=JSON.stringify([config.shape,config.width,config.depth,config.height,config.thickness,config.window]);if(verificationCache.has(key))return verificationCache.get(key);let result;try{result=validateSpec(makeSpec(config),config);}catch(e){result={status:'blocked',printable:false,physicalTested:false,issues:['Construction geometry could not be verified: '+e.message],checks:{}};}verificationCache.set(key,result);return result;}
 export function rebuild(){
- if(state.designAtlas&&state.designAtlas.manifest?.signature!==designSignature()){state.designAtlas=null;state.undoDesign=null;callbacks.onNotice?.('The box size or construction changed. Download a new template for this layout.');}
+ // Every rebuild starts a new generation. A slow artwork load that began
+ // before this point can detect that it is no longer current.
+ designGeneration++;
+ const signature=designSignature();
+ const atlas=state.designAtlas;
+ if(atlas){
+  // Adopt a legacy atlas only when its manifest already describes this box.
+  ensureAtlasBinding(atlas,signature);
+  if(!atlasMatchesSignature(atlas,signature)){
+   state.designAtlas=null;state.undoDesign=null;
+   callbacks.onNotice?.('The box size or construction changed. Download a new template for this layout.');
+  }
+ }
  if(!renderer)return;
  opening=openingTarget=openingVelocity=0;openingBounds=null;press=drag=orbit=null;
- if(built){built.geos.forEach(g=>g.dispose());built.mats.forEach(m=>m.dispose());Object.values(built.tex).forEach(t=>t.tex.dispose());flipper.clear();}
+ if(built){
+  // Drop mapped artwork for the previous box before its textures disappear.
+  Object.values(built.tex).forEach(t=>artworkCache.invalidate(t));
+  built.geos.forEach(g=>g.dispose());built.mats.forEach(m=>m.dispose());Object.values(built.tex).forEach(t=>t.tex.dispose());flipper.clear();
+ }
  const spec=makeSpec(),tex={},geos=[],mats=[],nodes=[],prints=[],dashes=[],meshes=[],pieces=[];
  Object.keys(faceNames).forEach(k=>delete faceNames[k]);Object.assign(faceNames,spec.names);
  function add(node,parent,at,rot,piece,parentTex=null){
@@ -104,7 +131,7 @@ export function rebuild(){
   if(node.fold)nodes.push({g,fold:node.fold});for(const ch of node.children||[])add(ch.node,g,ch.at,ch.rot,piece,k);
  }
  spec.pieces.forEach((p,i)=>{const g=new THREE.Group();g.position.set(p.at[0],0,p.at[1]);flipper.add(g);add(p.node,g,[0,0],0,i);pieces.push({...p,g});});
- built={tex,geos,mats,nodes,prints,panels:prints,dashes,meshes,pieces,lh:spec.lh};paint();pose(flatness);callbacks.onChange?.();callbacks.onOpening?.(openingState());
+ built={tex,geos,mats,nodes,prints,panels:prints,dashes,meshes,pieces,lh:spec.lh,signature};paint();pose(flatness);callbacks.onChange?.();callbacks.onOpening?.(openingState());
 }
 function pose(fold,open=opening){const t=fold*4;flipper.rotation.x=Math.PI*(1-ease(clamp(t)));for(const n of built.nodes)n.g.rotation.x=-n.fold(t);for(const p of built.prints)if(p.tex.endsWith('Tab'))p.g.visible=fold<.72;for(const p of built.pieces){const m=p.move(t);p.g.position.set(m.x,m.y||0,p.at[1]);p.g.rotation.z=m.rz||0;}if(fold>.999)applyOpening(built,state,open);turntable.rotation.y=angle;}
 function roundRect(g,x,y,w,h,r){g.beginPath();g.roundRect(x,y,w,h,r);g.fill();}
@@ -112,13 +139,19 @@ export function paintFace(id,c,selection=false){
  const g=c.getContext('2d'),w=c.width,h=c.height,f=faceState(id),bg=f.color||((id==='bottom')?state.accent:state.background);
  g.clearRect(0,0,w,h);g.fillStyle=bg;g.fillRect(0,0,w,h);
  if(id.endsWith('Tab')){g.fillStyle='#fff';g.fillRect(0,0,w,h);return;}
- const atlas=state.designAtlas, image=atlas&&imageFor(atlas.assetId), m=atlas?.manifest?.faces?.[id];
- if(image&&m&&atlas.manifest.signature===designSignature()){
+ const atlas=state.designAtlas, image=atlas&&imageFor(atlas.assetId), m=atlas?.manifest?.faces?.[id], t=built?.tex?.[id];
+ // Artwork is only valid for the box it was mapped onto. A stale atlas is
+ // dropped rather than projected through the new box's face maps.
+ if(image&&m&&t&&atlasMatchesSignature(atlas,designSignature())){
   ensureCurrentFit(atlas,image);
-  const t=built.tex[id],key=JSON.stringify([atlas.assetId,m,w,h,atlas.adjustments?.global,atlas.adjustments?.faces?.[id],atlas.crops?.[id],atlas.repairWhiteEdges!==false]);
-  const cached=t.atlasCanvas||=document.createElement('canvas');
-  if(t.atlasKey!==key){
-   if(cached.width!==w||cached.height!==h){cached.width=w;cached.height=h;}const cg=cached.getContext('2d',{willReadFrequently:true});cg.clearRect(0,0,w,h);
+  const signature=designSignature();
+  artworkCache.ensure(t,{
+   signature,assetId:atlas.assetId,manifestSignature:atlas.manifest.signature,
+   manifestWidth:atlas.manifest.width,manifestHeight:atlas.manifest.height,
+   faceId:id,width:w,height:h,widthMM:t.w,heightMM:t.h,map:m,
+   globalAdjustment:atlas.adjustments?.global??null,faceAdjustment:atlas.adjustments?.faces?.[id]??null,
+   crop:atlas.crops?.[id]??null,repairWhiteEdges:atlas.repairWhiteEdges!==false
+  },(cg,cached)=>{
    const matrix=new DOMMatrix([m[0]*image.naturalWidth/w,m[1]*image.naturalHeight/w,m[2]*image.naturalWidth/h,m[3]*image.naturalHeight/h,m[4]*image.naturalWidth,m[5]*image.naturalHeight]).inverse();
    const sample=ctx=>{if(atlas.crops?.[id]?.mode==='fit'){drawFittedFace(ctx,image,m,w,h);return;}ctx.save();ctx.transform(matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f);ctx.transform(...adjustmentMatrix(image.naturalWidth,image.naturalHeight,atlas.adjustments?.global));const crop=atlas.crops?.[id];
     if(crop?.mode==='template'){const r=crop.registration;ctx.transform(r.sx,0,0,r.sy,r.tx*image.naturalWidth,r.ty*image.naturalHeight);ctx.drawImage(image,0,0);}
@@ -129,9 +162,8 @@ export function paintFace(id,c,selection=false){
     const cropped=t.importCanvas||=document.createElement('canvas');if(cropped.width!==w||cropped.height!==h){cropped.width=w;cropped.height=h;}const cc=cropped.getContext('2d');cc.clearRect(0,0,w,h);sample(cc);
     cg.save();cg.transform(...adjustmentMatrix(w,h,local,!!t.flip));cg.drawImage(cropped,0,0);cg.restore();
    }else sample(cg);
-   t.edgeRepair=atlas.repairWhiteEdges!==false?extendWhiteEdges(cached,t.w,t.h):null;t.atlasKey=key;
-  }
-  g.drawImage(cached,0,0);
+  });
+  g.drawImage(t.atlasCanvas,0,0);
  }
  g.save();
  // Lid walls turn upside down when assembled; keep their artwork upright.
@@ -157,7 +189,18 @@ export function paintFace(id,c,selection=false){
  }
  g.restore();
 }
-export function paint(){if(!built)return;for(const [id,t]of Object.entries(built.tex)){paintFace(id,t.c);t.tex.needsUpdate=true;t.insideMat.color.copy(interiorColor(id));if(t.edgeMat){t.edgeMat.color.copy(interiorColor(id)).multiplyScalar(.72);t.edgeInk.color.copy(interiorColor(id)).multiplyScalar(.5);}}callbacks.onChange?.();}
+export function paint(){if(!built)return;for(const [id,t]of Object.entries(built.tex)){paintFace(id,t.c);t.tex.needsUpdate=true;t.insideMat.color.copy(interiorColor(id));if(t.edgeMat){t.edgeMat.color.copy(interiorColor(id)).multiplyScalar(.72);t.edgeInk.color.copy(interiorColor(id)).multiplyScalar(.5);}}built.paintedSignature=built.signature;callbacks.onChange?.();}
+// The print renderer reuses the exact face canvases the 3D material draws from.
+// If the model was rebuilt since the last paint, produce its canvases first so a
+// PDF can never pick up the previous box. A canvas already painted for the
+// current signature is left untouched, so repeated draws reuse the cache.
+function ensureModelForSignature(){
+ const signature=designSignature();
+ if(!built)return false;
+ if(built.signature!==signature){if(!renderer)return false;rebuild();}
+ else if(built.paintedSignature!==signature)paint();
+ return !!built&&built.signature===signature&&built.paintedSignature===signature;
+}
 function resize(){if(!renderer)return;const {width,height}=canvas.parentElement.getBoundingClientRect();renderer.setSize(width,height,false);camera.aspect=width/height;camera.updateProjectionMatrix();}
 function visiblePaperVertices(){flipper.updateWorldMatrix(true,true);const points=[];for(const mesh of built.meshes){if(mesh.userData.inside)continue;let visible=true;for(let p=mesh;p;p=p.parent)if(!p.visible){visible=false;break;}if(!visible)continue;const a=mesh.geometry.attributes.position;for(let i=0;i<a.count;i++)points.push(new THREE.Vector3().fromBufferAttribute(a,i).applyMatrix4(mesh.matrixWorld));}return points;}
 function frame(now){const dt=Math.min(.05,Math.max(0,(now-(lastFrame||now))/1000));lastFrame=now;if(built){const wasMoving=opening!==openingTarget,wasAssembled=flatness>.999&&requestedFold===1;
@@ -189,24 +232,36 @@ function move(e){if(press&&e.pointerId!==press.id)return;if(press&&Math.hypot(e.
 function cancelGesture(){press=drag=orbit=null;canvas.style.cursor='default';}
 function up(e){if(e.button!==0||!press||e.pointerId!==press.id)return;const click=press.onBox&&!press.moved&&!drag&&!!hit(e);if(drag&&press.moved)callbacks.onCommit?.();cancelGesture();if(click&&(state.simpleMode||!(state.step===2&&state.designAtlas)))toggleOpen();}
 
-export function designSignature(){return JSON.stringify([state.shape,state.width,state.depth,state.height,state.thickness,!!state.window,state.closure]);}
+export function designSignature(){return designSignatureOf(state);}
+// Re-exported so project restore can bind a stored atlas to the live box with
+// the same rule the engine uses on every rebuild.
+export {ensureAtlasBinding};
 export function flatPieces(){
+ if(!built)return [];
+ // If the state moved since the last paint, refresh the model and all face
+ // canvases so the print net is derived from the current box, not the old one.
+ ensureModelForSignature();
  const keepAngle=angle,keepFold=flatness;turntable.rotation.y=0;pose(0);turntable.rotation.y=0;scene.updateMatrixWorld(true);
  // Snap numerical transform noise so shared edges union into one cut contour.
  const p=new THREE.Vector3(),map=(g,x,y)=>{p.set(x,0,y).applyMatrix4(g.matrixWorld);return[Math.round(p.x*1e6)/1e6,Math.round(p.z*1e6)/1e6];};
  const output=built.pieces.map((_,pi)=>{
   const items=built.prints.filter(p=>p.piece===pi).map(it=>{const [o,x,y]=it.imageFrame;return{...it,sheet:it.polys.map(poly=>poly.map(([x,y])=>map(it.g,x,y))),cutouts:it.holes.map(poly=>poly.map(([x,y])=>map(it.g,x,y))),frame:[map(it.g,...o),map(it.g,o[0]+x[0],o[1]+x[1]),map(it.g,o[0]+y[0],o[1]+y[1])]};});
   const dashes=built.dashes.filter(p=>p.piece===pi).map(l=>[map(l.g,...l.a),map(l.g,...l.b)]);
-  return uprightNet({name:built.pieces[pi].name||`Piece ${pi+1}`,dashes,...finishNet(items)},id=>built.tex[id]?.flip);
+  return{...uprightNet({name:built.pieces[pi].name||`Piece ${pi+1}`,dashes,...finishNet(items)},id=>built.tex[id]?.flip),signature:built.signature};
  });angle=keepAngle;pose(keepFold);return output;
 }
 export function renderPrintPiece(piece,scale=8,guides=state.guides){
+ if(!built)return document.createElement('canvas');
+ // Every face canvas read below must belong to the current signature. A piece
+ // produced for another box is rejected rather than silently mixing canvases.
+ ensureModelForSignature();
+ if(piece.signature&&piece.signature!==built.signature)throw Error('The print layout belongs to another box. Rebuild the preview before printing.');
  const pad=3,c=document.createElement('canvas');c.width=Math.ceil((piece.w+pad*2)*scale);c.height=Math.ceil((piece.h+pad*2)*scale);const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);
  const pt=([x,y])=>[(x-piece.minX+pad)*scale,(y-piece.minY+pad)*scale];
  // Lay all edge extensions down first. Drawing them between face textures
  // would erase neighboring artwork, especially on the narrow curved facets.
  if(state.bleed)for(const it of piece.items){if(it.tex.endsWith('Tab'))continue;g.save();g.strokeStyle=faceState(it.tex).color||state.background;g.lineWidth=4*scale;for(const poly of it.sheet){g.beginPath();poly.forEach((p,i)=>i?g.lineTo(...pt(p)):g.moveTo(...pt(p)));g.closePath();g.stroke();}g.restore();}
- for(const it of piece.items){const t=built.tex[it.tex],tc=t.c,[o,x,y]=it.frame;const ax=[x[0]-o[0],x[1]-o[1]],ay=[y[0]-o[0],y[1]-o[1]];
+ for(const it of piece.items){const t=built.tex[it.tex];if(!t||!t.c)throw Error('A face canvas is missing for the print layout. Rebuild the preview, then export again.');const tc=t.c,[o,x,y]=it.frame;const ax=[x[0]-o[0],x[1]-o[1]],ay=[y[0]-o[0],y[1]-o[1]];
   // Identical face canvas in 3D and print; affine projection retains orientation.
   const a=ax[0]/tc.width*scale,b=ax[1]/tc.width*scale,cc=ay[0]/tc.height*scale,d=ay[1]/tc.height*scale,e=(o[0]-piece.minX+pad)*scale,f=(o[1]-piece.minY+pad)*scale;
   g.save();g.beginPath();for(const poly of [...it.sheet,...it.cutouts]){poly.forEach((p,i)=>i?g.lineTo(...pt(p)):g.moveTo(...pt(p)));g.closePath();}g.clip('evenodd');g.setTransform(a,b,cc,d,e,f);g.drawImage(tc,0,0);g.restore();
@@ -214,14 +269,22 @@ export function renderPrintPiece(piece,scale=8,guides=state.guides){
  if(guides){g.save();g.lineWidth=.18*scale;g.strokeStyle='#222';for(const polygon of piece.union)for(const ring of polygon){g.beginPath();ring.forEach((p,i)=>i?g.lineTo(...pt(p)):g.moveTo(...pt(p)));g.closePath();g.stroke();}g.setLineDash([2*scale,1.4*scale]);g.strokeStyle='#555';for(const [a,b]of piece.dashes){g.beginPath();g.moveTo(...pt(a));g.lineTo(...pt(b));g.stroke();}g.restore();}
  return c;
 }
-export function drawNet(cv){if(!built||!cv)return;const r=cv.getBoundingClientRect();if(!r.width)return;cv.width=r.width*devicePixelRatio;cv.height=r.height*devicePixelRatio;const g=cv.getContext('2d'),pieces=flatPieces(),totalW=pieces.reduce((s,p)=>s+p.w+6,0)+15,maxH=Math.max(...pieces.map(p=>p.h+6)),sc=Math.min((cv.width-60*devicePixelRatio)/totalW,(cv.height-110*devicePixelRatio)/maxH);let x=(cv.width-totalW*sc)/2;for(const p of pieces){const c=renderPrintPiece(p,Math.min(4,sc),true),w=(p.w+6)*sc,h=(p.h+6)*sc,y=(cv.height-h)/2+15*devicePixelRatio;g.drawImage(c,x,y,w,h);g.fillStyle='#777';g.font=`${11*devicePixelRatio}px Manrope`;g.letterSpacing='0.04em';g.fillText(p.name,x,y-12*devicePixelRatio);x+=w+15*sc;}}
+export function drawNet(cv){if(!built||!cv)return;ensureModelForSignature();const r=cv.getBoundingClientRect();if(!r.width)return;cv.width=r.width*devicePixelRatio;cv.height=r.height*devicePixelRatio;const g=cv.getContext('2d'),pieces=flatPieces(),totalW=pieces.reduce((s,p)=>s+p.w+6,0)+15,maxH=Math.max(...pieces.map(p=>p.h+6)),sc=Math.min((cv.width-60*devicePixelRatio)/totalW,(cv.height-110*devicePixelRatio)/maxH);let x=(cv.width-totalW*sc)/2;for(const p of pieces){const c=renderPrintPiece(p,Math.min(4,sc),true),w=(p.w+6)*sc,h=(p.h+6)*sc,y=(cv.height-h)/2+15*devicePixelRatio;g.drawImage(c,x,y,w,h);g.fillStyle='#777';g.font=`${11*devicePixelRatio}px Manrope`;g.letterSpacing='0.04em';g.fillText(p.name,x,y-12*devicePixelRatio);x+=w+15*sc;}}
 export function printPlan(){return built?flatPieces().map(p=>({...p,...sheetFor(p,state.paper),rotate:false})):[];}
 
 let printFont;
 export async function preparePrintFont(){if(printFont)return;const buffer=await (await fetch('/fonts/manrope-print.ttf')).arrayBuffer();const bytes=new Uint8Array(buffer);let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));printFont=btoa(binary);}
 export function exportPDF(){
  const verification=constructionCheck();if(!verification.printable)throw Error('PDF is unavailable for this construction: '+verification.issues.join(' '));
- const plan=printPlan(),doc=new jsPDF({unit:'mm',format:[plan[0].pw,plan[0].ph],orientation:plan[0].landscape?'landscape':'portrait',compress:true});let first=true;const meta={width:state.width,depth:state.depth,height:state.height,shape:state.shape,paper:state.paper,verification:{version:1,status:verification.status,physicalTested:false,checks:verification.checks},pieces:plan.map(p=>({name:p.name,width:p.w,height:p.h,cols:p.cols,rows:p.rows}))};
+ // Freeze the signature for this export and repaint first. flatPieces and
+ // renderPrintPiece draw from the same face canvases as the 3D preview.
+ if(!ensureModelForSignature())throw Error('The box model is not ready. Wait for the preview, then export again.');
+ const exportSignature=designSignature();
+ const plan=printPlan(),doc=new jsPDF({unit:'mm',format:[plan[0].pw,plan[0].ph],orientation:plan[0].landscape?'landscape':'portrait',compress:true});let first=true;
+ // The plan and every face canvas were produced for exportSignature. If the box
+ // moved in between, refuse rather than emit a PDF that mixes two boxes.
+ if(designSignature()!==exportSignature||!plan.every(p=>p.signature===exportSignature))throw Error('The box changed during export. Wait for the preview, then export again.');
+ const meta={signature:exportSignature,width:state.width,depth:state.depth,height:state.height,shape:state.shape,paper:state.paper,verification:{version:1,status:verification.status,physicalTested:false,checks:verification.checks},pieces:plan.map(p=>({name:p.name,width:p.w,height:p.h,cols:p.cols,rows:p.rows}))};
  if(printFont){doc.addFileToVFS('Manrope.ttf',printFont);doc.addFont('Manrope.ttf','Manrope','normal');doc.setFont('Manrope');}
  const page=(p)=>{if(!first)doc.addPage(p?[p.pw,p.ph]:'a4',p?.landscape?'landscape':'portrait');first=false;};
  for(const p of plan){let c=renderPrintPiece(p,8,false);if(p.rotate){const c2=document.createElement('canvas');c2.width=c.height;c2.height=c.width;const g=c2.getContext('2d');g.translate(c2.width,0);g.rotate(Q);g.drawImage(c,0,0);c=c2;}
@@ -235,5 +298,5 @@ export function exportPDF(){
  }
  if(state.printNotes){page();doc.setFontSize(22);doc.setCharSpace(.31044444);doc.text(state.shape==='classic'?'A little assembly':'Print notes',18,28);doc.setFontSize(10);doc.setCharSpace(.14111111);const instructions=state.shape==='classic'?['1. Print at 100% / Actual size. Measure the 50 mm control line.','2. For tiled pieces, trim the blank margins and match row / column overlaps.','3. Cut the solid outside contour. Score the dashed fold lines with a ruler.','4. Keep artwork facing out. Fold opposing walls up, then fold the glue tabs in.','5. Glue the plain tabs inside the neighboring walls. Repeat for the lid.','6. Let the glue dry, then turn the lid over and place it over the base.','','Start with one test copy on your chosen stock before making a batch.','Dimensions follow the crease lines. Paper thickness and printer scaling affect fit.','Stock allowance is adjustable. This is a printable prototype, not a factory cutting die.','Artwork is RGB at approximately 203 dpi; cut and fold guides are vectors.','Edge extension uses the face background color. Check artwork near cuts.']:['1. Print at 100% / Actual size. Verify the 50 mm ruler.', '2. Join tiles using the 5 mm overlap before cutting the pieces.', '3. Solid contours are cuts, including handle holes and windows.', '4. Dashed lines mark panel hinges and glue-tab folds.', '5. Keep artwork outside. Join the plain seam tabs on the inside.', '', 'This is a shape prototype. Make a test copy before making a batch.', `Opening: ${openingSpec(state.shape).title}.`,openingSpec(state.shape).seal?'Leave the opening panel unglued; use a removable seal to hold it closed.':'Do not glue the lid or tuck flap shut. Glue only the plain seam tabs.', 'This construction passed rigid, zero-thickness panel geometry checks.', 'A physical paper and closure test is still required.', '', 'RGB artwork at approximately 203 dpi; cut and crease guides are vectors.', 'Optional edge extension is solid face color, not image bleed.'];instructions.forEach((t,i)=>doc.text(t,18,48+i*9,{maxWidth:170}));}doc.setProperties({title:'Fold Studio — printable box',subject:JSON.stringify({...meta,opening:openingSpec(state.shape)})});doc.save(`fold-test-${state.shape}-${state.width}x${state.depth}x${state.height}mm.pdf`);return{pages:doc.getNumberOfPages(),...meta};
 }
-export function debug(){return{state,built,camera,flatPieces:flatPieces(),plan:printPlan(),fold:flatness,opening:openingState(),renderQuality:{pixelRatio:renderer.getPixelRatio(),webgl2:renderer.capabilities.isWebGL2,maxAnisotropy:renderer.capabilities.getMaxAnisotropy()}};}
+export function debug(){return{state,signature:designSignature(),built,camera,flatPieces:flatPieces(),plan:printPlan(),fold:flatness,opening:openingState(),artwork:artworkStats,renderQuality:{pixelRatio:renderer.getPixelRatio(),webgl2:renderer.capabilities.isWebGL2,maxAnisotropy:renderer.capabilities.getMaxAnisotropy()}};}
 export function renderedTargetError(){const keep=flatness;pose(1,0);scene.updateMatrixWorld(true);let max=0;for(const p of built.prints){if(!p.audit?.target)continue;const inverse=built.pieces[p.piece].g.matrixWorld.clone().invert(),positions=p.g.children.find(c=>c.isMesh).geometry.attributes.position;p.polys[0].forEach(([x,y],i)=>{const source=new THREE.Vector3(x,0,y);let nearest=new THREE.Vector3(),distance=Infinity;for(let j=0;j<positions.count;j++){const vertex=new THREE.Vector3().fromBufferAttribute(positions,j),d=vertex.distanceToSquared(source);if(d<distance){nearest.copy(vertex);distance=d;}}nearest.applyMatrix4(p.g.matrixWorld).applyMatrix4(inverse);max=Math.max(max,nearest.distanceTo(new THREE.Vector3(...p.audit.target[i])));});}pose(keep);return max;}
