@@ -306,7 +306,11 @@ export class Game {
       this.input.active = to === 'play' || to === 'brew' || to === 'photo' || to === 'cutscene';
       this.input.clear();
     }
-    this.audio.setPaused(to === 'pause' || to === 'book');
+    const paused = to === 'pause' || to === 'book';
+    this.audio.setPaused(paused);
+    // Keep the cauldron's voices tied to the same suspended state. Its frame is frozen while paused,
+    // so it must be told directly rather than waiting to notice the mode itself.
+    if (this.brewing) this.brewing.setPaused(paused);
     this._hold = 3;
     this.bus.emit('mode', { from, to, ...(extra || {}) });
   }

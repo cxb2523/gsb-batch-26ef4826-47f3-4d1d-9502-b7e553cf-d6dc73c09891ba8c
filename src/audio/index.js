@@ -16,6 +16,10 @@
 //   audio.meter()              { peak, rms } of the last ~40 ms on the output
 //   audio.names()              every name the engine knows
 //   audio.dispose()            close the context
+//   const h = audio.loop(...)  one stable handle for the loop's whole life, held across unlock: a
+//                              request made before the first gesture is neither lost nor doubled,
+//                              it is realised once when the context starts; h.state is 'virtual'
+//                              (requested, no nodes yet), 'live' (nodes sounding) or 'stopped'
 //   positions may be [x, y, z] or anything with .x .y .z
 //
 // For checking without ears (tools/audio-check.mjs) the same engine runs on an OfflineAudioContext:
@@ -75,7 +79,9 @@ const airCut = (d) => (d <= 12 ? 20000 : clamp(20000 * Math.exp(-(d - 12) / 45),
 const NEAR = 0.6;
 const EARS_TC = 0.035;
 const GESTURES = ['pointerdown', 'keydown', 'touchend'];
-const INERT = { set() {}, stop() {} };
+const INERT = { set() {}, stop() {}, get state() {
+  return 'stopped';
+} };
 
 export function createAudio(opts = {}) {
   const warned = new Set();
@@ -170,6 +176,9 @@ export function createAudio(opts = {}) {
     E.ambience.set(amb, true);
     E.music = createMusic(S, bus.music, wet.music);
     sendMusic(null);
+    // Loops the game asked for before there was a context (the very first brew can predate unlock)
+    // are realised now, so a request held through unlock exists once and at once.
+    if (handles.size) manageLoops(t0);
     if (!offline && !driven) {
       warm();
       if (typeof document !== 'undefined') document.addEventListener('visibilitychange', settle);
@@ -562,13 +571,18 @@ export function createAudio(opts = {}) {
       warnOnce('loop:' + name, `unknown loop "${name}"`);
       return INERT;
     }
+    // One request record for the loop's whole life. It is kept from before unlock: the same handle
+    // the game holds before there is a context is the one realised once a context exists, so a
+    // request made too early is neither lost nor doubled when the engine starts.
     const h = { name, def, pos: vec(o.pos), gain: num(o.gain, 1, 0, 4), pitch: num(o.pitch, 1, 0.25, 4), param: num(o.param, 0.5, 0, 1), r: null, stopped: false, dist: 0, fade: 1, att: 1, score: 0 };
     handles.add(h);
     if (E) {
       if (E.offline) manageLoops(o.at ?? E.ctx.currentTime);
       else E.loopClock = 1; // look at the loops on the next update
     }
-    return {
+    // A stable controller: always the same object, before and after unlock. Every call reaches the
+    // one record above instead of a stand-in that would shadow the real loop once it exists.
+    const ctrl = {
       set: guard('loop.set', (c = {}, at) => {
         if (h.stopped) return;
         const p = c.pos != null ? vec(c.pos) : null;
@@ -576,7 +590,7 @@ export function createAudio(opts = {}) {
         if (c.gain != null) h.gain = num(c.gain, h.gain, 0, 4);
         if (c.pitch != null) h.pitch = num(c.pitch, h.pitch, 0.25, 4);
         if (c.param != null) h.param = num(c.param, h.param, 0, 1);
-        if (!E) return;
+        if (!E) return; // the request is held; manageLoops() builds it from h after unlock
         const r = h.r;
         if (!r) {
           if (h.gain > 0) E.loopClock = 1;
@@ -596,7 +610,13 @@ export function createAudio(opts = {}) {
         handles.delete(h);
         if (E && h.r) release(h, at ?? E.ctx.currentTime, Math.max(0.02, Number(fade) || 0));
       }),
+      /** For tests and diagnostics: 'virtual' (requested, no nodes yet), 'live' (nodes sounding), 'stopped'. */
+      get state() {
+        if (h.stopped) return 'stopped';
+        return h.r ? 'live' : 'virtual';
+      },
     };
+    return ctrl;
   }
 
   // --- ambience and music ------------------------------------------------------------------------

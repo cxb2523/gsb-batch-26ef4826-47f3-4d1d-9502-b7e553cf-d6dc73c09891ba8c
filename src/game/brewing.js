@@ -158,6 +158,10 @@ export class Brewing {
     this._bub = 0;
     this._from = { pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
     this.loops = { fire: null, bubble: null, stir: null };
+    // The cauldron's voices are only allowed while the apprentice is actually at the pot and the
+    // world is not paused. The flag is reconciled every frame by syncLoops().
+    this._soundOn = false;
+    this._paused = false;
     this.stone = null;
     this.endT = 0;
   }
@@ -382,6 +386,10 @@ export class Brewing {
       b = g.brew;
     if (!this.pot || g.state.mode !== 'play') return;
     b.active = true;
+    // Begin silent; the next update() builds exactly the voices this state (heat, contents, stir)
+    // calls for, once and only once.
+    this._soundOn = false;
+    this.stopLoops();
     this._from.pos.copy(g.engine.camera.position);
     this._from.quat.copy(g.engine.camera.quaternion);
     this._phi = null;
@@ -396,6 +404,10 @@ export class Brewing {
     if (b.opus && b.opus.done && this.endT > 0) return;
     b.active = false;
     this.pumping = this.damping = false;
+    // The walk-away contract: silence the pot at once and disconnect every node it made, so no
+    // oscillator or noise source outlives the apprentice's time at the cauldron.
+    this._soundOn = false;
+    this.stopLoops();
     g.setMode('play');
     g.input.requestLock();
     g.audio.sfx('ui_close', { gain: 0.6 });
@@ -498,9 +510,9 @@ export class Brewing {
     }
 
     // --- sound
-    this._loop('fire', b.fire > 0.03, this.fireAt, b.fire, 0.8);
-    this._loop('bubble', b.contents.length > 0 && b.heat > 0.22, this.surface, b.heat, 0.7);
-    this._loop('stir', active && b.stir > 0.06, this.surface, b.stir, 0.6);
+    // The pot sounds strictly follow "standing at the cauldron, world not paused". Pausing stops
+    // and disconnects every voice; resuming rebuilds it from the heat and stir that hold now.
+    this.syncLoops(active, dt);
 
     // --- the pot
     this.coals.userData.u.uHeat.value = b.fire;
@@ -601,8 +613,91 @@ export class Brewing {
     return 'It binds.';
   }
 
+  /**
+   * The global audio lifecycle calls this when the world is suspended or resumed. While brewing this
+   * is authoritative for the pot's voices: suspending tears them all down (the bus duck alone is
+   * not enough), resuming lets the next update() rebuild them from the current fire and stir. The
+   * game frame is frozen while paused, so the change cannot wait for syncLoops() to run.
+   */
+  setPaused(paused) {
+    this._paused = !!paused;
+    const active = this.game.brew.active && this.game.state.mode === 'brew';
+    const wantOn = active && !this._paused;
+    if (wantOn === this._soundOn) return;
+    this._soundOn = wantOn;
+    if (!wantOn) this.stopLoops();
+    // On resume the voices are rebuilt by syncLoops() on the next (unfrozen) frame; nothing is
+    // replayed from before the suspension.
+  }
+
+  /**
+   * Reconcile the cauldron's three sustained voices with the only state that may make them sound:
+   * the apprentice is at the pot (`active`) and the game is not paused. Every transition tears the
+   * old voices down completely (stops the source nodes and disconnects their graphs), so leaving the
+   * pot or pausing leaves nothing ringing, and a resume rebuilds fresh voices from the fire and stir
+   * values that hold then — never the voices from before the interruption.
+   */
+  syncLoops(active) {
+    const g = this.game;
+    // setPaused(true) is driven by the 'pause' and 'book' modes (see Game.setMode). Either one must
+    // silence the pot; mode is the authoritative, per-frame source of that truth.
+    const paused = this._paused || g.state.mode === 'pause' || g.state.mode === 'book';
+    const wantOn = !!active && !paused;
+    if (wantOn !== this._soundOn) {
+      this._soundOn = wantOn;
+      if (!wantOn) this.stopLoops();
+    }
+    if (!wantOn) return;
+    // Desired voices for the heat and stir that hold *now*. Each exists at most once.
+    this._loop('fire', g.brew.fire > 0.03, this.fireAt, g.brew.fire, 0.8);
+    this._loop('bubble', g.brew.contents.length > 0 && g.brew.heat > 0.22, this.surface, g.brew.heat, 0.7);
+    this._loop('stir', g.brew.stir > 0.06, this.surface, g.brew.stir, 0.6);
+  }
+
+  /** Stop and disconnect every voice the cauldron created; forget the handles so nothing lingers. */
+  stopLoops() {
+    const L = this.loops;
+    for (const name of Object.keys(L)) {
+      if (L[name]) {
+        L[name].stop(0.25);
+        L[name] = null;
+      }
+    }
+  }
+
+  /**
+   * For tests: the state of the three voices the cauldron owns. `handles` are the controllers still
+   * held by the cauldron; `live` are those with real nodes sounding in the audio engine; `dying`
+   * are releases still fading out. The cauldron's contract is that these never outlive "at the pot,
+   * not paused".
+   */
+  voiceStatus() {
+    const A = this.game.audio;
+    const handles = {};
+    let live = 0;
+    for (const name of ['fire', 'bubble', 'stir']) {
+      const h = this.loops[name];
+      handles[name] = h ? h.state || 'live' : null;
+      if (h && h.state === 'live') live++;
+    }
+    const d = A.debug ? A.debug() : {};
+    return {
+      soundOn: this._soundOn,
+      paused: this._paused,
+      active: this.game.brew.active,
+      mode: this.game.state.mode,
+      handles,
+      live,
+      engineLoops: d.loops || 0,
+      engineHandles: d.handles || 0,
+      dying: d.dying || 0,
+    };
+  }
+
   _loop(name, on, at, param, gain) {
     const L = this.loops;
+    // Defensive: a voice that should not be here is torn down before anything is created.
+    if (!this._soundOn) on = false;
     if (on && !L[name]) L[name] = this.game.audio.loop(name, { pos: [at.x, at.y, at.z], gain });
     if (L[name]) {
       if (on) L[name].set({ param });
@@ -746,6 +841,9 @@ export class Brewing {
     Object.assign(b, { active: false, contents: [], mix: null, trail: [], fire: 0, heat: 0, region: null, band: null, fit: null, stir: 0, progress: 0, ready: null, opus: null, hint: '' });
     this.k = 0;
     this.endT = 0;
+    // A reset is a hard walk-away: no voice may survive a load or a return to the title.
+    this._soundOn = false;
+    this.stopLoops();
     this._splats.length = 0;
     this._splat('#05070a', 3, 1.5);
   }
