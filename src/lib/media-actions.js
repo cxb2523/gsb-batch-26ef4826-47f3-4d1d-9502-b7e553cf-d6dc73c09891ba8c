@@ -820,7 +820,9 @@ function createMediaActionsManager({
       }
     } catch (error) {
       log(`Error downloading subtitles: ${error.message}`);
-      if (preferences.get('show_notifications')) {
+      // A failure of a download the viewer has moved on from (another version
+      // or file is playing now) belongs to that session and is not reported.
+      if (!isStale(generation) && preferences.get('show_notifications')) {
         core.osd('Failed to download subtitles');
       }
     }
