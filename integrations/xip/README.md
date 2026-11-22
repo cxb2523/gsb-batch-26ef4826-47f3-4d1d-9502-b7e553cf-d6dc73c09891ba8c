@@ -326,8 +326,9 @@ Pivots (what sits at the sprite's x, y and what it rotates around), most specifi
 `pivot: { x, y }` in frame pixels (frame tables), an atlas-wide `pivot` for a grid, then the layer's
 `anchorX`/`anchorY`. Draw and pick use the same resolution.
 
-Alpha and opaque-bounds picking read the atlas pixels once (cached); call `layer.invalidateHitMasks()`
-after repainting a dynamic-canvas atlas.
+Alpha and opaque-bounds picking read the atlas pixels once (cached). Repainting a canvas
+atlas and calling `layer.markAtlasDirty(i)` refreshes the cache automatically before the next
+pick; `layer.invalidateHitMasks()` remains available to force every mask to be re-read.
 
 ## Dynamic canvases at runtime (texture atlases that grow)
 

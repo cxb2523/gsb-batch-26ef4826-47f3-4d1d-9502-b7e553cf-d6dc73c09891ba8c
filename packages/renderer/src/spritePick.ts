@@ -9,6 +9,11 @@ export type FrameHit = { x: number; y: number; w: number; h: number } | 'opaque'
 /** Alpha channel of an atlas texture, read once on first use. */
 export interface AtlasMask {
   source: unknown
+  /**
+   * `imageVersion` of the atlas when the mask was read, so a repaint announced with
+   * `markAtlasDirty()` invalidates the cached pixels lazily on the next pick.
+   */
+  version: number
   w: number
   h: number
   alpha: Uint8Array
@@ -17,7 +22,7 @@ export interface AtlasMask {
 }
 
 /** Read the alpha channel of `src` (null if unreadable, e.g. cross-origin or not loaded yet). */
-export function readAtlasMask(src: PickSource): AtlasMask | null {
+export function readAtlasMask(src: PickSource, version = 0): AtlasMask | null {
   try {
     const w = (src as HTMLImageElement).naturalWidth || src.width
     const h = (src as HTMLImageElement).naturalHeight || src.height
@@ -32,7 +37,7 @@ export function readAtlasMask(src: PickSource): AtlasMask | null {
     if (!px || px.length < w * h * 4) return null
     const alpha = new Uint8Array(w * h)
     for (let i = 0; i < alpha.length; i++) alpha[i] = px[i * 4 + 3]
-    return { source: src, w, h, alpha, bounds: new Map() }
+    return { source: src, version, w, h, alpha, bounds: new Map() }
   } catch {
     return null
   }

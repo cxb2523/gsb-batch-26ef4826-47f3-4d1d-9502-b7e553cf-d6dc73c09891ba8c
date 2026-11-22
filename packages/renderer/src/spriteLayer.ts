@@ -17,7 +17,8 @@ export const NO_SPRITE = -1
 export interface PickOptions {
   /**
    * Only count texels whose alpha is above this (0-255) as hits. Reads the atlas
-   * pixels once (cached; call `invalidateHitMasks()` after repainting a dynamic canvas).
+   * pixels once (cached; the cache is refreshed automatically after `markAtlasDirty()`
+   * or an `image` source change, or force-cleared with `invalidateHitMasks()`).
    * Default: the layer's `pickAlpha` (0 = off).
    */
   alpha?: number
@@ -60,7 +61,8 @@ export interface LayerAtlas {
   frameColumns?: number
   /**
    * Bumped by {@link SpriteLayer.markAtlasDirty}: when it changes, an `image` that is a canvas
-   * (or any mutable source) is uploaded to the GPU again. Ignored for `src` and `dynamicSrc`.
+   * (or any mutable source) is uploaded to the GPU again and its cached picking alpha mask is
+   * re-read on the next pick. Ignored for `src` and `dynamicSrc`.
    */
   imageVersion?: number
   /**
@@ -230,7 +232,7 @@ export class SpriteLayer {
    */
   pixelSource: ((atlas: LayerAtlas) => PickSource | undefined) | null = null
 
-  private _masks = new Map<LayerAtlas, AtlasMask | null>()
+  private _masks = new Map<LayerAtlas, AtlasMask>()
   private _keyIds = new Map<string, number>()
   private _keys: string[] = []
 
@@ -543,7 +545,9 @@ export class SpriteLayer {
 
   /**
    * Re-upload atlas `i`'s `image` on the next frame. Call it after repainting a canvas that is
-   * used as `image`; sources that never change need no call.
+   * used as `image`; sources that never change need no call. The cached picking alpha mask is
+   * refreshed lazily on the next pick, so hit testing follows the repainted pixels without a
+   * separate {@link invalidateHitMasks} call.
    */
   markAtlasDirty(i = 0): void {
     const a = this.atlases[i]
@@ -755,7 +759,12 @@ export class SpriteLayer {
     }
   }
 
-  /** Forget cached atlas alpha masks and opaque bounds (call after repainting a dynamic canvas atlas). */
+  /**
+   * Forget every cached atlas alpha mask and opaque bounds, forcing them to be re-read
+   * on the next pick. Normally unnecessary: {@link markAtlasDirty} and swapping an atlas'
+   * `image` source invalidate the affected mask automatically. Retained as an explicit
+   * escape hatch (e.g. after mutating a canvas' pixels by hand without going through either).
+   */
   invalidateHitMasks(): void {
     this._masks.clear()
   }
@@ -786,13 +795,18 @@ export class SpriteLayer {
   private maskOf(atlas: LayerAtlas): AtlasMask | null {
     const src = (atlas.image as PickSource | undefined) ?? this.pixelSource?.(atlas)
     if (!src) return null
-    let m = this._masks.get(atlas)
-    if (m === undefined || (m !== null && m.source !== src)) {
-      m = readAtlasMask(src)
+    const version = atlas.imageVersion ?? 0
+    const cached = this._masks.get(atlas)
+    // Re-read when the canvas was repainted (markAtlasDirty bumps imageVersion) or the
+    // atlas' image source was replaced; masks stay keyed per atlas, so two atlases sharing
+    // one canvas never borrow each other's pixels.
+    if (!cached || cached.source !== src || cached.version !== version) {
+      const m = readAtlasMask(src, version)
       // not loaded / unreadable yet: retry next time instead of caching the miss
       if (m) this._masks.set(atlas, m)
+      return m
     }
-    return m ?? null
+    return cached
   }
 
   /** Hit region of sprite `i` as fractions of its quad, into `_frac`; false = nothing is hittable. */
