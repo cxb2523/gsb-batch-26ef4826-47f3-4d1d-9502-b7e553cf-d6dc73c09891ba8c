@@ -33,11 +33,23 @@ export class Fighter {
 
   get alive() { return this.state !== 'ko'; }
 
+  // Swaps the look (greybox <-> models) without touching any combat state. The new visual
+  // goes in before the old one is disposed, so there is never a frame with neither or both.
   setVisual(visual) {
-    if (this.visual) { this.node.remove(this.visual.root); this.visual.dispose(); }
+    const old = this.visual;
+    if (old) this.node.remove(old.root);
     this.visual = visual;
     this.node.add(visual.root);
-    if (this.anim) visual.play(this.anim, this.animOpts);
+    if (this.anim) {
+      // An attack switched mid-swing starts its new clip at the same point, not at the wind-up.
+      const opts = { ...this.animOpts };
+      if (this.state === 'attack' && this.attack) opts.start = this.attack.t / this.attack.dur;
+      visual.play(this.anim, opts);
+    }
+    if (old) {
+      if ((old.opacity ?? 1) < 1) visual.setOpacity(old.opacity);   // a KO fade keeps its progress
+      old.dispose();
+    }
   }
 
   setState(state, anim, opts = {}) {

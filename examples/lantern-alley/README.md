@@ -10,14 +10,14 @@ A 3D arcade beat 'em up. Volt, a comic-book street hero, clears an alley of four
 npm install && npm run dev
 ```
 
-No models are included, so the game runs in greybox: every character and prop is a simple shape with the same size, hitboxes and animation timing as the finished model. The console prints one "did not load … showing its greybox placeholder" warning per missing model; that is expected.
+No models are included, so the game runs in greybox: every character and prop is a simple shape with the same size, hitboxes and animation timing as the finished model. The GREYBOX/MODELS button (top right, or V) switches the look at any time, mid-fight; the models load on the first switch, and any file that fails or is missing keeps its greybox placeholder, with a note on screen saying which.
 
 ## Get the Tripo look
 
 1. `assets.json` lists all 10 models: id, size, triangle budget, animations and the full generation prompt.
 2. Make each one in [Tripo Studio](https://studio.tripo3d.ai/?utm_source=github&utm_medium=referral&utm_campaign=vibe_gaming_interactive_handbook&utm_content=example_lantern_alley_readme). Characters need Auto Rig plus the animations named in their entry.
 3. Export GLB, name it after the id (`hero.glb`, `boss.glb`, `crate.glb`, …) and put it in `public/assets/`.
-4. Reload. The game switches to models as soon as they load; any file that is missing stays greybox. If `thug_kicker.glb` or `thug_crusher.glb` is missing, that enemy is shown as a recoloured Sprat or Slab.
+4. Reload and press the look button (or V). The models load once, the first time they are asked for; any file that is missing stays greybox. If `thug_kicker.glb` or `thug_crusher.glb` is missing, that enemy is shown as a recoloured Sprat or Slab.
 
 Your generations will not match the originals exactly, so ask your agent to check each model against its greybox (stage 5 of the prompt).
 

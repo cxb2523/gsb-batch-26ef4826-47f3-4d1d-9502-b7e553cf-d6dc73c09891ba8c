@@ -31,7 +31,7 @@ try {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
   const page = await ctx.newPage();
   watch(page, 'desktop');
-  await page.goto(URL);
+  await page.goto(URL + "?look=models");
   await page.waitForFunction(() => window.__game?.enemies.length > 0, null, { timeout: 10000 });
   const report = await page.evaluate(() => window.__modelsReady);
   for (const r of report) ok(r.ok, `model ${r.file} loaded${r.ok ? '' : ': ' + r.error}`);

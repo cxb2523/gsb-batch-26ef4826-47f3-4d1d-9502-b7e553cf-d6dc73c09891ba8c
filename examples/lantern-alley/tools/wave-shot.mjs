@@ -6,7 +6,7 @@ const server = spawn('npx', ['vite', 'preview', '--port', PORT, '--strictPort'],
 await new Promise(r => setTimeout(r, 1500));
 const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-await page.goto(`http://localhost:${PORT}/?manual=1&bot=1&seed=21`);
+await page.goto(`http://localhost:${PORT}/?manual=1&bot=1&seed=21&look=models`);
 await page.evaluate(() => window.__modelsReady);
 await page.waitForFunction(() => window.__game?.beforeStep);
 await page.evaluate(() => {

@@ -18,7 +18,7 @@ const all = { gaps: [], full: 0, chains: [], counters: 0, whiffs: 0, thrown: 0, 
 for (let s = 1; s <= SEEDS; s++) {
   const page = await browser.newPage();
   page.on('pageerror', e => console.log('page error', e.message));
-  await page.goto(`http://localhost:${PORT}/?manual=1&seed=${s * 31}`);
+  await page.goto(`http://localhost:${PORT}/?manual=1&seed=${s * 31}&look=models`);
   await page.evaluate(() => window.__modelsReady);
   const r = await page.evaluate(() => {
     const g = __game; let t = window.__t ?? 1000; const frame = () => __frame(t += 1000 / 60);

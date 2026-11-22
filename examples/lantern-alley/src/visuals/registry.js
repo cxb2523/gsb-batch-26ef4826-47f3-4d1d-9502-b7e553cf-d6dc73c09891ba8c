@@ -43,6 +43,7 @@ function withShadow(visual, id) {
     s.rotation.x = -Math.PI / 2;
     s.position.y = 0.01;
     s.scale.setScalar(Math.max(w, d) * 0.6);
+    s.userData.shared = true;   // geometry and material belong to every character, not this one
     visual.root.add(s);
   }
   return visual;

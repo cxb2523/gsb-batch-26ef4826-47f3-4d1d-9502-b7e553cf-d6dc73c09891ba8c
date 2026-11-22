@@ -50,33 +50,72 @@ input.bindTouch(...['stick', 'knob', 'btn-punch', 'btn-kick'].map(id => document
 
 const hud = new Hud(input);
 const game = new Game(scene, camera, input, hud);
-window.__game = game;   // for testing in the console
+window.__game = game;       // for testing in the console
+window.__renderer = renderer;
+window.__THREE = THREE;
 
 if (params.has('bot')) import('./bot.js').then(m => m.startBot(game, input));
 
-// 3D models load in the background; the game starts in greybox and switches when they are ready.
-// ?look=greybox starts (and stays) in greybox. The button (or V) switches at any time.
+// Look switch. The game starts in greybox; the Tripo models load on demand, the first time
+// models are asked for (button, V key, or ?look=models), and are never requested again after
+// that one load. While they load the button shows LOADING…; clicks during the load are not
+// lost — the last ask wins, and a load that finishes late never undoes a newer click.
 // The Tripo link opens in a new tab; drop focus so Enter (restart) does not open it again.
 document.getElementById('made-with').addEventListener('click', e => e.currentTarget.blur());
 const lookBtn = document.getElementById('look');
-let look = 'greybox';
-const setLook = m => {
-  look = m;
-  switchVisuals(game, m);
-  lookBtn.textContent = m === 'models' ? 'MODELS' : 'GREYBOX';
-};
-lookBtn.addEventListener('click', () => { lookBtn.blur(); if (!lookBtn.disabled) setLook(look === 'models' ? 'greybox' : 'models'); });
-addEventListener('keydown', e => { if (e.code === 'KeyV' && !e.repeat && !lookBtn.disabled) setLook(look === 'models' ? 'greybox' : 'models'); });
-window.__modelsReady = loadModels().then(protos => {
-  registerModelBuilders(modelBuilders(protos));
-  const failed = loadReport.filter(r => !r.ok);
-  for (const f of failed) console.warn(`Model ${f.file} did not load (${f.error}); showing its greybox placeholder.`);
-  window.__loadReport = loadReport;
-  lookBtn.disabled = false;
-  if (params.get('look') !== 'greybox') setLook('models');
-  else lookBtn.textContent = 'GREYBOX';
-  return loadReport;
-});
+const notice = document.getElementById('notice');
+let lookWanted = 'greybox';    // what the last click asked for
+let lookApplied = 'greybox';   // what is on screen
+let modelsPromise = null;      // the one and only load, shared by every ask
+let noticeTimer = 0;
+
+function drawLookButton() {
+  lookBtn.textContent = lookWanted === 'models' && lookApplied !== 'models' ? 'LOADING…'
+    : lookApplied === 'models' ? 'MODELS' : 'GREYBOX';
+}
+
+function applyLook(mode) {
+  switchVisuals(game, mode);
+  lookApplied = mode;
+  drawLookButton();
+}
+
+function showNotice(text) {
+  notice.textContent = text;
+  notice.classList.add('show');
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => notice.classList.remove('show'), 6000);
+}
+
+function askLook(mode) {
+  lookWanted = mode;
+  drawLookButton();
+  if (mode === 'greybox') {
+    if (lookApplied !== 'greybox') applyLook('greybox');
+    return;
+  }
+  modelsPromise ??= loadModels().then(protos => {
+    registerModelBuilders(modelBuilders(protos));
+    window.__loadReport = loadReport;
+    const failed = loadReport.filter(r => !r.ok);
+    for (const f of failed) console.warn(`Model ${f.file} did not load (${f.error}); showing its greybox placeholder.`);
+    if (failed.length === loadReport.length) showNotice('Models did not load — every character keeps its greybox look');
+    else if (failed.length) showNotice(`Missing ${failed.map(f => f.file).join(', ')} — greybox stand-in for those`);
+    return loadReport;
+  }).catch(e => {   // a load that fails outright still leaves a playable greybox game
+    console.warn(`Models did not load (${e.message || e}); staying in greybox.`);
+    showNotice('Models did not load — staying in greybox');
+    return loadReport;
+  });
+  window.__modelsReady = modelsPromise;
+  // Apply only if this is still the latest ask when the load finishes.
+  modelsPromise.then(() => { if (lookWanted === 'models' && lookApplied !== 'models') applyLook('models'); });
+}
+
+lookBtn.addEventListener('click', () => { lookBtn.blur(); askLook(lookWanted === 'models' ? 'greybox' : 'models'); });
+addEventListener('keydown', e => { if (e.code === 'KeyV' && !e.repeat) askLook(lookWanted === 'models' ? 'greybox' : 'models'); });
+if (params.get('look') === 'models') askLook('models');
+drawLookButton();
 
 let last = performance.now(), acc = 0;
 function frame(now) {

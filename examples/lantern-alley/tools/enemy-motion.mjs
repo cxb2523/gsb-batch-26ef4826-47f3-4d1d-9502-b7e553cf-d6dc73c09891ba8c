@@ -14,7 +14,7 @@ await new Promise(r => setTimeout(r, 1500));
 const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 page.on('pageerror', e => console.log('page error', e.message));
-await page.goto(`http://localhost:${PORT}/?manual=1&seed=${process.argv[2] ?? 3}`);
+await page.goto(`http://localhost:${PORT}/?manual=1&seed=${process.argv[2] ?? 3}&look=models`);
 await page.evaluate(() => window.__modelsReady);
 const out = await page.evaluate(() => {
   const g = __game;

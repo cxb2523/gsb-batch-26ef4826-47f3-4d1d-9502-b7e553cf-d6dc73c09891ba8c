@@ -15,4 +15,12 @@ export function switchVisuals(game, mode) {
     if (!p.broken) game.scene.add(v.root);   // a broken crate stays gone
     p.visual = v;
   }
+  for (const f of game.pickups) {            // food dropped by crates matches too
+    const v = createVisual('food');
+    v.root.position.copy(f.visual.root.position);
+    game.scene.remove(f.visual.root);
+    f.visual.dispose();
+    game.scene.add(v.root);
+    f.visual = v;
+  }
 }

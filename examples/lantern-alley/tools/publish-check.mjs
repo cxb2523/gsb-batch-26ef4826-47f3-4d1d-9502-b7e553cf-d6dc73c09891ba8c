@@ -45,7 +45,7 @@ try {
   // 1. Loads from the root, same-origin only
   const ctx = await newContext({ viewport: { width: 1280, height: 720 } });
   const page = await ctx.newPage();
-  await page.goto(ORIGIN + '/');
+  await page.goto(ORIGIN + '/?look=models');
   const report = await page.evaluate(() => window.__modelsReady);
   ok(report.length === 10 && report.every(r => r.ok), `all ${report.length} models load from ./assets/ (${report.filter(r => !r.ok).map(r => r.file).join(', ') || 'none failed'})`);
   ok(await page.textContent('#look') === 'MODELS', 'the game switches to the models');
@@ -108,7 +108,7 @@ try {
   // 4. A full bot round on the static build, then restart
   const bc = await newContext({ viewport: { width: 1280, height: 720 } });
   const bp = await bc.newPage();
-  await bp.goto(ORIGIN + '/?bot=1&speed=4&seed=7919');
+  await bp.goto(ORIGIN + '/?bot=1&speed=4&seed=7919&look=models');
   await bp.evaluate(() => window.__modelsReady);
   const t0 = Date.now();
   while (!(await bp.evaluate(() => window.__botReport?.done))) {

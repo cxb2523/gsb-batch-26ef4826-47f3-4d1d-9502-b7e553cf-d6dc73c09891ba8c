@@ -17,6 +17,17 @@ const RING_COLORS = {
   idle: 0xffffff, walk: 0x9fd8ff, run: 0x3fa9ff, wait: 0x2ec4b6, attack: 0xff9f1c, hurt: 0xff66cc, ko: 0x555555, win: 0xffd23f,
 };
 
+// Frees what belongs to one visual instance: its geometries and its own materials.
+// Shared things are left alone: the outline material (one for every placeholder, flagged
+// isOutline) and anything flagged userData.shared (the soft shadow from the registry).
+export function disposeDeep(root) {
+  root.traverse(o => {
+    if (!o.isMesh || o.userData.shared) return;
+    o.geometry?.dispose();
+    if (!o.userData.isOutline) o.material?.dispose();
+  });
+}
+
 // A humanoid placeholder built from capsules and boxes, facing +Z, feet at y = 0.
 export class GreyCharacter {
   constructor({ size, body, head, accent }) {
@@ -62,6 +73,7 @@ export class GreyCharacter {
     this.animTime = 0;
     this.timeScale = 1;
     this.flashTime = 0;
+    this.opacity = 1;
     this.materials = [];
     this.outlines = [];
     this.root.traverse(o => {
@@ -82,6 +94,7 @@ export class GreyCharacter {
 
   // The outline material is shared by every placeholder, so hide this one's outlines instead of fading them.
   setOpacity(a) {
+    this.opacity = a;
     for (const o of this.outlines) o.visible = a >= 1;
     for (const m of this.materials) { m.transparent = a < 1; m.opacity = a; }
   }
@@ -124,7 +137,7 @@ export class GreyCharacter {
     this.pose.position.y = bob + lieDown * 0.15;
   }
 
-  dispose() {}
+  dispose() { disposeDeep(this.root); }
 }
 
 // A static prop: just a group, facing +Z, bottom at y = 0.
@@ -135,7 +148,7 @@ export class GreyProp {
   hitFlash() {}
   setOpacity() {}
   update() {}
-  dispose() {}
+  dispose() { disposeDeep(this.root); }
 }
 
 export function dumpster([w, h, d]) {

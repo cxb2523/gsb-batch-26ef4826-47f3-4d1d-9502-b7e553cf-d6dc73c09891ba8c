@@ -373,6 +373,7 @@ export class ModelCharacter {
     this.actions = {};
     this.current = null;
     this.flashTime = 0;
+    this.opacity = 1;
   }
 
   duration(anim) { return this.proto.clips[anim]?.duration ?? 1; }
@@ -414,6 +415,7 @@ export class ModelCharacter {
   // Fading: hide the black outline hull (it would show through the see-through body) and keep
   // the body writing depth so only its front surface blends with the scene.
   setOpacity(a) {
+    this.opacity = a;
     for (const o of this.outlines) o.visible = a >= 1;
     for (const m of this.materials) { m.transparent = a < 1; m.opacity = a; }
   }
@@ -434,7 +436,13 @@ export class ModelCharacter {
     }
   }
 
-  dispose() { this.mixer.stopAllAction(); this.mixer.uncacheRoot(this.model); }
+  // Stops the animations and frees this copy's cloned materials. The geometry and textures
+  // belong to the shared prototype (kept so switching back costs nothing), so they stay.
+  dispose() {
+    this.mixer.stopAllAction();
+    this.mixer.uncacheRoot(this.model);
+    for (const m of this.materials) m.dispose();
+  }
 }
 
 export class ModelProp {
