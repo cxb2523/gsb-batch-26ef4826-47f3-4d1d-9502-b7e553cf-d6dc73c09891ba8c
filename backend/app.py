@@ -67,7 +67,11 @@ TARGET_LUFS = -16.0
 
 # Analysis schema version. Bump whenever the JSON shape changes so the frontend
 # (and any cache) can migrate or fall back gracefully.
-ANALYSIS_VERSION = 2
+# v3: Demucs vocal timeline is the single authoritative vocal source; mix
+# windows and first/last vocal times are derived from it, and the heuristic
+# fallback never carries Demucs-specific fields. Old v2 caches are ignored
+# because the key includes this version.
+ANALYSIS_VERSION = 3
 ANALYZER_ID = "par8dj-mixengine-v2"
 
 
@@ -90,9 +94,64 @@ def _cache_read(key: str | None) -> dict[str, Any] | None:
         return None
     try:
         with open(CACHE_DIR / f"{key}.json", encoding="utf-8") as handle:
-            return json.load(handle)
+            payload = json.load(handle)
     except (OSError, ValueError):
         return None
+    # A cache hit must be structurally identical to a fresh analysis. Reject
+    # entries written by a different schema/version or corrupted on disk so a
+    # stale entry can never change a track's result on the second analysis.
+    if not _is_valid_cached_result(payload):
+        return None
+    return payload
+
+
+# Fields every analysis result must carry. A cached entry missing any of them
+# predates the current schema (or is truncated) and must be treated as a miss.
+_REQUIRED_RESULT_FIELDS = (
+    "version",
+    "duration",
+    "cueIn",
+    "cueOut",
+    "outroStart",
+    "vocalRiskStart",
+    "firstVocalAt",
+    "lastVocalAt",
+    "vocalSource",
+    "mixableIntro",
+    "mixableOutro",
+    "timeline",
+    "vocals",
+)
+
+
+def _is_valid_cached_result(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("version") != ANALYSIS_VERSION:
+        return False
+    if not all(field in payload for field in _REQUIRED_RESULT_FIELDS):
+        return False
+    timeline = payload.get("timeline")
+    if not isinstance(timeline, dict) or not isinstance(timeline.get("t"), list):
+        return False
+    if not isinstance(timeline.get("vocalRisk"), list):
+        return False
+    if len(timeline["t"]) != len(timeline["vocalRisk"]):
+        return False
+    vocals = payload.get("vocals")
+    if not isinstance(vocals, dict) or "available" not in vocals:
+        return False
+    source = payload.get("vocalSource")
+    if source not in {"heuristic", "demucs"}:
+        return False
+    # Internal consistency: a Demucs result must actually carry Demucs fields,
+    # and a heuristic result must NOT carry Demucs-specific leftovers — its
+    # vocals payload has to be the exact one-key fallback shape.
+    if source == "demucs" and not vocals.get("available"):
+        return False
+    if source == "heuristic" and vocals != {"available": False}:
+        return False
+    return True
 
 
 def _cache_write(key: str | None, result: dict[str, Any]) -> None:
@@ -149,33 +208,41 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
     # Downbeat + multi-resolution phrase grid (16/32/64 beats), so transitions can
     # start on the most coherent musical phrase for this track.
     phrasing = detect_phrasing(y, sr, music["beats"], beat_interval, timeline)
-    # Optional Demucs vocal-stem analysis of the intro/outro mix regions; when
-    # present it refines the always-on heuristic vocal risk in the timeline.
+    # Optional Demucs vocal-stem analysis. The full-track Demucs map is the
+    # single AUTHORITATIVE vocal signal: timeline vocalRisk, first/last vocal
+    # times, vocalSource and the vocal-free mix windows all come from the SAME
+    # run. On any failure (or with stems off) we keep the always-on heuristic
+    # VAD and must not surface any Demucs-specific field — vocals stays the
+    # plain fallback dict, never a partial payload from another track/run.
     vocals: dict[str, Any] = {"available": False}
-    # Full-track Demucs vocal timeline. When present it is the AUTHORITATIVE
-    # vocalRisk (index-aligned with timeline.t); otherwise the heuristic VAD stays.
     timeline["vocalSource"] = "heuristic"
     first_vocal_at: float | None = None
     last_vocal_at: float | None = None
+    demucs_ok = False
     if use_stems:
         from . import stems as stems_module
 
-        vocal_tl = stems_module.vocal_activity_timeline(path, duration, TIMELINE_STEP)
-        if vocal_tl is not None:
-            risk = list(vocal_tl["vocalRisk"])
+        # One Demucs run for everything; returns None on ANY failure (missing
+        # dependency, download/decode/torch error) — never raises.
+        demucs_result = stems_module.analyze_vocal_track(
+            path, duration, TIMELINE_STEP
+        )
+        if demucs_result is not None and demucs_result.get("available"):
+            risk = list(demucs_result["vocalRisk"])
             n = len(timeline["t"])
+            # Defensive length alignment: both sides use ceil(duration/step),
+            # but never let a short/long stem map desync the shared timeline.
             if len(risk) < n:
                 risk = risk + [0.0] * (n - len(risk))
             timeline["vocalRisk"] = risk[:n]
             timeline["vocalSource"] = "demucs"
-            first_vocal_at = vocal_tl.get("firstVocalAt")
-            last_vocal_at = vocal_tl.get("lastVocalAt")
-
-        vocals = stems_module.analyze_vocals(path, duration)
-        # Only the legacy refine path is heuristic-based; skip it once the
-        # full-track map is authoritative so it cannot overwrite real silence.
-        if timeline.get("vocalSource") != "demucs":
-            refine_vocal_risk(timeline, vocals, duration)
+            first_vocal_at = demucs_result.get("firstVocalAt")
+            last_vocal_at = demucs_result.get("lastVocalAt")
+            vocals = demucs_result
+            demucs_ok = True
+        # else: full heuristic fallback. The legacy heuristic refine path was
+        # removed deliberately — it could overwrite the authoritative map and
+        # contradict firstVocalAt/mix windows on a second analysis.
 
     # Structural boundaries (timbre+harmony self-similarity, beat-synced). The
     # inspectable DSP baseline for intro/outro: real musical section changes, not
@@ -183,15 +250,30 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
     struct_boundaries = structural_boundaries(y, sr, music["beats"], duration)
     outro_start = refine_outro_start(outro_start, struct_boundaries, timeline, duration)
 
-    # Default mix windows from the spectral cue estimate.
+    # Default mix windows from the spectral cue estimate (heuristic path).
     mixable_intro = max(0.0, min(vocal_risk_start, duration) - cue_in)
     mixable_outro = max(0.0, cue_out - outro_start)
 
-    # When Demucs ran, the vocal-free windows are the authoritative mix zones:
-    # the incoming intro must stay instrumental, and so must the outgoing outro.
-    if vocals.get("available"):
+    # When the Demucs full-track map exists it is authoritative: the vocal-free
+    # windows come from the SAME per-second timeline as vocalRisk and
+    # first/lastVocalAt (see stems.analyze_vocal_track), so the incoming intro
+    # and outgoing outro can never be sized over a sung region. No heuristic
+    # refinement may override these afterwards.
+    if demucs_ok:
         mixable_intro = max(0.0, float(vocals["vocalIntro"]) - cue_in)
         mixable_outro = float(vocals["vocalOutro"])
+        # Hard consistency guard against rounding/quantization mismatch: the
+        # intro window (cueIn + mixableIntro) must end strictly before the
+        # first vocal window starts. firstVocalAt is the left edge of a
+        # `step`-second sung bin, so subtracting one step guarantees no part of
+        # the mix window overlaps that bin even when vocalIntro (also derived
+        # from the binned timeline) rounds up to the same second.
+        if first_vocal_at is not None:
+            safe_first = max(0.0, float(first_vocal_at) - TIMELINE_STEP)
+            mixable_intro = max(0.0, min(mixable_intro, safe_first - cue_in))
+        mixable_intro = min(mixable_intro, duration)
+        # The outro window cannot be longer than the track itself.
+        mixable_outro = max(0.0, min(mixable_outro, duration))
 
     # Explicit, scored, human-readable mix candidates on musical boundaries.
     candidates = build_candidates(
@@ -390,21 +472,6 @@ def build_timeline(y: np.ndarray, sr: int, duration: float) -> dict[str, Any]:
         }
     )
     return base
-
-
-def refine_vocal_risk(timeline: dict[str, Any], vocals: dict[str, Any], duration: float) -> None:
-    """If Demucs stem data is present, raise vocalRisk in known sung regions."""
-    if not vocals.get("available") or not timeline.get("t"):
-        return
-    first = vocals.get("firstVocalAt")
-    last = vocals.get("lastVocalAt")
-    risk = timeline["vocalRisk"]
-    for i, t in enumerate(timeline["t"]):
-        sung = (first is not None and t >= float(first)) and (
-            last is None or t <= float(last)
-        )
-        if sung:
-            risk[i] = round(min(1.0, max(risk[i], 0.7)), 4)
 
 
 def crest_factor(y: np.ndarray, rms: np.ndarray) -> float | None:

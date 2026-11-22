@@ -48,19 +48,32 @@ Creare una modalità `Radio Edit Mix Mode` che scelga automaticamente:
 
 ## Stato Implementazione
 
-Pipeline spiegabile implementata (analysis `version=2`, analyzer
+Pipeline spiegabile implementata (analysis `version=3`, analyzer
 `par8dj-mixengine-v2`):
 
 - `analysis.version` e fallback frontend per analisi vecchie (nessun crash).
 - Timeline musicale a passi di 1s (`analysis.timeline`): `step`, `t` e array
   allineati `rms`, `onset`, `beatStrength`, `low/mid/high`, `brightness`,
-  `vocalRisk`, `tension`. Il `vocalRisk` è ora autorevole: Demucs gira
-  sull'INTERO brano (htdemucs, auto-split su CPU) e produce una timeline di
-  presenza vocale per-secondo (RMS dello stem `vocals`, gate soft 0.06..0.40)
-  allineata a `timeline.t`; `timeline.vocalSource` vale `"demucs"` quando
-  disponibile, altrimenti `"heuristic"` (VAD flatness/centroid + banda
-  200-4000Hz + energia come fallback, mai crash). Esposti a top-level
-  `firstVocalAt`/`lastVocalAt`/`vocalSource`.
+  `vocalRisk`, `tension`. Il `vocalRisk` è autorevole: UNA singola corsa
+  Demucs sull'INTERO brano (htdemucs, auto-split su CPU,
+  `stems.analyze_vocal_track`) produce la timeline per-secondo di presenza
+  vocale (RMS dello stem `vocals`, gate soft 0.06..0.40) allineata a
+  `timeline.t`; dalla stessa envelope derivano anche `firstVocalAt`/
+  `lastVocalAt`, le finestre vocal-free `vocalIntro`/`vocalOutro` e le densità
+  head/tail, così tutti i campi vocali sono mutuamente consistenti.
+  `timeline.vocalSource` vale `"demucs"` quando disponibile, altrimenti
+  `"heuristic"` (VAD flatness/centroid + banda 200-4000Hz + energia come
+  fallback, mai crash). Esposti a top-level `firstVocalAt`/`lastVocalAt`/
+  `vocalSource` (i primi due sono `null` anche in caso di traccia strumentale).
+- Fallback euristico pulito: se Demucs manca o fallisce, `vocalSource` resta
+  `"heuristic"`, `firstVocalAt`/`lastVocalAt` sono `null` e
+  `vocals == {"available": False}` — nessun campo Demucs residuo. Il vecchio
+  refine euristico (`refine_vocal_risk`) e la doppia corsa Demucs head/tail
+  sono stati rimossi: nessun percorso può più sovrascrivere la mappa autorevole.
+- `mixableIntro`/`mixableOutro` in modalità Demucs derivano dalla stessa
+  timeline e `mixableIntro` è clampato per terminare prima di `firstVocalAt`
+  (incluso il passo di quantizzazione), quindi una sezione cantata non viene
+  mai marcata come mixabile.
 - Stem vocali ON di default (`AUTODJ_STEMS=0` per disattivare): la mappa vocale è
   sempre calcolata. `intro_end` preferisce la battuta prima di `firstVocalAt`
   quando il cantato apre il brano; il `mixPoint` rafforza l'evitamento voce (peso
@@ -68,7 +81,10 @@ Pipeline spiegabile implementata (analysis `version=2`, analyzer
   una frase cantata (niente cantato su cantato) e l'ingresso resta su zona pulita.
 - Cache analisi su file versionata (`~/.cache/par8dj-ai/analysis/<key>.json`,
   key = md5 dei byte del file + `ANALYSIS_VERSION` + stems/nostems): Demucs gira
-  una sola volta per brano, scrittura/lettura best-effort (mai fatale).
+  una sola volta per brano, scrittura/lettura best-effort (mai fatale). Ogni hit
+  passa una validazione strutturale (`_is_valid_cached_result`): versione, campi
+  obbligatori, allineamento `t`/`vocalRisk` e coerenza `vocalSource`↔`vocals`,
+  così un hit ha sempre la stessa shape di una miss; le entry v2 sono ignorate.
 - Phrase grid multi-risoluzione (`analysis.phraseGrid`): valuta 16/32/64 beat e
   sceglie la più coerente; restano `firstBeat`/`beatInterval`/`phraseAnchor` per
   retro-compatibilità.
