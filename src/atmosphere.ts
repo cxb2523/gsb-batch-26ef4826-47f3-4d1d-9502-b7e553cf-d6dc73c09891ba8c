@@ -96,11 +96,16 @@ export interface AtmosphereOptions extends Conditions {
    *
    * On by default: a browser goes on asking for frames for a canvas scrolled
    * out of the viewport or under `display: none`, and each one is a whole
-   * frame's GPU time that nobody sees. The sky's clocks and transitions go on
-   * as they were, the light probe with them, so it comes back as if it had been
-   * drawn all along. Turn it off for a canvas in the page that something reads
-   * from out of view — a texture for another renderer, `captureStream()`. One
-   * that isn't in the document is always drawn.
+   * frame's GPU time that nobody sees. So while it is out of view none is
+   * drawn — but the sky's clocks and transitions go on as they were, and a
+   * frame is drawn at once on the way back in, so it comes back as if it had
+   * been drawn all along. The light probe does not run while it is out of
+   * view (its series is of the frames drawn), and a GPU timing that comes in
+   * meanwhile — from a frame drawn before the pause — is dropped rather than
+   * read as the frame after it, so adaptive resolution does not act on it.
+   * Turn it off for a canvas in the page that something reads from out of view
+   * — a texture for another renderer, `captureStream()`. One that isn't in the
+   * document is always drawn.
    */
   pauseOffscreen?: boolean;
   /**
@@ -196,6 +201,19 @@ export class Atmosphere {
   private startedAt = 0;
   private last = 0;
   private lastDraw = 0;
+  // Out of view a running loop goes on ticking, so the sky's clocks go on —
+  // but no frame is drawn. `pausedAt` is the clock at which the drawing
+  // stopped (-1 while it is going on), and `pausedTotal` the drawn time the
+  // pauses have added up to, so a pause is no part of the light probe's
+  // interval nor of the governor's clock. `dropGpu` says the next batch of
+  // GPU timings to come in may hold frames drawn before the pause (results
+  // trail the frames that made them by a frame or two), and is thrown away
+  // rather than read as the first frames drawn since.
+  private pausedAt = -1;
+  private pausedTotal = 0;
+  private dropGpu = false;
+  // set by dispose(): not an observer, a timer or a queued callback draws again
+  private disposed = false;
   // "the caller wants rendering" — kept separate from the raf loop, so
   // reduced-motion can pause the loop without forgetting the caller's intent
   private wantRunning = false;
@@ -238,6 +256,13 @@ export class Atmosphere {
       this.startLoop();
     }
   };
+  // A frame drawn at once on the way back into view, at the clock the loop has
+  // reached: its ticks went on out of view, so this is the moment the sky is
+  // due at, not the moment it left. (The same clock rAF stamps — never
+  // performance.now(), which a throttled tab may have run ahead of.)
+  private resumeClock(): number {
+    return this.last;
+  }
 
   constructor(canvas: HTMLCanvasElement, options: AtmosphereOptions = {}) {
     this.canvas = canvas;
@@ -298,12 +323,24 @@ export class Atmosphere {
     }
     if (options.pauseOffscreen !== false && typeof IntersectionObserver !== 'undefined') {
       this.viewObserver = new IntersectionObserver((entries) => {
-        const inView = entries[entries.length - 1].isIntersecting;
-        const back = inView && !this.inView;
-        this.inView = inView;
-        // not left to the next tick, up to a frame interval off: what it left
-        // with is a moment long gone, and a new size has cleared the canvas of it
-        if (back && this.raf) this.draw(performance.now());
+        if (this.disposed) return;
+        const now = entries[entries.length - 1].isIntersecting;
+        const back = now && !this.inView;
+        this.inView = now;
+        if (!now) {
+          // A frame drawn before this moment is a moment already gone, and the
+          // drawing clocks stop here: nothing is drawn or probed until it is
+          // back, and a timing still in flight is dropped rather than read as
+          // the resumed frame's. (A canvas with no loop running draws only
+          // still frames, which are drawn as ever: there is nothing to pause.)
+          if (this.raf && this.canvas.isConnected) this.beginPause(this.last);
+        } else if (back && this.raf) {
+          // Drawn now, not left to the next tick, up to a frame interval off:
+          // what it left with is a moment long gone, and a new size has
+          // cleared the canvas of it. The frame fills it at the governor's
+          // scale of this moment.
+          this.draw(this.resumeClock());
+        }
         // (a little ahead of the edge, for a slow scroll to bring in this moment's sky)
       }, { rootMargin: '64px' });
       this.viewObserver.observe(canvas);
@@ -615,6 +652,9 @@ export class Atmosphere {
     if (!this.startedAt) this.startedAt = now;
     this.last = now;
     const tick = (t: number) => {
+      // a frame already in the queue when dispose() ran: let it go, and do not
+      // queue the next (cancelAnimationFrame cannot reach one already running)
+      if (this.disposed) return;
       this.raf = requestAnimationFrame(tick);
       const interval = 1000 / (this.opts.fps ?? 30);
       const elapsed = t - this.lastDraw;
@@ -635,21 +675,42 @@ export class Atmosphere {
   }
 
   private draw(t: number): void {
+    if (this.disposed) return;
     // jump() can be called before start(). Pin the reference time here
     if (!this.startedAt) { this.startedAt = t; this.last = t; }
+    // the clock the last frame was drawn at (or the last tick, out of view)
+    const since = this.last;
     // (a draw on the clock, not on a tick, may be followed by a tick stamped earlier)
-    const dt = Math.max(0, Math.min(0.2, (t - this.last) / 1000));
+    const dt = Math.max(0, Math.min(0.2, (t - since) / 1000));
     this.last = t;
+    // Out of view, a running loop keeps the clocks but draws nothing — not the
+    // frame, and not the light probe, whose series is of what is drawn — and
+    // takes no GPU timing in: the governor must not read a frame of a moment
+    // long gone as this drawing's. (A still frame has no next tick to come back
+    // on, so it is drawn as ever. And a canvas outside the document never
+    // intersects anything, and whoever made it means to read it.)
+    if (this.raf && !this.inView && this.canvas.isConnected) {
+      this.animator.step(this.target, dt);
+      // (the last frame drawn was at `since`: the drawing stopped there)
+      this.beginPause(since);
+      this.renderer.takeGpuTimes();   // whatever finished since: drop it
+      this.checkSettled(true);
+      return;
+    }
+    const resumed = this.pausedAt >= 0;
+    this.leavePause(t);
+    // A canvas coming back from a pause is sized to the governor's scale now,
+    // not the size it was left at under a scale it has since moved from — and
+    // before the probe reads its shape or the frame is drawn. (Its drawing
+    // buffer is stale either way, so the resize costs nothing here, and the
+    // frame fills it before paint.)
+    if (resumed && this.governor) this.applySize();
     this.animator.step(this.target, dt);
     // A meteor only reads as a meteor because it moves. Under reduced motion the
     // loop draws a single still frame, so one caught mid-flight would sit there
     // as a scratch across the sky — suppress them rather than freeze them.
     if (this.reducedMotion) this.animator.current.celestial.meteors = 0;
     if (this.opts.lightProbe) this.maybeProbe(t);
-    // Out of view, only a running loop's frames go undrawn: a still frame has no
-    // next tick to come back on. (A canvas outside the document never intersects
-    // anything, and whoever made it means to read it)
-    if (this.raf && !this.inView && this.canvas.isConnected) { this.checkSettled(true); return; }
     // Resizing clears the drawing buffer. Apply the previous frames' GPU
     // measurements before drawing so the new buffer is filled before paint.
     if (this.governor) {
@@ -657,9 +718,15 @@ export class Atmosphere {
       // governor reads them per pixel, so a resize in between is no matter
       const times = this.renderer.takeGpuTimes();
       if (times.length) {
-        const [w, h] = this.fullSize();
-        const before = this.governor.scale;
-        if (this.governor.update(times, w * h, t) !== before) this.applySize();
+        if (this.dropGpu) {
+          // of frames drawn before the pause: no measure of the ones since
+          this.dropGpu = false;
+        } else {
+          const [w, h] = this.fullSize();
+          const before = this.governor.scale;
+          // the governor's clock is drawn time: a pause is no headroom it earned
+          if (this.governor.update(times, w * h, t - this.pausedTotal) !== before) this.applySize();
+        }
       }
     }
     this.renderer.render(
@@ -671,6 +738,34 @@ export class Atmosphere {
     );
     // (a look over the variants in hand while nothing is linking)
     this.checkSettled(true);
+  }
+
+  /** note that a pause out of view has begun, as of the clock `t` */
+  private beginPause(t: number): void {
+    if (this.pausedAt >= 0) return;
+    this.pausedAt = t;
+    // (a timing still in flight was measured for a frame before the pause)
+    this.dropGpu = true;
+  }
+
+  /**
+   * Pick the drawing clocks up after a pause out of view. The light probe's
+   * interval is shifted by the pause, so the next measurement is the same
+   * drawn time off as it was before; and the governor's clock skips the pause
+   * too, so a canvas that was under budget has not earned a probe for it.
+   * (And the frame that follows is drawn at the governor's scale of this
+   * moment: see draw.)
+   */
+  private leavePause(t: number): void {
+    const at = this.pausedAt;
+    if (at < 0) return;
+    this.pausedAt = -1;
+    const paused = Math.max(0, t - at);
+    // (the governor's clock too: t - pausedTotal is drawn time)
+    this.pausedTotal += paused;
+    // (shifted rather than reset, so a probe that was nearly due is nearly due;
+    // firstProbe knows no pause, and has none to skip)
+    if (Number.isFinite(this.lastProbe)) this.lastProbe += paused;
   }
 
   /**
@@ -706,6 +801,9 @@ export class Atmosphere {
    */
   dispose(options: { loseContext?: boolean } = {}): void {
     this.stop();
+    this.disposed = true;
+    this.pausedAt = -1;
+    this.dropGpu = false;
     this.observer?.disconnect();
     this.observer = null;
     this.viewObserver?.disconnect();

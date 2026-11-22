@@ -866,8 +866,12 @@ sky.reducedMotion;   // true while the sky is being held still
 ```
 
 A canvas scrolled out of the viewport or under `display: none` is not drawn,
-though its clocks, transitions and light probe go on, so it comes back as if it
-had been drawn all along. If something reads the canvas from out of view (a
+though its clocks and transitions go on, and a frame is drawn at once on the way
+back in — at the adaptive resolution's current scale, even if the canvas was
+resized while out of view. The light probe does not run while it is out of view,
+and GPU timings from frames drawn before the pause are dropped rather than read
+as the resumed frame's, so a pause neither drags the resolution down nor is
+counted as time spent drawing. If something reads the canvas from out of view (a
 texture for another renderer, `captureStream()`), keep it drawing:
 
 ```ts

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **A canvas out of view pauses cleanly and comes back in step.** Nothing is
+  drawn while it is out (as before), but now the light probe does not run
+  either, and the GPU timings that arrive from frames drawn before the pause
+  are dropped rather than handed to the adaptive resolution as if they were the
+  first frames drawn since — so a pause cannot drag the resolution down, nor
+  leave the resumed frame at a size the governor has since moved past. The
+  probe's interval and the governor's clock are shifted by the pause, so a
+  recovered frame is drawn and probed as if the pause had never been extra
+  drawing time. The frame on the way back in is drawn at the governor's current
+  scale even if the canvas was resized while out of view, and a disposed
+  Atmosphere draws nothing, whatever its observers fire.
+
 ## 0.15.0 — 2026-11-20
 
 - Added optional world-space scenery: a lighthouse with a rotating beacon, two independently placed lights with water reflections, and two cloud banks with fixed centers.
