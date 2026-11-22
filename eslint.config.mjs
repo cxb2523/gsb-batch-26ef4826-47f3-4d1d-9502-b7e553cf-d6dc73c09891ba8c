@@ -17,5 +17,14 @@ export default defineConfig([
 		rules: {
 			"no-unused-vars": ["error", { "args": "none" }]
 		}
+	},
+	{
+		files: ["tests/**/*.js"],
+		languageOptions: {
+			sourceType: "commonjs",
+			globals: {
+				...globals.node
+			}
+		}
 	}
 ]);

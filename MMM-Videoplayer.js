@@ -34,11 +34,7 @@ Module.register("MMM-Videoplayer", {
 	notificationReceived: function (notification, payload) {
 		if (notification === this.config.notification) {
 			if (payload === "TOGGLE") {
-				if (this.video.paused) {
-					this.video.play();
-				} else {
-					this.video.pause();
-				}
+				this.toggleVideo();
 			} else if (payload === "NEXT") {
 				this.nextVideo();
 			} else if (payload === "REPLAY") {
@@ -47,64 +43,107 @@ Module.register("MMM-Videoplayer", {
 		}
 	},
 
+	// Toggle play/pause (from a notification or another module).
+	toggleVideo: function () {
+		// A manual toggle is a user decision: it clears any automatic
+		// pause state so a later "show" does not override it.
+		this.pausedByHide = false;
+		if (this.video.paused) {
+			this.video.play();
+		} else {
+			this.video.pause();
+		}
+	},
+
 	// What happens when the module is hidden.
 	suspend: function () {
-		if (this.config.pauseonhide) {
+		// Only pause (and remember why) if the video is actually playing.
+		// If the user already paused it manually, leave that state alone.
+		if (this.config.pauseonhide && !this.video.paused) {
 			this.video.pause();
+			this.pausedByHide = true;
 		}
 	},
 
 	// What happens when the module is shown.
 	resume: function () {
-		if (this.config.resumeonshow) {
+		// Only resume if the pause was caused by the hide itself. A clip the
+		// user paused manually (via TOGGLE) must stay paused.
+		if (this.config.resumeonshow && this.pausedByHide) {
+			this.pausedByHide = false;
 			this.video.play();
 		}
 	},
 
-	// Restart current playing video from start.
+	// Restart the currently playing (or last played) clip from the start.
 	replayVideo: function () {
-		var lastIndex = this.playedVideoArray.length - 1;
-		if (lastIndex > -1) {
-			this.video.setAttribute("src", this.playedVideoArray[lastIndex]);
+		if (this.currentVideo) {
+			this.pausedByHide = false;
+			this.video.setAttribute("src", this.currentVideo);
 			this.video.load();
 			this.video.play();
 		}
 	},
 
-	// Plays the next video in queue.
+	// Single entry point for advancing the playlist. Used by the "ended"
+	// event, the "NEXT" notification and the initial load in getDom().
 	nextVideo: function () {
-		// If set to true, the player will hide it self when a clip is loaded (and just started playing).
-		if (this.config.hideonstart) {
-			this.hide(this.config.fadeSpeed);
-		}
-
-		// Resets the video queue if set to loop.
+		// Queue exhausted: refill it from the played list when looping,
+		// otherwise stop safely instead of running out of bounds.
 		if (this.videoArray.length === 0) {
-			if (!this.config.loop) {
+			if (!this.config.loop || this.playedVideoArray.length === 0) {
+				this.stopVideo();
 				return;
 			}
 			this.videoArray = this.playedVideoArray;
 			this.playedVideoArray = [];
 		}
 
-		// Random video.
+		// Pick the next clip. Random picks any remaining clip, sequential
+		// always takes the first one left in the queue. Because played clips
+		// are removed from the queue, a random round never repeats a clip.
 		if (this.config.random) {
 			this.currentVideoIndex = Math.floor(Math.random() * this.videoArray.length);
+		} else {
+			this.currentVideoIndex = 0;
 		}
 
-		// Sets the video to play.
-		this.video.setAttribute("src", this.videoArray[this.currentVideoIndex]);
-		// Add the played video to the played queue.
-		this.playedVideoArray.push(this.videoArray.splice(this.currentVideoIndex, 1)[0]);
+		// Move the clip from the queue to the played list and make it current.
+		this.currentVideo = this.videoArray.splice(this.currentVideoIndex, 1)[0];
+		this.playedVideoArray.push(this.currentVideo);
+
+		// A new clip always starts playing, so any previous automatic pause
+		// state no longer applies.
+		this.pausedByHide = false;
+		this.video.setAttribute("src", this.currentVideo);
 		this.video.load();
 		this.video.play();
+
+		// Hide after the new clip has started playing. The hide triggers
+		// suspend(), which pauses the clip (once) if pauseonhide is set.
+		// If the module is already hidden there is nothing more to do, so
+		// the hide -> pause -> show -> resume cycle can not loop.
+		if (this.config.hideonstart && !this.hidden) {
+			this.hide(this.config.fadeSpeed);
+		}
+	},
+
+	// Stops the player when there is nothing left to play.
+	stopVideo: function () {
+		this.currentVideo = null;
+		if (this.video) {
+			this.video.pause();
+		}
 	},
 
 	// Send the module. :)
 	getDom: function () {
-		// Setup the video array.
+		// Setup the video arrays and state.
 		this.videoArray = [];
 		this.playedVideoArray = [];
+		this.currentVideo = null;
+		this.currentVideoIndex = 0;
+		this.pausedByHide = false;
 
 		// Checks if anything is defined in the config (video or videolist).
 		if (!this.config.video && !this.config.videolist) {
@@ -127,9 +166,6 @@ Module.register("MMM-Videoplayer", {
 		// Adds the video
 		this.video = document.createElement("video");
 
-		// Make sure we set the video list to 0
-		this.currentVideoIndex = 0;
-
 		// Adds the ended event so we know.
 		this.video.addEventListener("ended", this.nextVideo.bind(this), false);
 
@@ -141,7 +177,7 @@ Module.register("MMM-Videoplayer", {
 		this.video.preload = this.config.preload;
 		this.video.id = this.identifier + "_video";
 
-		// Loads the first video.
+		// Loads the first video (through the same advance path as everything else).
 		this.nextVideo();
 
 		// Wrap it up.

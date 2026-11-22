@@ -81,16 +81,41 @@ Absolute minimum config (will only play the default video file):
 |---|---|---| 
 |`video`|`/modules/MMM-Videoplayer/video/mov_bbb.mp4`|The video file to play (may be a URL to a video file as well).|
 |`videolist`|none|`Example: ['/modules/MMM-Videoplayer/video/video01.mp4', '/modules/MMM-Videoplayer/video/video02.mp4',... ]` List of video files to play (may be URLs to different video files as well).|
-|`loop`|`true`|Loop the video or not. If the videolist is set, it will loop through all videos.<br>Possible values: **true** or **false**|
-|`random`|`false`|If set to true, all videos in the list vill be played until all videos has been played in radom order.<br>Possible values: **true** or **false**|
-|`hideonstart`|false|If set to true, the player will hide it self when a clip is loaded (and just started playing (the clip will be paused when the module is hidden)). Then when the player is shown again it will continue play the clip and hide itself again when the next clip is loaded (and just starts playing) and so on.<br>Possible values: **true** or **false**|
+|`loop`|`true`|Loop the video list or not. When the last clip in the list has ended, the played queue is refilled and a new round starts. If set to false, the player simply stops (safely) when the list is finished.<br>Possible values: **true** or **false**|
+|`random`|`false`|If set to true, the clips are played in random order. Each clip is played exactly once per round (no repeats until the whole list has been played), then `loop` decides whether a new random round starts.<br>Possible values: **true** or **false**|
+|`hideonstart`|false|If set to true, the player hides itself each time a new clip has started playing. If `pauseonhide` is also true, the clip pauses while hidden; when the module is shown again (and `resumeonshow` is true) the clip resumes, and the player hides itself again when the next clip starts. The hide only happens once per clip and never re-triggers itself.<br>Possible values: **true** or **false**|
 |`showcontrols`|false|Show the controls or not.<br>Possible values: **true** or **false**|
 |`preload`|auto|Preload the video or not see the html-[video](https://www.w3schools.com/tags/tag_video.asp)-tag for more information<br>Possible values: **auto**, **metadata** or **none**|
 |`autoplay`|`true`|If set to true, sound (muted by default) has to be muted as well, otherwise the video will not auto play.<br>Possible values: **true** or **false**|
 |`muted`|`true`|Mute the sound. If auto play is true, this needs to be true as well, otherwise the video will not auto play.<br>Possible values: **true** or **false**|
-|`pauseonhide`|`true`|If true the module will pause the video when hidden.<br>Possible values: **true** or **false**|
-|`resumeonshow`|`true`|If true the module will resume the video when shown.<br>Possible values: **true** or **false**|
-|`notification`|`VIDEOPLAYER1`|Unique notification string for this player. "payload" can be "TOGGLE" to start or stop the player, "REPLAY" to restart current video or "NEXT" to play the next video in the list when sending notifications.|
+|`pauseonhide`|`true`|If true the module pauses the video when hidden. The module remembers that the pause was caused by the hide, so it can be distinguished from a manual pause.<br>Possible values: **true** or **false**|
+|`resumeonshow`|`true`|If true the module resumes the video when shown — but only if the pause was caused by the hide itself. A clip paused manually via `TOGGLE` stays paused.<br>Possible values: **true** or **false**|
+|`notification`|`VIDEOPLAYER1`|Unique notification string for this player. Send this notification with the payload `"TOGGLE"` to play/pause, `"REPLAY"` to restart the current clip from the beginning, or `"NEXT"` to advance to the next clip in the list.|
+
+### Playback state behaviour
+
+All playlist advancement goes through a single code path: the initial load, the video's `ended` event and the `NEXT` notification all update the current index, the played queue and the `<video>` element in exactly the same way, so the player state can not drift apart from what is on screen.
+
+* **Hide / show:** when the module is hidden (and `pauseonhide` is true) the video pauses and the reason is remembered. When the module is shown again, the video only resumes if it was paused by the hide and `resumeonshow` is true — a manual `TOGGLE` pause is never overridden.
+* **REPLAY:** always restarts the *current* clip, even right after the list has looped.
+* **End of list:** if the list is finished and `loop` is false, `NEXT` (or a natural `ended`) simply stops the player instead of throwing. With `loop` true the played queue becomes the new playlist.
+* **Random:** clips are drawn from the remaining queue, so a clip never repeats within a round; after a full round `loop` decides whether the queue resets.
+* **hideonstart:** the module hides once per new clip, after it has started playing. The hide does not re-trigger the pause logic, so no hide/pause loop can occur.
+
+### Development
+
+Run the local test suite (covers the playlist, hide/show and notification state transitions):
+
+```bash
+npm install
+npm test
+```
+
+Lint the code:
+
+```bash
+npm run lint
+```
 
 ### CSS Tricks
 
