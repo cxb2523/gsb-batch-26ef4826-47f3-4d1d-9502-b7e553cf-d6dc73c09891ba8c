@@ -143,3 +143,190 @@ test("loadNoCache rejection propagates", async () => {
   const loader = new FailingLoader(mockGL());
   await expect(loader.load(42)).rejects.toThrow(/boom/);
 });
+
+type PendingResult = { texture: WebGLTexture; width: number; height: number };
+
+/** A loader whose loadNoCache never settles on its own and counts disposes. */
+class ControllablePendingLoader extends WebGLTextureLoaderAsyncHashCache<number> {
+  // One resolver pair per loadNoCache invocation, so different generations
+  // can be settled independently.
+  resolvers: Array<{
+    resolve: (v: PendingResult) => void;
+    reject: (e: unknown) => void;
+  }> = [];
+  disposeCalls = 0;
+  loadNoCacheCalls = 0;
+  override canLoad(input: unknown) {
+    return typeof input === "number";
+  }
+  override inputHash(input: number) {
+    return input;
+  }
+  override loadNoCache(_input: number) {
+    this.loadNoCacheCalls++;
+    return {
+      promise: new Promise<PendingResult>((resolve, reject) => {
+        this.resolvers.push({ resolve, reject });
+      }),
+      dispose: () => {
+        this.disposeCalls++;
+      },
+    };
+  }
+  resolveGeneration(index: number, v: PendingResult) {
+    this.resolvers[index].resolve(v);
+  }
+  rejectGeneration(index: number, e: unknown) {
+    this.resolvers[index].reject(e);
+  }
+}
+
+const settle = (v: string) => new Promise<string>((resolve) => setTimeout(() => resolve(v), 10));
+
+test("cancelLoad: underlying dispose runs once and the pending promise never lands", async () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  const p = loader.load(42);
+  loader.cancelLoad(42);
+  expect(loader.disposeCalls).toBe(1);
+  // The cancelled load eventually resolves underneath; the returned promise
+  // must not adopt its result.
+  loader.resolveGeneration(0, {
+    texture: { id: 1 } as unknown as WebGLTexture,
+    width: 1,
+    height: 1,
+  });
+  await expect(Promise.race([p.then(() => "resolved"), settle("timeout")])).resolves.toBe(
+    "timeout",
+  );
+  expect(loader.get(42)).toBeUndefined();
+  loader.dispose();
+});
+
+test("cancelLoad is idempotent and safe for unknown or already-resolved inputs", async () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  // Never loaded: no-op, no throw.
+  expect(() => loader.cancelLoad(99)).not.toThrow();
+  expect(loader.disposeCalls).toBe(0);
+
+  loader.load(42);
+  loader.cancelLoad(42);
+  loader.cancelLoad(42);
+  loader.cancelLoad(42);
+  expect(loader.disposeCalls).toBe(1);
+
+  // Cancelling an input whose result is already cached must not delete the
+  // texture nor touch any dispose: cancellation only affects pending loads.
+  const deleted: WebGLTexture[] = [];
+  class ResolvedLoader extends WebGLTextureLoaderAsyncHashCache<number> {
+    override canLoad(input: unknown) {
+      return typeof input === "number";
+    }
+    override inputHash(input: number) {
+      return input;
+    }
+    override loadNoCache(input: number) {
+      return {
+        promise: Promise.resolve({
+          texture: { id: input } as unknown as WebGLTexture,
+          width: 1,
+          height: 1,
+        }),
+        dispose: () => {},
+      };
+    }
+  }
+  const resolvedLoader = new ResolvedLoader(mockGL(deleted));
+  const res = await resolvedLoader.load(7);
+  resolvedLoader.cancelLoad(7);
+  expect(resolvedLoader.get(7)).toBe(res);
+  expect(deleted).toEqual([]);
+  resolvedLoader.dispose();
+  expect(deleted).toEqual([res.texture]);
+});
+
+test("load after cancel starts a fresh load and a stale late result cannot replace it", async () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  const first = loader.load(42);
+  loader.cancelLoad(42);
+  expect(loader.disposeCalls).toBe(1);
+
+  const second = loader.load(42);
+  expect(loader.loadNoCacheCalls).toBe(2);
+  expect(second).not.toBe(first);
+  // Idempotent while the new load is pending.
+  expect(loader.load(42)).toBe(second);
+
+  // The old (cancelled) generation resolves first: its result must be dropped.
+  loader.resolveGeneration(0, {
+    texture: { id: "stale" } as unknown as WebGLTexture,
+    width: 1,
+    height: 1,
+  });
+  await expect(Promise.race([first.then(() => "resolved"), settle("timeout")])).resolves.toBe(
+    "timeout",
+  );
+  expect(loader.get(42)).toBeUndefined();
+
+  // A fresh resolve on the current generation lands normally.
+  const fresh = { texture: { id: "fresh" } as unknown as WebGLTexture, width: 3, height: 4 };
+  loader.resolveGeneration(1, fresh);
+  await expect(second).resolves.toBe(fresh);
+  expect(loader.get(42)).toBe(fresh);
+  loader.dispose();
+});
+
+test("dispose while loads are pending: disposes run once and no result is written", async () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  const p = loader.load(42);
+  loader.dispose();
+  expect(loader.disposeCalls).toBe(1);
+  expect(loader._disposed).toBe(true);
+
+  loader.resolveGeneration(0, {
+    texture: { id: 1 } as unknown as WebGLTexture,
+    width: 1,
+    height: 1,
+  });
+  await expect(Promise.race([p.then(() => "resolved"), settle("timeout")])).resolves.toBe(
+    "timeout",
+  );
+  expect(loader.results.size).toBe(0);
+  expect(loader.promises.size).toBe(0);
+  expect(loader.disposes.size).toBe(0);
+
+  // Dispose is idempotent: the underlying dispose is not invoked again.
+  loader.dispose();
+  expect(loader.disposeCalls).toBe(1);
+});
+
+test("load after dispose never starts a new loadNoCache", () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  loader.dispose();
+  const p = loader.load(42);
+  expect(loader.loadNoCacheCalls).toBe(0);
+  expect(loader.promises.size).toBe(0);
+  expect(loader.disposes.size).toBe(0);
+  // The promise stays pending rather than resolving against a dead context.
+  return expect(Promise.race([p.then(() => "resolved"), settle("timeout")])).resolves.toBe(
+    "timeout",
+  );
+});
+
+test("a rejected load after cancel is swallowed and allows reloading", async () => {
+  const loader = new ControllablePendingLoader(mockGL());
+  const first = loader.load(42);
+  loader.cancelLoad(42);
+  // Rejecting the dead generation must not produce an unhandled rejection
+  // and must not reject the (already detached) caller promise.
+  loader.rejectGeneration(0, new Error("cancelled failure"));
+  await expect(Promise.race([first.then(() => "resolved"), settle("timeout")])).resolves.toBe(
+    "timeout",
+  );
+
+  const second = loader.load(42);
+  expect(loader.loadNoCacheCalls).toBe(2);
+  const ok = { texture: { id: "ok" } as unknown as WebGLTexture, width: 1, height: 1 };
+  loader.resolveGeneration(1, ok);
+  await expect(second).resolves.toBe(ok);
+  loader.dispose();
+});

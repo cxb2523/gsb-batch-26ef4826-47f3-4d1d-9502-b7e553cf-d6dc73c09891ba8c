@@ -16,8 +16,16 @@ export default class VideoTextureLoader extends WebGLTextureLoaderAsyncHashCache
   override loadNoCache(input: HTMLVideoElement) {
     const { gl } = this;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
     const dispose = () => {
-      if (timeout !== undefined) clearTimeout(timeout);
+      // Idempotent: a second call (e.g. cancelLoad followed by loader
+      // dispose) must not clear a timer owned by a newer load.
+      if (cancelled) return;
+      cancelled = true;
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+        timeout = undefined;
+      }
     };
     const promise = new Promise<{
       texture: WebGLTexture;
@@ -25,6 +33,9 @@ export default class VideoTextureLoader extends WebGLTextureLoaderAsyncHashCache
       height: number;
     }>((resolve) => {
       const checkVideoReady = () => {
+        // The load was cancelled (cancelLoad) or the loader was disposed.
+        // Never create/upload a texture and never schedule another poll.
+        if (cancelled) return;
         if (input.videoWidth > 0) {
           const { videoWidth: width, videoHeight: height } = input;
           const texture = createTexture(gl);

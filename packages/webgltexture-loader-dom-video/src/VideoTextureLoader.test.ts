@@ -199,3 +199,189 @@ test("dispose deletes every cached texture", async () => {
   loader.dispose();
   expect(deleted).toEqual([a.texture, b.texture]);
 });
+
+/** Mock GL that counts every texture lifecycle and upload call. */
+const countingGL = () => {
+  const created: WebGLTexture[] = [];
+  const deleted: WebGLTexture[] = [];
+  const uploads: unknown[] = [];
+  let i = 0;
+  const gl = mockGL({
+    createTexture: () => {
+      const t = { __id: i++ } as unknown as WebGLTexture;
+      created.push(t);
+      return t;
+    },
+    deleteTexture: ((t: WebGLTexture) => {
+      deleted.push(t);
+    }) as WebGLRenderingContext["deleteTexture"],
+    texImage2D: ((...args: unknown[]) => {
+      uploads.push(args);
+    }) as unknown as WebGLRenderingContext["texImage2D"],
+  });
+  return { gl, created, deleted, uploads };
+};
+
+test("cancelling during polling clears the timer and creates/uploads no texture", async () => {
+  jest.useFakeTimers();
+  try {
+    const { gl, created, deleted, uploads } = countingGL();
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const promise = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+
+    loader.cancelLoad(v);
+    // The poll timer is gone and cancelling again is a safe no-op.
+    expect(jest.getTimerCount()).toBe(0);
+    expect(() => loader.cancelLoad(v)).not.toThrow();
+
+    // Even if the video becomes ready and every queued timer runs, no
+    // texture is ever created or uploaded for the cancelled load.
+    v.videoWidth = 320;
+    v.videoHeight = 240;
+    await jest.advanceTimersByTimeAsync(1000);
+    await Promise.resolve();
+    expect(created).toHaveLength(0);
+    expect(uploads).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(loader.get(v)).toBeUndefined();
+
+    // The caller's promise never settles.
+    let settled = false;
+    promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await jest.runAllTimersAsync();
+    expect(settled).toBe(false);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("dispose while a load is still polling: pending load never creates a texture", async () => {
+  jest.useFakeTimers();
+  try {
+    const { gl, created, deleted, uploads } = countingGL();
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const pending = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+
+    loader.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+
+    // The video would now be ready; timers run anyway but the disposed
+    // load must stay dead.
+    v.videoWidth = 640;
+    v.videoHeight = 480;
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(created).toHaveLength(0);
+    expect(uploads).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(loader.get(v)).toBeUndefined();
+    expect(loader.results.size).toBe(0);
+
+    let settled = false;
+    pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await jest.runAllTimersAsync();
+    expect(settled).toBe(false);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("dispose deletes cached textures while a different load is still polling", async () => {
+  jest.useFakeTimers();
+  try {
+    const { gl, created, deleted, uploads } = countingGL();
+    const loader = new VideoTextureLoader(gl);
+
+    // One load completes and is cached.
+    const ready = await loader.load(makeVideo(16, 16));
+    // Another load stays pending in the polling loop.
+    const pendingVideo = makeVideo(0, 0);
+    const pending = loader.load(pendingVideo);
+    expect(jest.getTimerCount()).toBe(1);
+
+    loader.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+    // The cached texture is deleted exactly once...
+    expect(deleted).toEqual([ready.texture]);
+    // ...and the pending load must not create anything afterwards.
+    pendingVideo.videoWidth = 100;
+    pendingVideo.videoHeight = 100;
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(created).toHaveLength(1);
+    expect(uploads).toHaveLength(1);
+    expect(deleted).toEqual([ready.texture]);
+    expect(loader.get(pendingVideo)).toBeUndefined();
+
+    let settled = false;
+    pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await jest.runAllTimersAsync();
+    expect(settled).toBe(false);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("reloading after a cancel starts a fresh poll and uploads exactly one texture", async () => {
+  jest.useFakeTimers();
+  try {
+    const { gl, created, deleted, uploads } = countingGL();
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+
+    const first = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+    loader.cancelLoad(v);
+    expect(jest.getTimerCount()).toBe(0);
+
+    // Reload: polling restarts from scratch, no texture has been spent yet.
+    const second = loader.load(v);
+    expect(second).not.toBe(first);
+    expect(jest.getTimerCount()).toBe(1);
+    expect(created).toHaveLength(0);
+    expect(uploads).toHaveLength(0);
+
+    // Idempotent while the new load is pending.
+    expect(loader.load(v)).toBe(second);
+
+    v.videoWidth = 128;
+    v.videoHeight = 64;
+    await jest.advanceTimersByTimeAsync(100);
+    const result = await second;
+    expect(result.width).toBe(128);
+    expect(result.height).toBe(64);
+    expect(created).toHaveLength(1);
+    expect(uploads).toHaveLength(1);
+    expect(loader.get(v)).toBe(result);
+    expect(jest.getTimerCount()).toBe(0);
+
+    // Disposing the completed load deletes the single texture exactly once.
+    loader.dispose();
+    expect(deleted).toEqual([result.texture]);
+  } finally {
+    jest.useRealTimers();
+  }
+});
