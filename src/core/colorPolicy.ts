@@ -53,6 +53,20 @@ export function readCadColorPolicy(document?: CadDocument): Required<Pick<CadCol
   return monochromeColor ? { mode, monochromeColor } : { mode };
 }
 
+/** Normalizes a caller-supplied policy so renderers can store and compare it safely. */
+export function normalizeCadColorPolicy(policy: CadColorPolicy = {}): Required<Pick<CadColorPolicy, 'mode'>> & Pick<CadColorPolicy, 'monochromeColor'> {
+  const mode: CadColorMode = policy.mode === 'monochrome' ? 'monochrome' : 'source';
+  const monochromeColor = normalizeOptionalColor(policy.monochromeColor);
+  return monochromeColor ? { mode, monochromeColor } : { mode };
+}
+
+/** Compares two policies after normalization. */
+export function cadColorPoliciesEqual(a: CadColorPolicy, b: CadColorPolicy): boolean {
+  const left = normalizeCadColorPolicy(a);
+  const right = normalizeCadColorPolicy(b);
+  return left.mode === right.mode && left.monochromeColor === right.monochromeColor;
+}
+
 function normalizeOptionalColor(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim();

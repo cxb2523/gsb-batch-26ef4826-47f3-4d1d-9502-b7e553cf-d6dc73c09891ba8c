@@ -2,7 +2,7 @@ import { createDefaultLoaderRegistry } from '../loaders/index.js';
 import type { CadLoaderRegistry } from '../loaders/CadLoaderRegistry.js';
 import { summarizeCadDocument } from '../core/entity.js';
 import { extractCadBom } from '../core/bom.js';
-import { createCadRenderDocument, type CadColorMode } from '../core/colorPolicy.js';
+import type { CadColorMode } from '../core/colorPolicy.js';
 import { CadShxFontRegistry, synchronizeCadDocumentReferences, type CadShxGlyphResolver } from '../core/shx.js';
 import { isCadNativeRenderableLoader, type CadBom, type CadBomOptions, type CadDocument, type CadFitMode, type CadLoadInput, type CadLoadedReference, type CadLoadOptions, type CadLoadProgress, type CadLoadResult, type CadLoader, type CadMissingReference, type CadNativeRenderableLoader, type CadReferenceInput, type CadReferenceState } from '../core/types.js';
 import { CadCanvasRenderer, type CanvasViewerOptions, type RenderStats, type ViewChangeEvent } from './CadCanvasRenderer.js';
@@ -173,7 +173,8 @@ export class CadViewer {
       summary: summarizeCadDocument(document),
       fileName
     };
-    this.renderer.setDocument(this.createRenderDocument(document));
+    this.syncRendererColorPolicy();
+    this.renderer.setDocument(document);
     if (!this.options.autoFit) this.renderer.render();
     this.lastResult = result;
     this.options.onLoad?.(result);
@@ -303,7 +304,8 @@ export class CadViewer {
     this.options.onLoadProgress?.({ phase: 'render', format: result.format, message: 'Rendering normalized CAD scene…', percent: 96 });
     this.activateDocumentReferences(result.document);
     result.warnings = result.document.warnings;
-    this.renderer.setDocument(this.createRenderDocument(result.document));
+    this.syncRendererColorPolicy();
+    this.renderer.setDocument(result.document);
     if (!this.options.autoFit) this.renderer.render();
     const value: CadViewerLoadResult = {
       ...result,
@@ -395,8 +397,8 @@ export class CadViewer {
     };
   }
 
-  private createRenderDocument(document: CadDocument): CadDocument {
-    return createCadRenderDocument(document, {
+  private syncRendererColorPolicy(): void {
+    this.renderer.setColorPolicy({
       mode: this.getColorMode(),
       monochromeColor: this.getMonochromeColor()
     });
@@ -407,11 +409,9 @@ export class CadViewer {
       this.activeNativeLoader.setNativeOptions?.(this.mergeLoadOptions({}));
       return;
     }
-    const document = this.lastResult?.document;
-    if (!document) return;
-    const view = this.renderer.getViewState();
-    this.renderer.setDocument(this.createRenderDocument(document));
-    this.renderer.setViewState(view);
+    if (!this.lastResult?.document) return;
+    // The renderer rebuilds its color batches in place and keeps the viewport.
+    this.syncRendererColorPolicy();
   }
 
   private activateDocumentReferences(document: CadDocument): void {

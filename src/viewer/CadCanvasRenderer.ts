@@ -1,5 +1,6 @@
 import { applyByBlockColorInheritance, layerVisible, resolveCadColor, resolveFillColor, type CadColorContrastMode } from '../core/color.js';
 import { computeCadDocumentBounds, resolveCadFitBounds } from '../core/bounds.js';
+import { cadColorPoliciesEqual, createCadRenderDocument, normalizeCadColorPolicy, type CadColorPolicy } from '../core/colorPolicy.js';
 import { arcPoints, boundsValid, bulgeToPolylinePoints, clamp, ellipsePoints, emptyBounds, isFinitePoint, xy } from '../core/geometry.js';
 import { paintCadText } from '../core/text.js';
 import { cadEntityWorldStrokeWidth, inferEntityKind, isCadPolylineClosed } from '../core/entity.js';
@@ -129,6 +130,8 @@ export class CadCanvasRenderer {
   private resizeObserver?: ResizeObserver;
   private imageCache = new Map<string, HTMLImageElement>();
   private stats: RenderStats = { total: 0, drawn: 0, skipped: 0, byType: {}, unsupported: {}, renderElapsedMs: 0, backend: 'canvas2d' };
+  private colorPolicy: CadColorPolicy = { mode: 'source' };
+  private destroyed = false;
 
   onStats?: (stats: RenderStats) => void;
   onViewChange?: (event: ViewChangeEvent) => void;
@@ -149,6 +152,7 @@ export class CadCanvasRenderer {
   }
 
   destroy(): void {
+    this.destroyed = true;
     this.resizeObserver?.disconnect();
   }
 
@@ -164,9 +168,31 @@ export class CadCanvasRenderer {
 
   setDocument(document: CadDocument): void {
     this.sourceDocument = document;
-    this.document = createCadSceneDocument(document);
+    this.document = createCadSceneDocument(createCadRenderDocument(document, this.colorPolicy));
     this.bounds = computeCadDocumentBounds(this.document, this.boundsOptions());
     this.fitToView();
+  }
+
+  /**
+   * Rebuilds the render view with a new color policy while preserving the
+   * current pan/zoom/fitScale viewport. The parser-owned source document is
+   * never mutated; getDocument() exposes the policy-carrying render view.
+   * Safe to call with no document loaded or after destroy().
+   */
+  setColorPolicy(policy: CadColorPolicy = {}): void {
+    if (this.destroyed) return;
+    const next = normalizeCadColorPolicy(policy);
+    if (cadColorPoliciesEqual(this.colorPolicy, next)) return;
+    this.colorPolicy = next;
+    if (!this.sourceDocument) return;
+    this.document = createCadSceneDocument(createCadRenderDocument(this.sourceDocument, this.colorPolicy));
+    this.bounds = computeCadDocumentBounds(this.document, this.boundsOptions());
+    this.render();
+    this.emitViewChange();
+  }
+
+  getColorPolicy(): CadColorPolicy {
+    return { ...this.colorPolicy };
   }
 
   refreshReferences(): void {
