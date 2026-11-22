@@ -1,6 +1,18 @@
 import { defaults, directiveRegex, idPrefix, spaceDelimiter, specialSymbol } from "@/constants";
 import { composeProps, createElementWithProps } from "@/lib/dom";
-import { addToQueue, clearQueue, clearQueueHook, clearQueueUnload, dequeue, emit, removeFromQueue, speakFromQueue, subscribe } from "@/lib/queue";
+import {
+  addToQueue,
+  clearQueue,
+  clearQueueHook,
+  clearQueueUnload,
+  dequeue,
+  emit,
+  isQueueHead,
+  markUtteranceEnded,
+  removeSessionFromQueue,
+  speakFromQueue,
+  subscribe,
+} from "@/lib/queue";
 import { findCharIndex, getIndex, indexText, isParent, isSetStateFunction, nodeToKey, nodeToWords, parent, stripDirectives, toText } from "@/lib/react";
 import { setState, state } from "@/lib/state";
 import { cancel, getProgress, isMobile, parse, sanitize, shouldHighlightNextPart, splitNode, textToChunks } from "@/lib/utils";
@@ -22,6 +34,22 @@ import type {
   VoidFunction,
 } from "@/types";
 import { cloneElement, forwardRef, isValidElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+
+/** DOM nodes temporarily rewritten to render a highlight. */
+type HighlightSnapshot = { element: HTMLElement; originalTextContent: string; container: HTMLElement };
+
+/** A single run of speech, from `start()` until it ends or is replaced. */
+type SpeechSession = {
+  id: string;
+  utterance: SpeechSynthesisUtterance;
+  timers: Set<ReturnType<typeof setTimeout>>;
+  active: boolean;
+  /** Whether this session registered the global `beforeunload` handler. */
+  listensForUnload: boolean;
+};
+
+/** Monotonic counter used to build globally unique session ids. */
+let sessionSequence = 0;
 
 function useStableValue<T>(value: T, mode: UpdateMode, delay: number) {
   const [stableValue, setStableValue] = useState(value);
@@ -109,9 +137,25 @@ export function useSpeechInternal({
 }: UseSpeechOptionsInternal) {
   const [speechStatus, speechStatusRef, setSpeechStatus] = useStateRef<SpeechStatus>("stopped");
   const [speakingWord, speakingWordRef, setSpeakingWord] = useStateRef<SpeakingWord>(null);
-  const { utteranceRef, updateProps } = useSpeechSynthesisUtterance();
+  const { createUtterance, updateProps } = useSpeechSynthesisUtterance();
   const highlightRef = useRef(false);
   const directiveRef = useRef<{ event: DirectiveEvent; delay: number; abortDelay?: VoidFunction }>({ event: null, delay: 0 });
+  /** The session that currently owns the utterance, queue entry and timers. */
+  const sessionRef = useRef<SpeechSession | null>(null);
+  /** Pending 500ms parameter-change switch, so it can be cancelled on replacement. */
+  const pendingParamSwitchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** A `start()` request that arrived before the new text finished debouncing. */
+  const pendingStartRef = useRef(false);
+  /** DOM nodes modified by the highlight effect, restored when speech ends. */
+  const highlightSnapshotsRef = useRef<HighlightSnapshot[]>([]);
+
+  /** Always expose the latest callbacks and params to deferred work (timers, utterance events). */
+  const callbacksRef = useRef({ onError, onStart, onResume, onPause, onStop, onBoundary, onQueueChange });
+  const paramsRef = useRef({ pitch, rate, volume, lang, voiceURI });
+  useLayoutEffect(() => {
+    callbacksRef.current = { onError, onStart, onResume, onPause, onStop, onBoundary, onQueueChange };
+    paramsRef.current = { pitch, rate, volume, lang, voiceURI };
+  });
 
   const uniqueId = useMemo(() => `${idPrefix}${id ?? crypto.randomUUID()}`, [id]);
   const key = useMemo(() => (stableText ? text : nodeToKey(text)), [text, stableText]);
@@ -144,12 +188,94 @@ export function useSpeechInternal({
 
   function resumeEventHandler() {
     setSpeechStatus("started");
-    onResume?.();
+    callbacksRef.current.onResume?.();
   }
 
   function pauseEventHandler() {
     setSpeechStatus("paused");
-    onPause?.();
+    callbacksRef.current.onPause?.();
+  }
+
+  function clearPendingParamSwitch() {
+    if (pendingParamSwitchRef.current === null) return;
+    clearTimeout(pendingParamSwitchRef.current);
+    pendingParamSwitchRef.current = null;
+  }
+
+  function clearSessionTimers(session: SpeechSession) {
+    session.timers.forEach((timeout) => clearTimeout(timeout));
+    session.timers.clear();
+  }
+
+  function scheduleSessionTimer(session: SpeechSession, handler: VoidFunction, delay: number) {
+    const timeout = setTimeout(() => {
+      session.timers.delete(timeout);
+      if (session.active && sessionRef.current === session) handler();
+    }, delay);
+    session.timers.add(timeout);
+    return timeout;
+  }
+
+  function detachUtteranceEvents(utterance: SpeechSynthesisUtterance) {
+    utterance.onstart = null;
+    utterance.onend = null;
+    utterance.onerror = null;
+    utterance.onboundary = null;
+  }
+
+  /** Restores DOM nodes rewritten by highlighting, without clobbering content React already replaced. */
+  function restoreHighlightedDom() {
+    const snapshots = highlightSnapshotsRef.current;
+    highlightSnapshotsRef.current = [];
+    snapshots.forEach(({ element, originalTextContent, container }) => {
+      if (element.isConnected && element.contains(container)) element.textContent = originalTextContent;
+    });
+  }
+
+  /**
+   * Tears down a session: queued entry, pending timers, listeners and utterance
+   * callbacks. This is what guarantees that a replaced session cannot speak,
+   * highlight, or call back into a newer session.
+   */
+  function teardownSession(
+    session: SpeechSession,
+    {
+      cancelSpeech = true,
+      stopReason = "manual",
+      speakNext = false,
+      notifyStop = false,
+    }: { cancelSpeech?: boolean; stopReason?: State["stopReason"]; speakNext?: boolean; notifyStop?: boolean } = {},
+  ) {
+    if (!session.active) {
+      if (sessionRef.current === session) sessionRef.current = null;
+      return;
+    }
+    session.active = false;
+    if (sessionRef.current === session) sessionRef.current = null;
+
+    // Only the queue head is actually driving `speechSynthesis`; a queued entry
+    // must never cancel (or advance) another instance's speech.
+    const wasHead = isQueueHead(session.utterance);
+    clearSessionTimers(session);
+    clearPendingParamSwitch();
+    detachUtteranceEvents(session.utterance);
+    if (cancelSpeech && wasHead) cancel(stopReason);
+
+    // `beforeunload` is a shared global listener: only remove it when this very
+    // session installed it, so stopping a queued instance cannot deafen the one
+    // that is still speaking.
+    if (session.listensForUnload) {
+      session.listensForUnload = false;
+      window.removeEventListener("beforeunload", clearQueueUnload);
+    }
+    removeSessionFromQueue(session.id, callbacksRef.current.onQueueChange);
+    restoreHighlightedDom();
+    highlightRef.current = false;
+    setSpeakingWord(null);
+    setSpeechStatus("stopped");
+
+    if (speakNext) speakFromQueue();
+    if (notifyStop) callbacksRef.current.onStop?.();
   }
 
   function start() {
@@ -161,14 +287,40 @@ export function useSpeechInternal({
       return resumeEventHandler();
     }
     if (speechStatusRef.current === "queued") return;
+
+    // The text key changes immediately, but `stableKey` (and therefore the
+    // chunks) only follows once the debounce/throttle window elapses. Starting
+    // now would speak the previous content, so wait for the new chunks and
+    // start from the effect that observes the stabilized signature.
+    if (stableKey !== key) {
+      pendingStartRef.current = true;
+      return;
+    }
+    pendingStartRef.current = false;
+    // Captured before teardown: a manual restart of an already-speaking
+    // instance must speak immediately rather than wait behind itself.
+    const wasStarted = speechStatusRef.current === "started";
+
+    // A manual start replaces whatever this hook was previously doing. The
+    // previous session belongs to this hook instance, so cancelling it can
+    // never interrupt another instance's speech.
+    const previousSession = sessionRef.current;
+    if (previousSession) teardownSession(previousSession, { cancelSpeech: true });
+
+    const createdUtterance = createUtterance();
+    if (!createdUtterance) return onError(new Error("Browser not supported! Try some other browser."));
+    const utterance = createdUtterance;
+
+    const session: SpeechSession = { id: `${uniqueId}:${++sessionSequence}`, utterance, timers: new Set(), active: true, listensForUnload: false };
+    sessionRef.current = session;
+
     let currentChunk = 0;
     let currentText = chunks[currentChunk] || "";
     let processedTextLength = -spaceDelimiter.length;
-    const utterance = utteranceRef.current!;
     utterance.text = currentText.trimStart();
     let offset = processedTextLength + currentText.length - utterance.text.length;
     let specialSymbolOffset = 0;
-    updateProps({ pitch, rate, volume, lang, voiceURI });
+    updateProps(utterance, paramsRef.current);
 
     function handleDirectives() {
       let skip = false;
@@ -189,7 +341,7 @@ export function useSpeechInternal({
             case "volume":
             case "lang":
             case "voice":
-              updateProps({ [key]: value === "default" ? defaults[key] : value });
+              updateProps(utterance, { [key]: value === "default" ? defaults[key] : value });
               break;
             case "skip":
               if (typeof value === "boolean") skip = value;
@@ -203,15 +355,27 @@ export function useSpeechInternal({
     }
 
     function startEventHandler() {
-      window.addEventListener("beforeunload", clearQueueUnload);
+      if (!session.active) return;
+      if (!session.listensForUnload) {
+        session.listensForUnload = true;
+        window.addEventListener("beforeunload", clearQueueUnload);
+      }
       setState({ stopReason: "auto" });
       highlightRef.current = true;
+      // A preserved queue may have started this entry long after `start()` set
+      // it to "queued"; now that it is actually being spoken it is "started".
+      if (speechStatusRef.current === "queued") setSpeechStatus("started");
       if (directiveRef.current.event || directiveRef.current.delay) reset();
-      else onStart?.();
-      onBoundary?.({ progress: getProgress(offset, speechText.length) });
+      else callbacksRef.current.onStart?.();
+      callbacksRef.current.onBoundary?.({ progress: getProgress(offset, speechText.length) });
     }
 
     async function stopEventHandler() {
+      // The utterance has finished (naturally, via cancel, or via an error), so
+      // it may be spoken again for the next chunk.
+      markUtteranceEnded(utterance);
+      if (!session.active) return;
+
       if (state.stopReason === "auto" && currentChunk < chunks.length - 1) {
         processedTextLength += currentText.length;
         currentText = chunks[++currentChunk] ?? "";
@@ -223,8 +387,11 @@ export function useSpeechInternal({
           const { delay } = directiveRef.current;
           directiveRef.current.event = "change";
           if (!delay) return speakFromQueue();
-          const timeout = setTimeout(speakFromQueue, delay);
-          directiveRef.current.abortDelay = () => clearTimeout(timeout);
+          const timeout = scheduleSessionTimer(session, speakFromQueue, delay);
+          directiveRef.current.abortDelay = () => {
+            clearTimeout(timeout);
+            session.timers.delete(timeout);
+          };
           return;
         }
       }
@@ -237,21 +404,12 @@ export function useSpeechInternal({
         }
         return speakFromQueue();
       }
-      if (state.stopReason === "auto") onBoundary?.({ progress: 100 });
-      if (synth.paused) cancel();
-      window.removeEventListener("beforeunload", clearQueueUnload);
-      setSpeechStatus("stopped");
-      setSpeakingWord(null);
-      utterance.onstart = null;
-      utterance.onend = null;
-      utterance.onerror = null;
-      utterance.onboundary = null;
-      removeFromQueue(utterance, onQueueChange);
-      speakFromQueue();
-      onStop?.();
+      if (state.stopReason === "auto") callbacksRef.current.onBoundary?.({ progress: 100 });
+      teardownSession(session, { cancelSpeech: synth.paused, speakNext: true, notifyStop: true });
     }
 
     function boundaryEventHandler(event: SpeechSynthesisEvent) {
+      if (!session.active) return;
       const { charIndex, charLength, name } = event as SpeechSynthesisEvent & { name: SpeechSynthesisEventName };
       if (name === "word") {
         const isSpecialSymbol = +(utterance.text[charIndex + charLength] === specialSymbol);
@@ -260,7 +418,7 @@ export function useSpeechInternal({
           setSpeakingWord({ index, charIndex: isSpecialSymbol ? charIndex + charLength + 1 : charIndex, length: isSpecialSymbol || charLength });
         if (isSpecialSymbol) specialSymbolOffset -= charLength + 1;
       }
-      onBoundary?.({ progress: getProgress(offset + charIndex + charLength, speechText.length) });
+      callbacksRef.current.onBoundary?.({ progress: getProgress(offset + charIndex + charLength, speechText.length) });
     }
 
     utterance.onstart = startEventHandler;
@@ -269,11 +427,21 @@ export function useSpeechInternal({
     utterance.onboundary = boundaryEventHandler;
 
     if (!preserveUtteranceQueue) clearQueue();
-    addToQueue({ text: speechText, utterance, setSpeechStatus }, onQueueChange);
+    addToQueue({ text: speechText, utterance, setSpeechStatus, sessionId: session.id }, callbacksRef.current.onQueueChange);
+    if (!synth.speaking) {
+      setSpeechStatus("started");
+      return speakFromQueue();
+    }
+    // Preserved queues must wait their turn: do not interrupt the instance that
+    // is already speaking. `startEventHandler` promotes this entry to "started"
+    // once `speakFromQueue` actually reaches it.
+    if (preserveUtteranceQueue && !wasStarted) {
+      setSpeechStatus("queued");
+      return;
+    }
     setSpeechStatus("started");
-    if (!synth.speaking) return speakFromQueue();
-    if (preserveUtteranceQueue && speechStatus !== "started") return setSpeechStatus("queued");
     cancel();
+    speakFromQueue();
   }
 
   function pause() {
@@ -285,17 +453,25 @@ export function useSpeechInternal({
     }
   }
 
-  function stop({ status = speechStatusRef.current, stopReason }: { status?: SpeechStatus; stopReason?: State["stopReason"] } = {}) {
+  function stop({ status = speechStatusRef.current, stopReason = "manual" }: { status?: SpeechStatus; stopReason?: State["stopReason"] } = {}) {
+    // Cancel a start still waiting on the text debounce, even when nothing is
+    // speaking yet ("stopped" would otherwise return early below).
+    pendingStartRef.current = false;
     if (status === "stopped") return;
+    const session = sessionRef.current;
     if (status === "queued") {
-      removeFromQueue(utteranceRef.current!, onQueueChange);
-      return setSpeechStatus("stopped");
+      if (session) teardownSession(session, { cancelSpeech: false });
+      else setSpeechStatus("stopped");
+      return;
     }
-    if (directiveRef.current.delay || directiveRef.current.event === "pause") {
-      reset();
-      speakFromQueue();
+    reset();
+    if (session) {
+      teardownSession(session, { cancelSpeech: true, stopReason, speakNext: true, notifyStop: true });
+      return;
     }
     cancel(stopReason);
+    setSpeakingWord(null);
+    setSpeechStatus("stopped");
   }
 
   function highlightedText(node: ReactNode, index = ""): ReactNode {
@@ -315,14 +491,29 @@ export function useSpeechInternal({
     if (isValidElement<NodeProps>(node)) return cloneElement(node, { children: highlightedText(node.props.children, index) });
   }
 
-  useEffect(() => {
-    return () => stop({ status: speechStatusRef.current });
-  }, [enableDirectives, key]);
+  // Replace the current session whenever the spoken content changes (the text
+  // key or `enableDirectives`). Tearing the old session down first guarantees
+  // that stale chunk timers, listeners and utterance callbacks cannot outlive
+  // it. The same cleanup covers unmount.
+  useLayoutEffect(() => {
+    return () => {
+      const session = sessionRef.current;
+      if (!session) return;
+      const status = speechStatusRef.current;
+      const isSpeaking = status === "started" || status === "paused";
+      teardownSession(session, { cancelSpeech: isSpeaking, speakNext: isSpeaking, notifyStop: isSpeaking });
+    };
+  }, [stableKey, enableDirectives]);
 
   useLayoutEffect(() => {
     highlightRef.current = false;
-    if (autoPlay) start();
-  }, [autoPlay, enableDirectives, normalizedText]);
+    // A `start()` that arrived while the text was still debouncing resumes here,
+    // now that the chunks reflect the current text.
+    if (autoPlay || pendingStartRef.current) {
+      pendingStartRef.current = false;
+      start();
+    }
+  }, [autoPlay, stableKey, enableDirectives]);
 
   useLayoutEffect(() => {
     if (!highlightText || !highlightRef.current || showOnlyHighlightedText || !speakingWord) return;
@@ -330,8 +521,9 @@ export function useSpeechInternal({
     const parts = speakingWord.index.split("-");
     const parentIndex = parts.slice(0, -1).join("-");
 
-    const elements = Array.from(document.getElementsByClassName(`${uniqueId}${parentIndex}`));
-    const elementSnapshots = elements.map((element) => {
+    const elements = Array.from(document.getElementsByClassName(`${uniqueId}${parentIndex}`)) as HTMLElement[];
+    const snapshots: HighlightSnapshot[] = [];
+    elements.forEach((element) => {
       const originalTextContent = element.textContent;
       const [before, highlighted, after] = splitNode(highlightMode, element.textContent, speakingWord);
 
@@ -345,24 +537,39 @@ export function useSpeechInternal({
 
       element.textContent = "";
       element.appendChild(container);
-
-      return [element, originalTextContent] as const;
+      snapshots.push({ element, originalTextContent, container });
     });
+    highlightSnapshotsRef.current.push(...snapshots);
 
     return () => {
-      if (highlightRef.current) elementSnapshots.forEach(([element, originalTextContent]) => (element.textContent = originalTextContent));
+      highlightSnapshotsRef.current = highlightSnapshotsRef.current.filter((snapshot) => !snapshots.includes(snapshot));
+      snapshots.forEach(({ element, originalTextContent, container }) => {
+        if (element.isConnected && element.contains(container)) element.textContent = originalTextContent;
+      });
     };
   }, [speakingWord, highlightText, showOnlyHighlightedText, highlightMode]);
 
   useEffect(() => {
     if (speechStatusRef.current !== "started") return;
+    const session = sessionRef.current;
     const timeout = setTimeout(() => {
-      updateProps({ pitch, rate, volume, lang, voiceURI });
+      if (pendingParamSwitchRef.current === timeout) pendingParamSwitchRef.current = null;
+      // The session may have been replaced by a text change while this was pending.
+      if (!session || sessionRef.current !== session || !session.active) return;
+      if (speechStatusRef.current !== "started") return;
+      updateProps(session.utterance, paramsRef.current);
       if (directiveRef.current.delay) return;
-      stop({ stopReason: "change" });
-      emit(onQueueChange);
+      // Only the queue head is actually being spoken. A queued instance must
+      // never cancel another instance's speech just because its props changed.
+      if (!isQueueHead(session.utterance)) return;
+      cancel("change");
+      emit(callbacksRef.current.onQueueChange);
     }, 500);
-    return () => clearTimeout(timeout);
+    pendingParamSwitchRef.current = timeout;
+    return () => {
+      clearTimeout(timeout);
+      if (pendingParamSwitchRef.current === timeout) pendingParamSwitchRef.current = null;
+    };
   }, [pitch, rate, volume, lang, stringifiedVoices]);
 
   return {
@@ -379,11 +586,14 @@ export function useSpeechInternal({
 }
 
 function useSpeechSynthesisUtterance() {
-  const utteranceRef = useRef<SpeechSynthesisUtterance>(typeof window === "undefined" || !window.speechSynthesis ? null : new SpeechSynthesisUtterance());
   const { voices } = useVoices();
 
-  function updateProps({ pitch, rate, volume, lang, voiceURI }: SpeechSynthesisUtteranceProps) {
-    const utterance = utteranceRef.current;
+  function createUtterance(): SpeechSynthesisUtterance | null {
+    if (typeof window === "undefined" || !window.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return null;
+    return new SpeechSynthesisUtterance();
+  }
+
+  function updateProps(utterance: SpeechSynthesisUtterance | null, { pitch, rate, volume, lang, voiceURI }: SpeechSynthesisUtteranceProps) {
     if (!utterance) return;
     if (pitch !== undefined) utterance.pitch = pitch;
     if (rate !== undefined) utterance.rate = rate;
@@ -406,7 +616,7 @@ function useSpeechSynthesisUtterance() {
     }
   }
 
-  return { utteranceRef, updateProps };
+  return { createUtterance, updateProps };
 }
 
 function useStateRef<T>(init: T) {
@@ -414,11 +624,9 @@ function useStateRef<T>(init: T) {
   const ref = useRef(init);
 
   function setStateRef(value: T) {
-    setState((prev) => {
-      const next = isSetStateFunction(value) ? value(prev) : value;
-      ref.current = next;
-      return next;
-    });
+    const next = isSetStateFunction(value) ? value(ref.current) : value;
+    ref.current = next;
+    setState(next);
   }
 
   return [state, ref, setStateRef] as const;
