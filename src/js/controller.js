@@ -2123,11 +2123,18 @@ class Controller {
     }
 
     /**
-     * Rebuild the simulation after the earlier jobs changed
+     * Rebuild the simulation's starting stock after the earlier jobs changed. The simulator
+     * keeps its grid, so it re-carves from the new starting stock back up to the animation
+     * position and only the changed parts of the stock are re-uploaded.
      */
     priorJobsChanged() {
-        this.stockSim = null;
-        this.renderer3d.setStockSimulator(null);
+        if (this.stockSim) {
+            this.stockSim.setPriorJobs((this.priorJobs || []).filter(job => job.status === 'loaded'));
+            this.stockInfoText = null;
+            this.stockFluteWarnings = this.findFluteLengthProblems();
+        } else {
+            this.renderer3d.setStockSimulator(null);
+        }
         this.updateStockDisplay();
     }
 

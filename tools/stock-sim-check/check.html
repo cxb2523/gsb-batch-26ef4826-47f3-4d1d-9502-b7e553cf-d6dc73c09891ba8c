@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stock simulation check</title>
+<style>
+    body { font: 13px/1.5 system-ui, sans-serif; margin: 20px; color: #222; }
+    h1 { font-size: 18px; }
+    #output { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; }
+    .pass { color: #157f3b; }
+    .fail { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Stock simulation consistency check</h1>
+<p>Loads the viewer's own scripts and the sample G-code, then checks that the carved stock
+depends only on the hidden tools, earlier jobs and the animation position. It also checks
+that rebuilding the simulator releases its GPU buffers. Open this file directly in a
+browser, or serve the repository (for example <code>python -m http.server</code>) and open
+<code>tools/stock-sim-check/check.html</code> if the browser blocks the G-code fetch from a
+<code>file://</code> page.</p>
+<div id="output">Running…</div>
+
+<script src="../../src/js/gcode-expander.js"></script>
+<script src="../../src/js/parser.js"></script>
+<script src="../../src/js/stock-sim.js"></script>
+<script type="module">
+import { runAllBrowser } from './browser.js';
+
+const output = document.getElementById('output');
+const lines = [];
+const log = (text) => { lines.push(text); output.textContent = lines.join('\n'); };
+
+let pass = false;
+try {
+    const gcode = new URL('../../examples/stock_sim_demo.nc', location.href);
+    ({ pass } = await runAllBrowser(gcode, log));
+} catch (error) {
+    log(`Error: ${error && error.stack || error}`);
+}
+output.className = pass ? 'pass' : 'fail';
+log(pass ? '\nAll checks passed.' : '\nSome checks FAILED.');
+</script>
+</body>
+</html>

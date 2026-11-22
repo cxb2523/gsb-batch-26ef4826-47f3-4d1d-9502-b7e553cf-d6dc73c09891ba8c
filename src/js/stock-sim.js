@@ -115,9 +115,14 @@ class StockSimulator {
 
         this.base = null; // heights after earlier jobs, the starting point for this one
         this.hiddenTools = new Set(); // segment.tool values (the tool panel's) not carved
+        this.priorJobs = []; // jobs carved into the base, as set by setPriorJobs
         this.segments = [];
         this.snapshots = new Map(); // segment index -> heights after carving [0, index)
         this.gouges = new Set(); // indices of rapid moves that cut into the stock
+        // Where the renderer last asked the stock to be: changing the baseline carves
+        // forward to here again, so the stock never shows a position it isn't at
+        this.lastTarget = 0;
+        this.lastProgress = 0;
         this.reset();
     }
 
@@ -136,7 +141,28 @@ class StockSimulator {
      * @param {Array<{segments: Array, tools: Map}>} jobs
      */
     setPriorJobs(jobs) {
-        this.base = null;
+        jobs = jobs || [];
+        if (this.samePriorJobs(jobs)) return;
+        this.priorJobs = jobs;
+        // What the renderer last showed (before the starting stock is rebuilt)
+        const before = this.heights.slice();
+        const pending = this.takeDirtyBox();
+        this.base = this.buildBase(jobs);
+        this.restoreAndCarve(before, pending);
+    }
+
+    samePriorJobs(jobs) {
+        if (jobs.length !== this.priorJobs.length) return false;
+        return jobs.every((job, i) => {
+            const old = this.priorJobs[i];
+            return old.segments === job.segments && old.tools === job.tools;
+        });
+    }
+
+    /**
+     * Carve the starting stock (the prior jobs) and return it, or null for uncut stock
+     */
+    buildBase(jobs) {
         this.heights.fill(this.stock.zmax);
         for (const job of jobs) {
             const tools = StockSimulator.compileTools(job.tools);
@@ -144,10 +170,7 @@ class StockSimulator {
                 this.carveMove(job.segments, i, tools, null);
             }
         }
-        if (jobs.length > 0) this.base = this.heights.slice();
-        this.snapshots.clear();
-        this.gouges.clear();
-        this.reset();
+        return jobs.length > 0 ? this.heights.slice() : null;
     }
 
     /**
@@ -158,9 +181,7 @@ class StockSimulator {
         const next = new Set(hidden);
         if (next.size === this.hiddenTools.size && [...next].every(t => this.hiddenTools.has(t))) return;
         this.hiddenTools = next;
-        this.snapshots.clear();
-        this.gouges.clear();
-        this.reset();
+        this.restoreAndCarve(this.heights.slice(), this.takeDirtyBox());
     }
 
     setSegments(segments) {
@@ -171,6 +192,11 @@ class StockSimulator {
         this.snapshotInterval = this.useSnapshots ? Math.max(256, Math.ceil(segments.length / count)) : Infinity;
         this.snapshots.clear();
         this.gouges.clear();
+        // The renderer asks for a position again; it can't be past the new moves
+        if (this.lastTarget > segments.length) {
+            this.lastTarget = segments.length;
+            this.lastProgress = 0;
+        }
         this.reset();
     }
 
@@ -180,6 +206,30 @@ class StockSimulator {
         else this.heights.fill(this.stock.zmax);
         this.carvedIndex = 0;
         this.markAllDirty();
+    }
+
+    /**
+     * After the baseline changed (hidden tools or earlier jobs): throw away the snapshots
+     * and any move carved part way, restore the starting stock and carve forward again to
+     * where the animation is, so the stock never shows a position it isn't at. Only the
+     * vertices whose heights actually changed are marked dirty for the renderer.
+     * @param {Float32Array} before - heights as last shown
+     * @param {Object} pending - dirty region not yet uploaded at that point
+     */
+    restoreAndCarve(before, pending) {
+        this.partial = null;
+        this.snapshots.clear();
+        this.gouges.clear();
+        if (this.base) this.heights.set(this.base);
+        else this.heights.fill(this.stock.zmax);
+        this.carvedIndex = 0;
+        this.clearDirty();
+        this.advanceTo(Math.min(this.lastTarget, this.segments.length), Infinity, this.lastProgress);
+        // Only the vertices that differ from what the renderer has need uploading (the
+        // re-carving itself doesn't), plus anything the renderer hadn't uploaded yet
+        this.clearDirty();
+        this.markChanged(before);
+        this.markDirtyBox(pending);
     }
 
     // Changed area since the renderer last looked: vertex rows dirtyMin..dirtyMax and
@@ -198,17 +248,67 @@ class StockSimulator {
         this.dirtyMaxI = -Infinity;
     }
 
+    /**
+     * The dirty box, to be restored after some work that shouldn't be reported as carving
+     * (building the starting stock, for one) so whatever hadn't been uploaded still is.
+     */
+    takeDirtyBox() {
+        const box = { j0: this.dirtyMin, j1: this.dirtyMax, i0: this.dirtyMinI, i1: this.dirtyMaxI };
+        this.clearDirty();
+        return box;
+    }
+
+    markDirtyBox(box) {
+        if (!box || box.j0 > box.j1) return;
+        if (box.j0 < this.dirtyMin) this.dirtyMin = box.j0;
+        if (box.j1 > this.dirtyMax) this.dirtyMax = box.j1;
+        if (box.i0 < this.dirtyMinI) this.dirtyMinI = box.i0;
+        if (box.i1 > this.dirtyMaxI) this.dirtyMaxI = box.i1;
+    }
+
+    /**
+     * Mark the rows and columns of vertices whose height differs from `before`, so the
+     * renderer re-uploads only what actually changed (not the whole grid).
+     */
+    markChanged(before) {
+        const h = this.heights, vx = this.vx, vy = this.vy;
+        for (let j = 0; j < vy; j++) {
+            const row = j * vx;
+            let changed = false;
+            for (let i = 0; i < vx; i++) {
+                if (h[row + i] !== before[row + i]) {
+                    changed = true;
+                    if (i < this.dirtyMinI) this.dirtyMinI = i;
+                    if (i > this.dirtyMaxI) this.dirtyMaxI = i;
+                }
+            }
+            if (changed) {
+                if (j < this.dirtyMin) this.dirtyMin = j;
+                if (j > this.dirtyMax) this.dirtyMax = j;
+            }
+        }
+    }
+
     get isDirty() {
         return this.dirtyMin <= this.dirtyMax;
     }
 
     /**
-     * Carve segments until segments [0, target) are cut, or the time budget runs out.
-     * Going backward restores the nearest snapshot and carves forward from it.
+     * Carve segments until moves [0, target) are cut, or the time budget runs out. `progress`
+     * (0-1) is how far through move `target` the animation is; a progress of 1 is the move
+     * finished, which is where the next one starts, so it's carved whole (counting as move
+     * `target` done). Going backward restores the nearest snapshot and carves forward.
      * @returns {boolean} true when the stock is up to date
      */
     advanceTo(target, budgetMs = Infinity, progress = 0) {
         target = Math.max(0, Math.min(target, this.segments.length));
+        // Progress 1 is the end of the move, which is where the next one starts: carve it
+        // whole, so a part-carved move never lingers at "done" (the state is the same
+        // however the animation got there, and rebuilding the stock reproduces it)
+        if (progress >= 1) {
+            target = Math.min(target + 1, this.segments.length);
+            progress = 0;
+        }
         // A move carved part way (see carvePartial) that the position is now before
         const p = this.partial;
         if (p && (target < p.index || (target === p.index && progress < p.progress))) {
@@ -232,13 +332,18 @@ class StockSimulator {
         }
         const done = this.carvedIndex >= target;
         if (done && progress > 0 && progress < 1 && target < this.segments.length) this.carvePartial(target, progress);
+        // The position asked for (even if the budget ran out getting there), for rebuilding
+        // the stock after the baseline changes
+        this.lastTarget = target;
+        this.lastProgress = progress;
         return done;
     }
 
     /**
      * Carve move `index` from its start to `progress` (0-1) of the way, so the stock keeps
      * up with the tool during long moves. Each call only carves on from where the last one
-     * got to, as the tool's swept area along a line is the union of its pieces.
+     * got to; the pieces are laid out along the whole move, so a move carved in steps ends
+     * up exactly as one carved in a single go.
      */
     carvePartial(index, progress) {
         const seg = this.segments[index];
@@ -246,15 +351,10 @@ class StockSimulator {
         if (this.hiddenTools.size > 0 && this.hiddenTools.has(seg.tool || 0)) return;
         const p = this.partial && this.partial.index === index ? this.partial : null;
         if (p && progress <= p.progress) return;
-        const at = (t) => ({
-            x: seg.start.x + (seg.end.x - seg.start.x) * t,
-            y: seg.start.y + (seg.end.y - seg.start.y) * t,
-            z: seg.start.z + (seg.end.z - seg.start.z) * t
-        });
-        const piece = { ...seg, start: p ? at(p.progress) : seg.start, end: at(progress) };
-        // Only the first piece follows a probe (see carveMove)
-        const prev = p ? piece : this.segments[index - 1];
-        this.carveOne(piece, prev, this.tools, this.defaultTool);
+        // Always the move before: a probe's adjust (see carveMove) applies to every piece
+        // alike, so the whole move is carved from the same line however it's split
+        const prev = this.segments[index - 1];
+        this.carveOne(seg, prev, this.tools, this.defaultTool, p ? p.progress : 0, progress);
         this.partial = { index, progress };
     }
 
@@ -290,10 +390,12 @@ class StockSimulator {
     }
 
     /**
-     * Carve one move, given the move before it
+     * Carve one move, given the move before it. `from`..`to` (0-1) is how much of the
+     * move to carve, so one carved part way and later finished is carved exactly as one
+     * carved in a single go (the pieces are laid out along the whole move either way).
      * @returns {boolean} true if any material was removed
      */
-    carveOne(seg, prev, tools, fallbackTool) {
+    carveOne(seg, prev, tools, fallbackTool, from = 0, to = 1) {
         // Probe moves stop on contact, so they never cut
         if (seg.type === 'probe') return false;
         const tool = tools.get(seg.toolNumber) || fallbackTool;
@@ -306,30 +408,48 @@ class StockSimulator {
         if (prev && prev.type === 'probe' && s.z < e.z) s = { x: s.x, y: s.y, z: e.z };
         if (Math.min(s.z, e.z) >= this.stock.zmax) return false; // entirely above the stock
 
-        return this.sweep(s.x, s.y, s.z, e.x, e.y, e.z, tool);
+        return this.sweep(s.x, s.y, s.z, e.x, e.y, e.z, tool, from, to);
     }
 
     /**
-     * Lower the heightmap to the tool's swept volume along a straight move.
-     * Level moves are exact. Moves that change Z are cut in pieces no longer than a
-     * cell, each at its own height, so the error is at most one cell's worth of slope.
+     * Lower the heightmap to the tool's swept volume along a straight move, from `from`
+     * to `to` (0-1) of the way. Level moves are exact. Moves that change Z are cut in
+     * pieces no longer than a cell, each at its own height, so the error is at most one
+     * cell's worth of slope. Only whole pieces are cut, from the same grid a full carve
+     * uses, so a move carved in steps then finished ends up exactly as one carved in a
+     * single go: heights only ever go down, so the union of the pieces is the same.
      * @returns {boolean} true if any material was removed
      */
-    sweep(x0, y0, z0, x1, y1, z1, tool) {
+    sweep(x0, y0, z0, x1, y1, z1, tool, from = 0, to = 1) {
+        if (!(to > from)) return false;
         const lx = x1 - x0, ly = y1 - y0, lz = z1 - z0;
         const lengthXY = Math.hypot(lx, ly);
         const step = Math.min(this.dx, this.dy);
-        const pieces = Math.abs(lz) > 1e-9 && lengthXY > step
-            ? Math.min(Math.ceil(lengthXY / step), 100000)
-            : 1;
-
+        const at = (t) => [x0 + lx * t, y0 + ly * t, z0 + lz * t];
         let cut = false;
-        for (let p = 0; p < pieces; p++) {
-            const t0 = p / pieces, t1 = (p + 1) / pieces;
-            if (this.sweepPiece(x0 + lx * t0, y0 + ly * t0, z0 + lz * t0,
-                                x0 + lx * t1, y0 + ly * t1, z0 + lz * t1, tool)) {
-                cut = true;
+
+        if (Math.abs(lz) > 1e-9 && lengthXY > 0) {
+            // A move that changes Z while it goes: pieces no longer than a cell, each at
+            // its own height. The grid is fixed by the whole move, and only whole pieces
+            // are cut, so carving it in steps cuts exactly the same pieces as carving it
+            // once (a piece's result doesn't depend on when it's carved).
+            const pieces = Math.min(Math.max(1, Math.ceil(lengthXY / step)), 100000);
+            if (pieces === 1) {
+                // Shorter than a cell: carving it all on the first call is within a cell
+                const [ax, ay, az] = at(0), [bx, by, bz] = at(1);
+                return this.sweepPiece(ax, ay, az, bx, by, bz, tool);
             }
+            const p0 = Math.max(0, Math.floor(from * pieces));
+            const p1 = Math.min(pieces, Math.ceil(to * pieces));
+            for (let p = p0; p < p1; p++) {
+                const [ax, ay, az] = at(p / pieces), [bx, by, bz] = at((p + 1) / pieces);
+                if (this.sweepPiece(ax, ay, az, bx, by, bz, tool)) cut = true;
+            }
+        } else {
+            // A level move is exact as one piece; a straight plunge cuts the same at every
+            // depth (the lowest point cuts most), so the range's lowest point is its cut
+            const [ax, ay, az] = at(from), [bx, by, bz] = at(to);
+            if (this.sweepPiece(ax, ay, az, bx, by, bz, tool)) cut = true;
         }
         return cut;
     }
@@ -552,20 +672,12 @@ class StockMeshRenderer {
      * Build the buffers for a simulator (or release them with null). The grid is drawn in
      * tiles of up to TILE x TILE cells, so 16-bit indices do and grids of millions of cells
      * fit: each tile only stores its heights and normals (8 bytes a vertex).
+     * A new simulator has a new stock, grid and tools, so the old tiles and solids go.
      */
     setSimulator(sim) {
         const gl = this.gl;
-        // Tool meshes are keyed by the simulator's tools, so they go with it
-        for (const mesh of (this.toolMeshes || new Map()).values()) {
-            gl.deleteBuffer(mesh.position);
-            gl.deleteBuffer(mesh.normal);
-        }
-        this.toolMeshes = new Map();
-        for (const tile of this.tiles) {
-            gl.deleteBuffer(tile.z);
-            gl.deleteBuffer(tile.normal);
-        }
-        this.tiles = [];
+        this.releaseTiles();
+        this.releaseSolids();
         this.sim = sim;
         if (!sim) {
             this.rawNormals = this.normals = null;
@@ -619,6 +731,35 @@ class StockMeshRenderer {
         gl.bufferData(gl.ARRAY_BUFFER, skirtNormal, gl.STATIC_DRAW);
         this.skirtZ = new Float32Array(this.edge.length * 6);
         this.updateSkirt();
+    }
+
+    /**
+     * Delete the tiles' height and normal buffers (the tile shapes are shared and stay)
+     */
+    releaseTiles() {
+        for (const tile of this.tiles) {
+            this.gl.deleteBuffer(tile.z);
+            this.gl.deleteBuffer(tile.normal);
+        }
+        this.tiles = [];
+        this.staging = null;
+    }
+
+    /**
+     * Delete the tool and box meshes. They're drawn from the simulator's tools and the
+     * stock's coordinates, so they go when either changes.
+     */
+    releaseSolids() {
+        for (const mesh of (this.toolMeshes || new Map()).values()) {
+            this.gl.deleteBuffer(mesh.position);
+            this.gl.deleteBuffer(mesh.normal);
+        }
+        this.toolMeshes = null;
+        for (const mesh of (this.boxMeshes || new Map()).values()) {
+            this.gl.deleteBuffer(mesh.position);
+            this.gl.deleteBuffer(mesh.normal);
+        }
+        this.boxMeshes = null;
     }
 
     /**
@@ -1136,15 +1277,11 @@ class StockMeshRenderer {
 
     destroy() {
         const gl = this.gl;
-        this.setSimulator(null);
+        this.setSimulator(null); // releases the tiles and the tool and box meshes
         for (const buffer of Object.values(this.buffers)) gl.deleteBuffer(buffer);
         for (const shape of this.tileShapes.values()) {
             gl.deleteBuffer(shape.ij);
             gl.deleteBuffer(shape.index);
-        }
-        for (const mesh of [...(this.toolMeshes || new Map()).values(), ...(this.boxMeshes || new Map()).values()]) {
-            gl.deleteBuffer(mesh.position);
-            gl.deleteBuffer(mesh.normal);
         }
         gl.deleteProgram(this.program);
         if (this.toolProgram) gl.deleteProgram(this.toolProgram);
@@ -1198,5 +1335,8 @@ function guessStockToolFromName(name, units = 'mm') {
 
 // Node (tests) - in the browser these are plain globals
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { StockSimulator, StockProbe, compileStockTool, guessStockToolFromName, STOCK_TOOL_SHAPES };
+    module.exports = {
+        StockSimulator, StockProbe, StockMeshRenderer,
+        compileStockTool, guessStockToolFromName, STOCK_TOOL_SHAPES
+    };
 }

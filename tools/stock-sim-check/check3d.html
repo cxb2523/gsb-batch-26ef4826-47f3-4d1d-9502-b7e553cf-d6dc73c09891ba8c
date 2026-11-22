@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stock simulation 3D check</title>
+<style>
+    body { font: 13px/1.5 system-ui, sans-serif; margin: 20px; color: #222; }
+    h1 { font-size: 18px; }
+    #output { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; }
+    .pass { color: #157f3b; }
+    .fail { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Stock simulation 3D check</h1>
+<p>Draws a carved stock with the viewer's real <code>StockMeshRenderer</code> in WebGL, then
+changes the hidden tools mid-animation. The pixels must match a simulator built with those
+settings from the start, and only the tiles the change touches may be re-uploaded. Open
+this file directly in a browser, or serve the repository and open
+<code>tools/stock-sim-check/check3d.html</code>.</p>
+<canvas id="canvas" width="600" height="400"></canvas>
+<div id="output">Running…</div>
+
+<script src="../../src/js/camera.js"></script>
+<script src="../../src/js/stock-sim.js"></script>
+<script type="module">
+const output = document.getElementById('output');
+const log = (text) => { output.textContent = output.textContent === 'Running…' ? text : output.textContent + '\n' + text; };
+output.textContent = 'Running…';
+
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: false, preserveDrawingBuffer: true });
+let pass = false;
+try {
+    if (!gl) throw new Error('WebGL is not available in this browser');
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    const stock = { xmin: 0, xmax: 40, ymin: 0, ymax: 30, zmin: -6, zmax: 0 };
+    const tools = new Map([
+        [1, { shape: 'flat', diameter: 6, flutes: 2 }],
+        [2, { shape: 'ball', diameter: 8, flutes: 2 }]
+    ]);
+    // Tool 1 clears a band, then tool 2 a second one; the switch happens after both start
+    const segments = [];
+    for (const [toolNumber, y] of [[1, 10], [2, 22]]) {
+        segments.push({ type: 'rapid', tool: toolNumber, toolNumber, start: { x: 5, y, z: 3 }, end: { x: 5, y, z: 0 } });
+        for (let i = 0; i <= 6; i++) {
+            segments.push({
+                type: 'cut', tool: toolNumber, toolNumber,
+                start: { x: 5 + i * 5, y, z: -3 }, end: { x: 10 + i * 5, y, z: -3 }
+            });
+        }
+    }
+
+    const camera = new Camera();
+    camera.fitToBounds({ minX: 0, maxX: 40, minY: 0, maxY: 30, minZ: -6, maxZ: 0 }, 0.1,
+        canvas.width, canvas.height);
+    const mvp = camera.getMVPMatrix(canvas.width / canvas.height);
+    const mid = Math.floor(segments.length * 0.6), midProgress = 0.5;
+
+    const makeSim = (hidden) => {
+        const sim = new StockSimulator(stock, tools, { maxCells: 40000 });
+        sim.setHiddenTools(hidden);
+        sim.setSegments(segments);
+        sim.advanceTo(mid, Infinity, midProgress);
+        return sim;
+    };
+    const pixels = () => {
+        const px = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+        gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        return px;
+    };
+    const draw = (sim, drawOnce) => {
+        gl.clearColor(0.1, 0.1, 0.1, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        sim.stock && drawOnce(sim);
+        return pixels();
+    };
+
+    // Live: carve, then hide tool 2 mid-animation and draw again
+    const live = makeSim([]);
+    const liveMesh = new StockMeshRenderer(gl);
+    liveMesh.setSimulator(live);
+    liveMesh.update();
+    live.setHiddenTools([2]);
+    liveMesh.update();
+    const livePixels = draw(live, (sim) => liveMesh.draw(mvp, camera, 'light'));
+
+    // Reference: the same settings from the start
+    const reference = makeSim([2]);
+    const refMesh = new StockMeshRenderer(gl);
+    refMesh.setSimulator(reference);
+    refMesh.update();
+    const refPixels = draw(reference, (sim) => refMesh.draw(mvp, camera, 'light'));
+
+    let differing = 0;
+    for (let i = 0; i < livePixels.length; i++) if (livePixels[i] !== refPixels[i]) differing++;
+    log(`pixels after switching match the stock carved with those settings: ` +
+        `${differing === 0 ? 'IDENTICAL' : differing + ' bytes differ'}`);
+    log(`carving progress: ${live.carvedIndex} (the reference is at ${reference.carvedIndex})`);
+
+    // Only the tiles around the changed rows are re-uploaded
+    const counted = makeSim([]);
+    const countedMesh = new StockMeshRenderer(gl);
+    countedMesh.setSimulator(counted);
+    countedMesh.update();
+    let uploads = 0;
+    const uploadTile = countedMesh.uploadTile.bind(countedMesh);
+    countedMesh.uploadTile = (tile, create) => { uploads++; return uploadTile(tile, create); };
+    counted.setHiddenTools([2]);
+    countedMesh.update();
+    const tileCount = countedMesh.tiles.length;
+    log(`tiles re-uploaded after the switch: ${uploads} of ${tileCount}`);
+
+    pass = differing === 0 && live.carvedIndex === reference.carvedIndex && uploads < tileCount;
+    liveMesh.destroy();
+    refMesh.destroy();
+    countedMesh.destroy();
+} catch (error) {
+    log(`Error: ${error && error.stack || error}`);
+}
+output.className = pass ? 'pass' : 'fail';
+log(pass ? 'PASS: the 3D view shows the same stock as carving with the new settings from the start.'
+    : 'FAIL: the 3D view and the carving settings disagree.');
+</script>
+</body>
+</html>

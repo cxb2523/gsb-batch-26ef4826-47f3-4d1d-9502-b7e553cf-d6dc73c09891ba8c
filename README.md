@@ -185,6 +185,8 @@ For files without these comments, the panel estimates the stock from the toolpat
 
 With **Current layer only** on (under "Show toolpaths on the stock"), the animation only draws the toolpaths of the layer being cut, from where the tool started that Z level. Earlier layers are already visible in the stock.
 
+Hiding a tool (in **Toolpaths**) or adding/removing **Earlier jobs** changes what the stock is cut from. The simulation then re-carves from the stock's starting point up to the animation position, so the stock always shows that position with the new settings, and only the part of the stock that changed is re-uploaded. Showing the tool again gives the same stock as never hiding it.
+
 While the stock is shown, **Fit** and double-click frame the whole stock. The 3D grid stands for the machine bed. It's sized from the machine's max travel (read from the connected machine in the FluidNC extension, or from a loaded `config.yaml`), or else made a little larger than the stock. A size you type in yourself is kept.
 
 Rapid (G0) moves that cut into the stock, and cuts deeper than a tool's flute length, are listed under **Warnings**. A machine with a vertical tool can't cut undercuts, so the top surface describes the part fully. Accuracy is limited by the grid: the cell size is shown in the panel.
@@ -239,7 +241,7 @@ cnc-gcode-tools/
 │   ├── viewer-demo/              # Demo job from the FreeCAD FluidNC post: 7 bit types, probing, M0s; all-in-one and one file per bit (PriorJob)
 │   └── *-font.json               # Sample Font Creator fonts
 ├── docs/                         # Screenshots (README, landing page) and the stock simulation metadata format
-├── tools/                        # set-version.ps1, record-video/
+├── tools/                        # set-version.ps1, record-video/, stock-sim-check/ (consistency checks)
 ├── VERSION                       # The version of everything here
 ├── dist/                         # Build output (generated)
 ├── build.ps1                     # Build script
@@ -271,6 +273,13 @@ python -m http.server 8000
 3. JavaScript is in `src/js/` - organized by functionality
 4. Test in browser (refresh to see changes)
 5. Check browser console for errors
+
+### Stock Simulation Checks
+`tools/stock-sim-check/` checks that the carved stock stays consistent when the hidden tools or the earlier jobs change: the same settings and animation position always give the same heightmap, the hidden tool's cuts don't stay on the stock, and only the changed part of the stock is re-uploaded. It runs the viewer's own parser and stock simulator, in Node or in a browser:
+```bash
+node tools/stock-sim-check/check.mjs        # the sample file and the viewer demo
+```
+Open `tools/stock-sim-check/check.html` and `check3d.html` from a local server for the browser versions (the second draws the stock in WebGL and compares pixels). See `tools/stock-sim-check/README.md`.
 
 ### Building for Distribution
 ```powershell

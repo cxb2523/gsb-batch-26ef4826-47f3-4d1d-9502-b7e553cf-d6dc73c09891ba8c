@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Viewer: hiding a tool, or adding or removing an earlier job, no longer leaves the stock out of step with the animation: the simulation re-carves from its starting stock up to the animation position instead of carrying on from the old carved index. A hidden tool's cuts are gone from the stock, showing it again gives the same stock as never hiding it, and only the rows and columns that changed are re-uploaded to the 3D view. A move that was part carved while the settings changed comes out exactly as one carved in a single go.
+- Viewer: rebuilding the stock simulation frees the old tiles' buffers and the tool and box meshes instead of leaving them for the browser to reclaim.
+
 ## 0.6.2
 
 - Viewer: G20/G21 carry the current position, work offsets and feed rate over into the new units, and take effect before the rest of their line, as on a controller. A move after a unit switch with no Z word no longer reads the old Z in the wrong units, and `G20 G1 X1 F10` reads F10 as inches.
