@@ -173,8 +173,10 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
                   </svg>
                   <div className="text-sm text-[#8b949e]">
                     <p>
-                      <strong className="text-[#c9d1d9]">Note:</strong> Changing modes will reset the
-                      current decoding session. Make sure to save your image before switching.
+                      <strong className="text-[#c9d1d9]">Note:</strong> Changing modes resets the
+                      current decoding session. If you are recording, decoding restarts from line 0
+                      in the new mode without interrupting microphone capture. Make sure to save your
+                      image before switching.
                     </p>
                   </div>
                 </div>

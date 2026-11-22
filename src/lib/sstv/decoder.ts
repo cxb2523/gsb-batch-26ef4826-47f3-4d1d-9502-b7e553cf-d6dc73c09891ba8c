@@ -81,23 +81,34 @@ export class SSTVDecoder {
 
     // Create sync detector and mode-specific line decoder
     this.syncDetector = new SyncDetector(sampleRate);
-    if (modeName === 'ROBOT36') {
-      this.lineDecoder = new Robot36LineDecoder(sampleRate);
-    } else if (modeName === 'ROBOT72') {
-      this.lineDecoder = new Robot72LineDecoder(sampleRate);
-    } else if (modeName === 'SCOTTIE_S1') {
-      this.lineDecoder = new ScottieS1LineDecoder(sampleRate);
-    } else if (modeName === 'SCOTTIE_S2') {
-      this.lineDecoder = new ScottieS2LineDecoder(sampleRate);
-    } else if (modeName === 'PD120') {
-      this.lineDecoder = new PD120LineDecoder(sampleRate);
-    } else if (modeName === 'PD160') {
-      this.lineDecoder = new PD160LineDecoder(sampleRate);
-    } else if (modeName === 'PD180') {
-      this.lineDecoder = new PD180LineDecoder(sampleRate);
-    } else {
-      // Default to PD120 for unknown modes
-      this.lineDecoder = new PD120LineDecoder(sampleRate);
+    this.lineDecoder = this.createLineDecoder(modeName);
+  }
+
+  /**
+   * Create the line decoder matching a mode
+   */
+  private createLineDecoder(
+    modeName: keyof typeof SSTV_MODES
+  ): Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder {
+    const sampleRate = this.sampleRate;
+
+    switch (modeName) {
+      case 'ROBOT36':
+        return new Robot36LineDecoder(sampleRate);
+      case 'ROBOT72':
+        return new Robot72LineDecoder(sampleRate);
+      case 'SCOTTIE_S1':
+        return new ScottieS1LineDecoder(sampleRate);
+      case 'SCOTTIE_S2':
+        return new ScottieS2LineDecoder(sampleRate);
+      case 'PD160':
+        return new PD160LineDecoder(sampleRate);
+      case 'PD180':
+        return new PD180LineDecoder(sampleRate);
+      case 'PD120':
+      default:
+        // Default to PD120 for unknown modes
+        return new PD120LineDecoder(sampleRate);
     }
   }
 
@@ -282,6 +293,50 @@ export class SSTVDecoder {
   }
 
   /**
+   * Switch the decoder to a different SSTV mode.
+   *
+   * Everything that is mode-dependent is rebuilt from scratch: the image
+   * buffer, the line decoder, the sync detector and the frequency
+   * calibration. Audio that was captured but not yet decoded is discarded
+   * so the new mode never tries to interpret old-mode timing. Progress
+   * restarts at zero while the running/idle state is preserved.
+   */
+  setMode(modeName: keyof typeof SSTV_MODES): void {
+    if (this.modeName === modeName) {
+      return;
+    }
+
+    this.modeName = modeName;
+    this.mode = SSTV_MODES[modeName];
+
+    // Fresh image buffer matching the new mode's dimensions.
+    const imageData = new Uint8ClampedArray(this.mode.width * this.mode.height * 4);
+    for (let i = 0; i < imageData.length; i += 4) {
+      imageData[i + 3] = 255; // A
+    }
+    this.imageData = imageData;
+
+    // Brand new line decoder and sync detector: no filter state, sync
+    // position or frequency calibration from the old mode may survive.
+    this.lineDecoder = this.createLineDecoder(modeName);
+    this.syncDetector = new SyncDetector(this.sampleRate);
+
+    // Drop audio collected under the old mode, including already
+    // demodulated values, so no partial old-mode line can be emitted.
+    this.audioBuffer.fill(0);
+    this.demodulatedBuffer.fill(0);
+    this.bufferWritePos = 0;
+
+    this.currentLine = 0;
+    this.lastSyncPos = -1;
+    this.lastSyncWidth = null;
+    this.frequencyOffset = 0;
+    this.sampleCounter = 0;
+    this.lastLogTime = 0;
+    this.absoluteSamplePosition = 0;
+  }
+
+  /**
    * Reset decoder
    */
   reset(): void {
@@ -300,6 +355,7 @@ export class SSTVDecoder {
 
     // Clear audio buffer
     this.audioBuffer.fill(0);
+    this.demodulatedBuffer.fill(0);
 
     // Clear image data to black
     for (let i = 0; i < this.imageData.length; i += 4) {

@@ -29,10 +29,9 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
   } = useAudioProcessor(selectedMode);
 
   const handleModeChange = (newMode: SSTVMode) => {
-    // Stop recording if active
-    if (state.isRecording) {
-      stopRecording();
-    }
+    if (newMode === selectedMode) return;
+    // The audio processor rebuilds the live decoder in place when the mode
+    // prop changes, so recording can keep running across the switch.
     onModeChange(newMode);
   };
 
@@ -409,7 +408,9 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-      link.download = `sstv-decode-robot36-${timestamp}.png`;
+      // Use the dimensions of what is actually on the canvas so the saved
+      // resolution always matches the mode the image was decoded with.
+      link.download = `sstv-decode-${selectedMode.toLowerCase()}-${canvas.width}x${canvas.height}-${timestamp}.png`;
       link.href = url;
       link.click();
 
@@ -436,7 +437,6 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
       <SettingsPanel
         currentMode={selectedMode}
         onModeChange={handleModeChange}
-        disabled={state.isRecording}
       />
 
       {/* Controls */}
