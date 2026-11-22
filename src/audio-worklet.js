@@ -9,6 +9,11 @@
 // addModule, registerProcessor, AudioWorkletProcessor and its port, AudioWorkletNode with its port and parameters. What
 // it costs is the ScriptProcessorNode's latency (two blocks of BLOCK frames) and that a processor shares the game's
 // thread, which is where a single-threaded web export's audio is mixed anyway.
+//
+// Lifecycle follows the real graph: a fresh node is held by a silent gain chain so a node connected to nothing still
+// renders, but node.disconnect() suspends it (processor uncalled, chain released) until a connect() resumes it; a
+// context close, a process() returning false or a process() throwing ends the node for good -- the chain is torn down,
+// both message ports close and parameter scheduling refuses -- with processorerror dispatched at most once.
 
 import { readScript } from "./worker.js";
 import DOMException from "./dom-exception.js";
@@ -123,6 +128,8 @@ class WorkletParam {
     this.automationRate = descriptor.automationRate ?? "a-rate";
     this._value = initial ?? this.defaultValue;
     this._events = [];
+    // A node that has left the graph for good (process returned false/threw, or the context closed) schedules nothing.
+    this._stopped = false;
   }
 
   get value() {
@@ -130,32 +137,44 @@ class WorkletParam {
   }
 
   set value(v) {
+    if (this._stopped) throw new DOMException("the AudioWorkletNode is no longer processing", "InvalidStateError");
     this._events.length = 0;
     this._value = Number(v);
   }
 
-  setValueAtTime(value, time) {
+  _schedule(value, time) {
+    if (this._stopped) throw new DOMException("the AudioWorkletNode is no longer processing", "InvalidStateError");
     this._events.push({ time: Number(time), value: Number(value) });
     this._events.sort((x, y) => x.time - y.time);
     return this;
   }
 
+  setValueAtTime(value, time) {
+    return this._schedule(value, time);
+  }
+
   // Ramps arrive at their value at their end time: a k-rate approximation.
   linearRampToValueAtTime(value, time) {
-    return this.setValueAtTime(value, time);
+    return this._schedule(value, time);
   }
 
   exponentialRampToValueAtTime(value, time) {
-    return this.setValueAtTime(value, time);
+    return this._schedule(value, time);
   }
 
   setTargetAtTime(value, time) {
-    return this.setValueAtTime(value, time);
+    return this._schedule(value, time);
   }
 
   cancelScheduledValues(time) {
+    if (this._stopped) throw new DOMException("the AudioWorkletNode is no longer processing", "InvalidStateError");
     this._events = this._events.filter((event) => event.time < Number(time));
     return this;
+  }
+
+  _stop() {
+    this._stopped = true;
+    this._events.length = 0;
   }
 
   _at(time) {
@@ -180,6 +199,14 @@ class AudioWorklet {
   constructor(context) {
     this._context = context;
     this._processors = new Map();
+    // addModule is idempotent per URL: a module's script is evaluated once, the first time it is asked for.
+    this._modules = new Set();
+    this._closed = false;
+    // Every node this worklet has built, so a context close can stop them all; entries vanish with the node itself.
+    this._nodes = new Set();
+    if (typeof FinalizationRegistry === "function") {
+      this._finalizer = new FinalizationRegistry((record) => this._nodes.delete(record.node));
+    }
     const worklet = this;
     // AudioWorkletGlobalScope: what a processor script sees before the game's globals.
     this._scope = {
@@ -201,12 +228,20 @@ class AudioWorklet {
   }
 
   /// Evaluates the processor script at `url` (a path in the game's package, a blob: or data: URL) in the worklet's
-  /// scope. Rejects with what stopped it.
+  /// scope. The same URL is evaluated only once: later calls resolve without re-running the script or re-registering
+  /// its processors (a repeated registration in a re-run would also be an error of its own). Rejects with what stopped
+  /// the first evaluation, and with InvalidStateError once the context has closed.
   addModule(url) {
+    if (this._closed) {
+      return Promise.reject(new DOMException("the AudioContext is closed", "InvalidStateError"));
+    }
+    const key = String(url);
+    if (this._modules.has(key)) return Promise.resolve();
     try {
       const source = readScript(url);
       const run = new Function("__migoWorkletScope", "with (__migoWorkletScope) {\n" + source + "\n}");
       run.call(this._scope, this._scope);
+      this._modules.add(key);
       return Promise.resolve();
     } catch (error) {
       return Promise.reject(error);
@@ -227,51 +262,27 @@ function workletOf(context) {
 // --- AudioWorkletNode -----------------------------------------------------------------------------------------------
 
 const nodeState = new WeakMap();
-// The worklet nodes something is connected into: only those hand their processor an input with channels, as a node
-// with nothing connected gets an input of none.
-const fed = new WeakSet();
+// Graph edges touching worklet nodes: what feeds a node (its inputs) and where a node feeds (its outputs). Connection
+// tracking on both ends is what lets disconnect() decide whether the node still belongs to the graph.
+const incoming = new WeakMap();
+const outgoing = new WeakMap();
 
-function runBlock(node, event) {
-  const state = nodeState.get(node);
-  if (!state || !state.active) return;
-  const { worklet, processor, parameters, inputChannels, outputChannels } = state;
-  const scope = worklet._scope;
-  const rate = scope.sampleRate;
-  const inputData = [];
-  for (let c = 0; c < inputChannels; c++) inputData.push(event.inputBuffer.getChannelData(c));
-  const outputData = [];
-  for (let c = 0; c < outputChannels; c++) outputData.push(event.outputBuffer.getChannelData(c));
-  const values = {};
-  for (let at = 0; at + QUANTUM <= event.outputBuffer.length; at += QUANTUM) {
-    scope.currentTime = event.playbackTime + at / rate;
-    scope.currentFrame = Math.round(scope.currentTime * rate);
-    const inputs = state.numberOfInputs === 0 ? [] : [fed.has(node) ? inputData.map((d) => d.subarray(at, at + QUANTUM)) : []];
-    const outputs = state.numberOfOutputs === 0 ? [] : [outputData.map((d) => d.subarray(at, at + QUANTUM))];
-    for (const [name, param] of parameters) {
-      const block = values[name] || (values[name] = new Float32Array(1));
-      block[0] = param._at(scope.currentTime);
-    }
-    let keepGoing;
-    try {
-      keepGoing = processor.process(inputs, outputs, values);
-    } catch (error) {
-      state.active = false;
-      console.error("[migo-web-adapter] AudioWorkletProcessor.process threw:", error);
-      const handler = node.onprocessorerror;
-      if (typeof handler === "function") {
-        try {
-          handler.call(node, { type: "processorerror", error, target: node, currentTarget: node });
-        } catch (e) {
-          console.error("[migo-web-adapter] onprocessorerror threw:", e);
-        }
-      }
-      return;
-    }
-    if (!keepGoing) {
-      state.active = false;
-      return;
-    }
-  }
+function incomingOf(node) {
+  let set = incoming.get(node);
+  if (set === undefined) { set = new Set(); incoming.set(node, set); }
+  return set;
+}
+function outgoingOf(node) {
+  let set = outgoing.get(node);
+  if (set === undefined) { set = new Set(); outgoing.set(node, set); }
+  return set;
+}
+
+/// Whether the node is still in the live graph: it starts there even with nothing connected (the silent keep-alive
+/// chain stands in for a downstream), and leaves only once content itself disconnects it with neither an input nor an
+/// output edge left. A later connect() puts it back.
+function inGraph(state) {
+  return !state.everDisconnected || incomingOf(state.node).size > 0 || outgoingOf(state.node).size > 0;
 }
 
 export function installAudioWorklet(global) {
@@ -292,20 +303,188 @@ export function installAudioWorklet(global) {
     configurable: true,
   });
 
-  // A connection into a worklet node is what gives its processor an input.
-  if (AudioNode && typeof AudioNode.prototype.connect === "function" && !AudioNode.prototype.connect._migoWorkletAware) {
-    const connect = AudioNode.prototype.connect;
-    const wrapped = function (destination, ...rest) {
-      if (destination && nodeState.has(destination)) fed.add(destination);
-      return connect.call(this, destination, ...rest);
+  // Wrap the graph's connect/disconnect once, keeping the originals for the adapter's own keep-alive wiring. Internal
+  // calls carry an internal flag so the silent chain never counts as a content edge (and never suspends its own node).
+  const INTERNAL = Symbol("migoWorkletInternal");
+  const rawConnect = AudioNode && AudioNode.prototype.connect;
+  const rawDisconnect = AudioNode && AudioNode.prototype.disconnect;
+  if (AudioNode && typeof rawConnect === "function" && !rawConnect._migoWorkletAware) {
+    const wrappedConnect = function (destination, ...rest) {
+      const result = rawConnect.call(this, destination, ...rest);
+      if (rest[0] === INTERNAL) return result;
+      if (destination && nodeState.has(destination)) {
+        incomingOf(destination).add(this);
+        enterGraph(nodeState.get(destination));
+      }
+      if (nodeState.has(this)) {
+        outgoingOf(this).add(destination);
+        // An outgoing edge can itself bring a suspended node back into the graph.
+        enterGraph(nodeState.get(this));
+      }
+      return result;
     };
-    wrapped._migoWorkletAware = true;
-    AudioNode.prototype.connect = wrapped;
+    wrappedConnect._migoWorkletAware = true;
+    AudioNode.prototype.connect = wrappedConnect;
+  }
+  if (AudioNode && typeof rawDisconnect === "function" && !rawDisconnect._migoWorkletAware) {
+    const wrappedDisconnect = function (destination, ...rest) {
+      // Let the underlying node throw first (an edge that does not exist), as a real AudioNode would.
+      rawDisconnect.call(this, destination, ...rest);
+      if (rest[0] === INTERNAL) return;
+      const isWorkletSource = nodeState.has(this);
+      if (destination === undefined) {
+        for (const target of outgoingOf(this)) {
+          if (nodeState.has(target)) incomingOf(target).delete(this);
+        }
+        if (isWorkletSource) outgoingOf(this).clear();
+      } else if (destination !== null) {
+        if (isWorkletSource) outgoingOf(this).delete(destination);
+        if (nodeState.has(destination)) incomingOf(destination).delete(this);
+      }
+      if (isWorkletSource) {
+        const state = nodeState.get(this);
+        state.everDisconnected = true;
+        leaveGraph(state);
+      } else if (destination && nodeState.has(destination)) {
+        leaveGraph(nodeState.get(destination));
+      }
+    };
+    wrappedDisconnect._migoWorkletAware = true;
+    AudioNode.prototype.disconnect = wrappedDisconnect;
+  }
+
+  const connectNode = (node, destination) =>
+    (typeof rawConnect === "function" ? rawConnect : ScriptProcessorNode.prototype.connect).call(node, destination, INTERNAL);
+  const disconnectNode = (node, destination) => {
+    if (typeof rawDisconnect === "function") rawDisconnect.call(node, destination, INTERNAL);
+  };
+
+  /// (Re)attach the silent path to the destination that keeps an in-graph node rendering, and resume its processor.
+  function attachChain(state) {
+    if (state.stopped || state.chainAttached) return;
+    const { node, keepAlive } = state;
+    connectNode(node, keepAlive);
+    connectNode(keepAlive, state.worklet._context.destination);
+    state.chainAttached = true;
+  }
+
+  /// Release the silent path: a suspended or ended node must not keep nodes of its own alive.
+  function detachChain(state) {
+    if (!state.chainAttached) return;
+    const { node, keepAlive } = state;
+    try { disconnectNode(node, keepAlive); } catch { /* already gone */ }
+    try { disconnectNode(keepAlive, state.worklet._context.destination); } catch { /* already gone */ }
+    state.chainAttached = false;
+  }
+
+  function enterGraph(state) {
+    if (!state || state.stopped) return;
+    state.everDisconnected = false;
+    attachChain(state);
+  }
+
+  function leaveGraph(state) {
+    if (!state || state.stopped) return;
+    if (!inGraph(state)) detachChain(state);
+  }
+
+  /// The end that cannot be undone: process() returned false or threw, or the context closed. No further process()
+  /// calls, no more messages either way, no parameter scheduling, and the keep-alive chain is released.
+  function stopNode(state) {
+    if (state.stopped) return;
+    state.stopped = true;
+    detachChain(state);
+    state.processor = null;
+    for (const param of state.parameters.values()) param._stop();
+    state.port.close();
+    state.processorPort.close();
+    state.worklet._nodes.delete(state.node);
+    if (state.worklet._finalizer) state.worklet._finalizer.unregister(state.node);
+  }
+
+  /// Context close: every node on it stops processing and gives up its keep-alive chain; addModule/building afterwards
+  /// is refused.
+  function shutdownWorklet(worklet) {
+    if (worklet._closed) return;
+    worklet._closed = true;
+    for (const node of [...worklet._nodes]) {
+      const state = nodeState.get(node);
+      if (state) stopNode(state);
+    }
+    worklet._nodes.clear();
+  }
+
+  function runBlock(node, event) {
+    const state = nodeState.get(node);
+    if (!state || state.stopped || !inGraph(state)) return;
+    const { worklet, parameters, inputChannels, outputChannels } = state;
+    const processor = state.processor;
+    if (!processor) return;
+    const scope = worklet._scope;
+    const rate = scope.sampleRate;
+    const inputData = [];
+    for (let c = 0; c < inputChannels; c++) inputData.push(event.inputBuffer.getChannelData(c));
+    const outputData = [];
+    for (let c = 0; c < outputChannels; c++) outputData.push(event.outputBuffer.getChannelData(c));
+    const values = {};
+    for (let at = 0; at + QUANTUM <= event.outputBuffer.length; at += QUANTUM) {
+      scope.currentTime = event.playbackTime + at / rate;
+      scope.currentFrame = Math.round(scope.currentTime * rate);
+      const inputs = state.numberOfInputs === 0 ? [] : [incomingOf(node).size > 0 ? inputData.map((d) => d.subarray(at, at + QUANTUM)) : []];
+      const outputs = state.numberOfOutputs === 0 ? [] : [outputData.map((d) => d.subarray(at, at + QUANTUM))];
+      for (const [name, param] of parameters) {
+        const block = values[name] || (values[name] = new Float32Array(1));
+        block[0] = param._at(scope.currentTime);
+      }
+      let keepGoing;
+      try {
+        keepGoing = processor.process(inputs, outputs, values);
+      } catch (error) {
+        // A throw ends the node exactly once: a second block must neither call process() nor re-dispatch the event.
+        stopNode(state);
+        console.error("[migo-web-adapter] AudioWorkletProcessor.process threw:", error);
+        if (!state.errorReported) {
+          state.errorReported = true;
+          const handler = state.onprocessorerror;
+          if (typeof handler === "function") {
+            try {
+              handler.call(node, { type: "processorerror", error, target: node, currentTarget: node });
+            } catch (e) {
+              console.error("[migo-web-adapter] onprocessorerror threw:", e);
+            }
+          }
+        }
+        return;
+      }
+      if (!keepGoing) {
+        stopNode(state);
+        return;
+      }
+    }
+  }
+
+  // A context close has to reach the worklet. Wrap the prototype's close; contexts whose class defines none (the test
+  // double, or an older runtime) get an instance method lazily, so ctx.close() still means something there.
+  if (typeof base.close === "function" && !base.close._migoWorkletAware) {
+    const close = base.close;
+    const wrappedClose = function (...args) {
+      const result = close.apply(this, args);
+      shutdownWorklet(workletOf(this));
+      return result;
+    };
+    wrappedClose._migoWorkletAware = true;
+    base.close = wrappedClose;
+  } else if (typeof base.close !== "function") {
+    base.close = function () {
+      shutdownWorklet(workletOf(this));
+      return Promise.resolve();
+    };
   }
 
   function AudioWorkletNode(context, name, options = {}) {
     if (!new.target) throw new TypeError("AudioWorkletNode must be constructed with new");
     const worklet = workletOf(context);
+    if (worklet._closed) throw new DOMException("the AudioContext is closed", "InvalidStateError");
     const definition = worklet._processors.get(String(name));
     if (!definition) throw new DOMException(`no processor "${name}" is registered: addModule first`, "InvalidStateError");
     const numberOfInputs = options.numberOfInputs ?? 1;
@@ -343,17 +522,22 @@ export function installAudioWorklet(global) {
     } finally {
       constructingPort = null;
     }
-    nodeState.set(node, {
-      worklet, processor, parameters, inputChannels, outputChannels, numberOfInputs, numberOfOutputs,
-      port: nodePort, active: true, onprocessorerror: null,
-    });
+    const state = {
+      node, worklet, processor, parameters, inputChannels, outputChannels, numberOfInputs, numberOfOutputs,
+      port: nodePort, processorPort, stopped: false, everDisconnected: false, chainAttached: false,
+      keepAlive: null, onprocessorerror: null, errorReported: false,
+    };
+    nodeState.set(node, state);
+    worklet._nodes.add(node);
+    if (worklet._finalizer) worklet._finalizer.register(node, { node }, node);
     node.addEventListener("audioprocess", (event) => runBlock(node, event));
     // An AudioWorkletNode is processed whether or not anything downstream reads it (a node that only reports, like
-    // Godot's position processor, is connected to nothing): a silent path to the destination keeps it in the graph.
+    // Godot's position processor, is connected to nothing): a silent path to the destination keeps it in the graph
+    // until content disconnects it. It is the same chain detachChain() later releases and enterGraph() rebuilds.
     const keepAlive = context.createGain();
     keepAlive.gain.value = 0;
-    ScriptProcessorNode.prototype.connect.call(node, keepAlive);
-    keepAlive.connect(context.destination);
+    state.keepAlive = keepAlive;
+    attachChain(state);
     return node;
   }
   AudioWorkletNode.prototype = Object.create(ScriptProcessorNode.prototype, {

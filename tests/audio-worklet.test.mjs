@@ -17,7 +17,13 @@ globalThis.migo = {
 class AudioNode {
   constructor(context) { this.context = context; this.connections = []; }
   connect(destination) { this.connections.push(destination); return destination; }
-  disconnect() {}
+  disconnect(destination) {
+    if (destination === undefined) this.connections.length = 0;
+    else {
+      const at = this.connections.indexOf(destination);
+      if (at !== -1) this.connections.splice(at, 1);
+    }
+  }
 }
 class ScriptProcessorNode extends AudioNode {
   constructor(context, bufferSize, inputs, outputs) {
@@ -37,9 +43,10 @@ class Buffer {
   getChannelData(c) { return this.channels[c]; }
 }
 class BaseAudioContext {
-  constructor() { this.sampleRate = 48000; this.destination = new AudioNode(this); }
+  constructor() { this.sampleRate = 48000; this.destination = new AudioNode(this); this.closed = false; }
   createScriptProcessor(bufferSize, inputs, outputs) { return new ScriptProcessorNode(this, bufferSize, inputs, outputs); }
   createGain() { return new GainNode(this); }
+  close() { this.closed = true; return Promise.resolve(); }
 }
 class AudioContext extends BaseAudioContext {}
 
@@ -141,14 +148,173 @@ console.error = () => {};
 block(broken, 0);
 console.error = originalError;
 assert.equal(reported, "processorerror");
+block(broken, 0);
+assert.equal(reported, "processorerror", "processorerror is dispatched at most once");
 
-// 7. What this cannot be is refused, not half-done.
+// 7. Graph lifecycle: disconnect() suspends a node (no process calls, keep-alive chain released) and connect() resumes it.
+files.set("worklets/life.js", `
+  globalThis.__lifeLoads = (globalThis.__lifeLoads || 0) + 1;
+  class Life extends AudioWorkletProcessor {
+    static get parameterDescriptors() { return [{ name: "level", defaultValue: 1 }]; }
+    constructor() {
+      super();
+      this.got = [];
+      this.port.onmessage = (event) => this.got.push(event.data);
+      globalThis.__lastLife = this;
+    }
+    process(inputs, outputs) {
+      globalThis.__lifeCalls = (globalThis.__lifeCalls || 0) + 1;
+      for (const channel of outputs[0]) channel.fill(0.75);
+      return true;
+    }
+  }
+  registerProcessor("life", Life);
+  registerProcessor("life-broken", class extends AudioWorkletProcessor {
+    static get parameterDescriptors() { return [{ name: "level", defaultValue: 1 }]; }
+    process() { throw new Error("life boom"); }
+  });
+`);
+await ctx.audioWorklet.addModule("worklets/life.js");
+const life = new AudioWorkletNode(ctx, "life");
+const lifeKeepAlive = life.connections[0];
+assert.ok(lifeKeepAlive instanceof GainNode && lifeKeepAlive.gain.value === 0, "the keep-alive chain is a silent gain");
+assert.deepEqual(lifeKeepAlive.connections, [ctx.destination], "the silent gain reaches the destination");
+block(life, 10);
+const callsAfterFirstBlock = globalThis.__lifeCalls;
+assert.ok(callsAfterFirstBlock > 0, "a fresh node renders with nothing connected to it");
+
+life.disconnect();
+assert.deepEqual(life.connections, [], "disconnect releases the node's end of the keep-alive chain");
+assert.deepEqual(lifeKeepAlive.connections, [], "the silent gain is detached from the destination");
+block(life, 11);
+assert.equal(globalThis.__lifeCalls, callsAfterFirstBlock, "a disconnected node's processor is not called");
+
+const feeder = new AudioNode(ctx);
+feeder.connect(life);
+assert.deepEqual(life.connections, [lifeKeepAlive], "reconnect rebuilds the keep-alive chain");
+assert.deepEqual(lifeKeepAlive.connections, [ctx.destination]);
+block(life, 12, (c, i) => i);
+assert.ok(globalThis.__lifeCalls > callsAfterFirstBlock, "the processor runs again after reconnect");
+
+// Suspended (not ended) nodes still take parameter scheduling and port messages.
+life.disconnect();
+assert.doesNotThrow(() => life.parameters.get("level").setValueAtTime(0.2, 13), "a suspended node still schedules parameters");
+life.port.postMessage({ whileSuspended: true });
+await settle();
+assert.deepEqual(globalThis.__lastLife.got, [{ whileSuspended: true }], "a suspended node's port still delivers");
+feeder.connect(life);
+block(life, 13);
+
+// A node that still has an input edge stays in the graph even after its own disconnect() removes the output edge.
+life.disconnect();
+assert.equal(life.connections.length, 0, "the output edge goes, the input edge remains");
+const callsBeforeFedBlock = globalThis.__lifeCalls;
+block(life, 14);
+assert.ok(globalThis.__lifeCalls > callsBeforeFedBlock, "an input edge alone keeps the processor running");
+feeder.disconnect();
+assert.equal(life.connections.length, 0);
+block(life, 15);
+const callsAfterInputRemoved = globalThis.__lifeCalls;
+assert.equal(globalThis.__lifeCalls, callsAfterInputRemoved, "losing the last input suspends the node");
+feeder.connect(life);
+block(life, 16);
+assert.ok(globalThis.__lifeCalls > callsAfterInputRemoved, "an incoming connect() resumes it");
+
+// A suspended node can also be resumed by its own outgoing connect(), and a terminally stopped node ignores both edges.
+const lifeCallsBeforeSuspend = globalThis.__lifeCalls;
+life.disconnect();
+const sink = new AudioNode(ctx);
+life.connect(sink);
+block(life, 17);
+assert.ok(globalThis.__lifeCalls > lifeCallsBeforeSuspend, "the node's own connect() resumes it");
+const dead = new AudioWorkletNode(ctx, "once");
+const deadBefore = globalThis.__once;
+block(dead, 0);
+feeder.connect(dead);
+dead.connect(sink);
+block(dead, 0);
+assert.equal(globalThis.__once, deadBefore + 1, "a terminally stopped node never resumes");
+
+// 8. Terminal stop on process() === false: no more process calls, ports closed both ways, keep-alive chain released.
+const onceBeforeTerm = globalThis.__once;
+const term = new AudioWorkletNode(ctx, "once");
+const termKeepAlive = term.connections[0];
+block(term, 0);
+assert.equal(globalThis.__once, onceBeforeTerm + 1);
+block(term, 0);
+assert.equal(globalThis.__once, onceBeforeTerm + 1, "process is never called again after it returns false");
+assert.deepEqual(term.connections, [], "the ended node releases its keep-alive chain");
+assert.deepEqual(termKeepAlive.connections, [], "the silent gain is detached from the destination");
+assert.doesNotThrow(() => term.port.postMessage("late"), "postMessage after the end does not throw");
+await settle(); // the closed port drops the message rather than delivering it
+
+// A throwing processor ends just as finally: one processorerror, then silence; params and the port are shut.
+const lifeBroken = new AudioWorkletNode(ctx, "life-broken");
+let lifeErrors = 0;
+lifeBroken.onprocessorerror = () => { lifeErrors += 1; };
+const messagesBeforeEnd = globalThis.__lastLife.got.length;
+console.error = () => {};
+block(lifeBroken, 0);
+block(lifeBroken, 0);
+block(lifeBroken, 0);
+console.error = originalError;
+assert.equal(lifeErrors, 1, "a throw dispatches processorerror exactly once across later blocks");
+const stoppedParam = lifeBroken.parameters.get("level");
+for (const refuse of [
+  () => stoppedParam.setValueAtTime(0.3, 1),
+  () => stoppedParam.linearRampToValueAtTime(0.3, 1),
+  () => stoppedParam.exponentialRampToValueAtTime(0.3, 1),
+  () => stoppedParam.setTargetAtTime(0.3, 1),
+  () => stoppedParam.cancelScheduledValues(1),
+  () => { stoppedParam.value = 0.3; },
+]) {
+  assert.throws(refuse, { name: "InvalidStateError" }, "scheduling after the end throws a clear error");
+}
+assert.equal(stoppedParam.value, stoppedParam.defaultValue, "the getter still reads the last value after stopping");
+assert.doesNotThrow(() => lifeBroken.port.postMessage({ ignored: true }), "postMessage after the end does not throw");
+await settle();
+assert.equal(globalThis.__lastLife.got.length, messagesBeforeEnd, "a message posted after the end is never delivered");
+
+// 9. Context close stops every node and releases every keep-alive chain; the worklet then refuses new work.
+const ctx2 = new AudioContext();
+files.set("worklets/ctx.js", `
+  registerProcessor("ctx-probe", class extends AudioWorkletProcessor {
+    process() { globalThis.__ctxCalls = (globalThis.__ctxCalls || 0) + 1; return true; }
+  });
+`);
+await ctx2.audioWorklet.addModule("worklets/ctx.js");
+const ctxNodeA = new AudioWorkletNode(ctx2, "ctx-probe");
+const ctxNodeB = new AudioWorkletNode(ctx2, "ctx-probe");
+const ctxChainA = ctxNodeA.connections[0];
+const ctxChainB = ctxNodeB.connections[0];
+block(ctxNodeA, 0);
+const ctxCallsBeforeClose = globalThis.__ctxCalls;
+await ctx2.close();
+assert.equal(ctx2.closed, true);
+assert.deepEqual(ctxNodeA.connections, [], "close releases node A's chain");
+assert.deepEqual(ctxNodeB.connections, [], "close releases node B's chain");
+assert.deepEqual(ctxChainA.connections, [], "node A's silent gain is detached");
+assert.deepEqual(ctxChainB.connections, [], "node B's silent gain is detached");
+block(ctxNodeA, 0);
+block(ctxNodeB, 0);
+assert.equal(globalThis.__ctxCalls, ctxCallsBeforeClose, "no node on a closed context processes again");
+await assert.rejects(ctx2.audioWorklet.addModule("worklets/ctx.js"), { name: "InvalidStateError" }, "addModule after close rejects");
+assert.throws(() => new AudioWorkletNode(ctx2, "ctx-probe"), { name: "InvalidStateError" }, "a node after close is refused");
+await ctx2.close(); // idempotent: closing twice is harmless
+
+// 10. addModule is idempotent per URL: the script runs once, so its registrations happen once.
+const loadsBefore = globalThis.__lifeLoads;
+await ctx.audioWorklet.addModule("worklets/life.js");
+await ctx.audioWorklet.addModule("worklets/life.js");
+assert.equal(globalThis.__lifeLoads, loadsBefore, "re-adding the same URL does not re-evaluate the script");
+
+// 11. What this cannot be is refused, not half-done.
 assert.throws(() => new AudioWorkletNode(ctx, "tone", { numberOfOutputs: 2 }), { name: "NotSupportedError" });
 assert.throws(() => new AudioWorkletNode(ctx, "tone", { numberOfInputs: 0, numberOfOutputs: 0 }), { name: "NotSupportedError" });
 files.set("worklets/dup.js", 'registerProcessor("tone", class extends AudioWorkletProcessor {})');
 await assert.rejects(ctx.audioWorklet.addModule("worklets/dup.js"), { name: "NotSupportedError" }, "a name is registered once");
 
-// 8. Installing twice changes nothing; a runtime without ScriptProcessorNode gets no worklet.
+// 12. Installing twice changes nothing; a runtime without ScriptProcessorNode gets no worklet.
 assert.deepEqual(installAudioWorklet(fake), {});
 assert.deepEqual(installAudioWorklet({ AudioContext: class {} }), {});
 
