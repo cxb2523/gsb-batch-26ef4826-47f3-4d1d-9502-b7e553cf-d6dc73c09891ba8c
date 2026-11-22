@@ -11,5 +11,6 @@ export function createGtvbaoVariantValue<T>(
     mirrorNode?: { value: T } | null;
     shouldRebuild?: (previousValue: T, nextValue: T) => boolean;
     shouldNotify?: (previousValue: T, nextValue: T) => boolean;
+    onChange?: (value: T) => void;
   }
 ): GTVBAOVariantValue<T>;

@@ -52,18 +52,28 @@ class GTVBAONode extends GTVBAONodeBase {
 		this.maxThickness = uniform( options.maxThickness ?? 0.35, 'float' );
 		this.sectorMeasure = createVariantValue( this, options.sectorMeasure ?? GTVBAO_SECTOR_MEASURE_OPTIONS.Cosine, normalizeGtvbaoSectorMeasure );
 		this.usePerspectiveCorrectSlice = createVariantValue( this, options.usePerspectiveCorrectSlice ?? true, normalizeBool );
-		this.useDepthMips = createVariantValue( this, options.useDepthMips ?? true, normalizeBool );
+		// Toggling depth MIPs releases the prefilter immediately and rebuilds it at
+		// the current size when re-enabled, instead of waiting for the next setSize.
+		this.useDepthMips = createVariantValue( this, options.useDepthMips ?? true, normalizeBool, { onChange: () => this._syncLayout() } );
 		this.debugMode = createVariantValue(
 			this,
 			options.debugMode ?? 0,
 			normalizeInt( GTVBAO_VARIANT_LIMITS.debugMode ),
 			{
 				shouldRebuild: ( previousValue, nextValue ) => getGtvbaoDebugVariantKey( previousValue ) !== getGtvbaoDebugVariantKey( nextValue ),
-				shouldNotify: ( previousValue, nextValue ) => isGtvbaoDebugEnabled( previousValue ) !== isGtvbaoDebugEnabled( nextValue ) || getGtvbaoDebugVariantKey( previousValue ) !== getGtvbaoDebugVariantKey( nextValue )
+				shouldNotify: ( previousValue, nextValue ) => isGtvbaoDebugEnabled( previousValue ) !== isGtvbaoDebugEnabled( nextValue ) || getGtvbaoDebugVariantKey( previousValue ) !== getGtvbaoDebugVariantKey( nextValue ),
+				// Switching the debug view only swaps which target is active; the
+				// newly inactive target shrinks to 1x1 right away, not a frame later.
+				onChange: () => this._syncLayout()
 			}
 		);
 		this.useTemporalFiltering = options.useTemporalFiltering ?? true;
-		this.resolutionScale = options.resolutionScale ?? 1;
+		// Backing field for the resolutionScale accessor; the setter re-applies the
+		// sizes so a preset or GUI edit cannot leave _lastSize stale.
+		this._resolutionScale = options.resolutionScale ?? 1;
+		// Full-resolution size from the last setSize; null until the first call.
+		// Variant changes re-apply it through _syncLayout().
+		this._fullSize = null;
 		// Consumers built through createDepthAwareAo upsample the reduced-resolution
 		// AO by depth; the uniform gates it per frame, since it needs the linear-depth
 		// MIPs and does nothing useful at full resolution.
@@ -110,6 +120,16 @@ class GTVBAONode extends GTVBAONodeBase {
 		// runs at AO resolution (its radius is in AO texels) before the bilinear upscale.
 		this._textureNode = passTexture( this, this._getActiveRenderTarget().texture );
 		this._lastSize = { aoWidth: 0, aoHeight: 0, projectionScale: - 1, targetIsDebug: null };
+	}
+	get resolutionScale() {
+		return this._resolutionScale;
+	}
+	set resolutionScale( value ) {
+		if ( value === this._resolutionScale ) return;
+		this._resolutionScale = value;
+		// Presets and the GUI write this directly; re-apply the sizes now so the
+		// AO target, the depth prefilter and _resolution never keep a stale size.
+		this._syncLayout();
 	}
 	setVariantChangeCallback( callback ) {
 		this._onVariantChange = callback;
@@ -204,10 +224,25 @@ class GTVBAONode extends GTVBAONodeBase {
 		return this.useDepthAwareUpsample && this.useDepthMips.value && this.resolutionScale < 1;
 	}
 	setSize( width, height ) {
+		if ( this._fullSize === null ) this._fullSize = { width, height };
+		else {
+			this._fullSize.width = width;
+			this._fullSize.height = height;
+		}
+		this._syncLayout();
+	}
+	// Applies the current resolutionScale, debug mode and useDepthMips to the AO
+	// target, the debug target, the depth prefilter and _resolution, so all of
+	// them always agree on one AO size. setSize supplies the full resolution;
+	// variant changes (resolutionScale, debugMode, useDepthMips) re-apply the
+	// last one here instead of waiting for the next frame's setSize.
+	_syncLayout() {
+		if ( this._fullSize === null ) return;
+		const { width, height } = this._fullSize;
 		const renderTarget = this._getActiveRenderTarget();
 		const targetIsDebug = renderTarget === this._debugRenderTarget;
-		const aoWidth = Math.max( 1, Math.round( width * this.resolutionScale ) );
-		const aoHeight = Math.max( 1, Math.round( height * this.resolutionScale ) );
+		const aoWidth = Math.max( 1, Math.round( width * this._resolutionScale ) );
+		const aoHeight = Math.max( 1, Math.round( height * this._resolutionScale ) );
 		if ( this.useDepthMips.value ) this._depthPrefilter.setSize( aoWidth, aoHeight, width, height );
 		else this._depthPrefilter.release();
 		const projectionScale = this._camera.projectionMatrix.elements[ 5 ];
@@ -272,6 +307,10 @@ class GTVBAONode extends GTVBAONodeBase {
 		materials.add( this._material );
 		for ( const material of materials ) material.dispose();
 		this._materials.clear();
+		this._materialInputs = null;
+		// Forget the layout so a later variant toggle cannot resize disposed targets.
+		this._fullSize = null;
+		this._lastSize = { aoWidth: 0, aoHeight: 0, projectionScale: - 1, targetIsDebug: null };
 	}
 }
 export default GTVBAONode;

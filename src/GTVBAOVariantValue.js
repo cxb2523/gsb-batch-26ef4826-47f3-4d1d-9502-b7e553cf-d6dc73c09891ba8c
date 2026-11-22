@@ -21,7 +21,8 @@ export const createGtvbaoVariantValue = (
 	{
 		mirrorNode = null,
 		shouldRebuild = ( previousValue, nextValue ) => previousValue !== nextValue,
-		shouldNotify = shouldRebuild
+		shouldNotify = shouldRebuild,
+		onChange = null
 	} = {}
 ) => {
 	let value = normalizeValue( initialValue );
@@ -37,6 +38,9 @@ export const createGtvbaoVariantValue = (
 			const notify = shouldNotify( value, normalizedValue );
 			value = normalizedValue;
 			if ( mirrorNode !== null ) mirrorNode.value = value;
+			// Side effects (target/prefilter resizing) run eagerly, even inside a
+			// variant batch; only the shader rebuild and notification are deferred.
+			if ( onChange !== null ) onChange( normalizedValue );
 			if ( rebuild || notify ) owner._markVariantDirty( rebuild );
 		}
 	};
