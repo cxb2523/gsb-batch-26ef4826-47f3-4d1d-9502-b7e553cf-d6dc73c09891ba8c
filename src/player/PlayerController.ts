@@ -253,15 +253,62 @@ export class PlayerController implements MovementContext {
     });
   }
 
+  /**
+   * Respawn at the spawn point given to the constructor, with a fully clean
+   * movement state: nothing from the life that ended (fall speed, landing
+   * snapshots, surf/ladder flags, bunny-hop bookkeeping, stuck counters,
+   * contact log, tick history, the time base, or jump input edges) may carry
+   * across the boundary. The first tick after this runs exactly like the
+   * first tick of a freshly constructed controller.
+   */
   respawn(): void {
-    copy(this.origin, this.spawn);
+    this.resetLife(this.spawn);
+  }
+
+  /**
+   * Move the player to an arbitrary origin with the same hard lifecycle cut
+   * as respawn(): every piece of per-life movement state is reset through the
+   * identical cleanup path. Unlike respawn() this does NOT touch the stored
+   * spawn point, so a later respawn() still returns to the constructor's
+   * spawn. The interpolation snapshots are pinned to the new origin so a
+   * render step can't lerp the player back toward the old position.
+   */
+  teleport(origin: Vec3): void {
+    this.resetLife(origin);
+  }
+
+  /**
+   * The single lifecycle-boundary cleanup shared by respawn() and
+   * teleport(). Every field that can leak residue from a previous life is
+   * returned to its constructor/initial semantic here; the target origin is
+   * copied into both the live position and the interpolation snapshots.
+   */
+  private resetLife(target: Vec3): void {
+    // Position snapshots: live origin plus the prev/curr pair the renderer
+    // interpolates between, all pinned to the new life's origin.
+    copy(this.origin, target);
+    copy(this.prevPos, target);
+    copy(this.currPos, target);
+    this.prevEye = EYE_STAND;
+    this.currEye = EYE_STAND;
+
+    // Velocity and the fall-speed sample used by landing costs/view punch.
     set(this.velocity, 0, 0, 0);
-    copy(this.prevPos, this.spawn);
-    copy(this.currPos, this.spawn);
+    this.fallVelocity = 0;
+
+    // Ground / surf / ladder state.
     this.onGround = false;
     this.surfaceFriction = 1;
+    set(this.groundNormal, 0, 1, 0);
+    this.surfing = false;
+    this.surfedSinceGrounded = false;
     this.onLadder = null;
+    this.ladderCooldown = 0;
     this.ladderJumpAllowedAt = 0;
+    this.groundTicksSinceLanding = 0;
+    this.landPunch = 0;
+
+    // Duck state (full duck bookkeeping included).
     this.ducked = false;
     this.ducking = false;
     this.duckFlag = false;
@@ -270,20 +317,48 @@ export class PlayerController implements MovementContext {
     this.duckSpeed = DUCK_SPEED_IDEAL;
     this.rawDuckPrev = false;
     this.lastDuckTime = Number.NEGATIVE_INFINITY;
-    this.stamina = 0;
-    this.groundTicksSinceLanding = 0;
+    this.fullDuckX = 0;
+    this.fullDuckZ = 0;
+
+    // Bunny-hop / perfect-jump bookkeeping and the landing snapshot.
     this.hasJumpedBefore = false;
-    this.surfedSinceGrounded = false;
     set(this.landingVelocity, 0, 0, 0);
     this.lastHopQuality = null;
+
+    // Stamina starts at zero; the first tick's recovery then has nothing to
+    // recover, so an enabled-stamina build can't smuggle the old value back.
+    this.stamina = 0;
+
+    // Stuck / blocked counters and the per-tick contact log.
+    this.stuckTicks = 0;
+    this.blockedTicks = 0;
+    this.contactsThisTick.clear();
+
+    // Diagnostic history: the new life starts at tick 0.
+    this.tickHistory.clear();
+
+    // Time base: ladder grace windows and duck anti-spam are measured
+    // against ctx.time, so the clock restarts with the life.
+    this.time = 0;
+
+    // Jump input edges — the held key, the wheel-notch queue, the pogo-stick
+    // latch, and the current +jump level all return to "not pressed".
+    this.oldJump = false;
+    this.keyJumpHeld = false;
+    this.wheelJumpQueued = false;
+    this.input.jump = false;
+
+    // Scratch vectors start empty; every behavior overwrites before reading
+    // them, but a clean boundary guarantees no stale scratch at tick 0.
+    set(this.wishDir, 0, 0, 0);
+    set(this.moveEnd, 0, 0, 0);
+    set(this.tmpA, 0, 0, 0);
+    set(this.tmpB, 0, 0, 0);
   }
 
   // -- Simulation -----------------------------------------------------------
 
   tick(dt: number): void {
-    copy(this.prevPos, this.currPos);
-    this.prevEye = this.currEye;
-
     // Space stays pressed for as long as it's physically held; a queued
     // wheel notch is consumed for exactly this one tick and then gone,
     // whether or not Space is also down — see bindInput()'s wheel handler.
@@ -292,10 +367,19 @@ export class PlayerController implements MovementContext {
       this.wheelJumpQueued = false;
     }
 
+    // Lifecycle boundary first — before ANY tick-internal state is read
+    // (including the prevPos/prevEye snapshots below). A reset set on the
+    // same tick as tick() therefore wins over jump, gravity, collision, and
+    // history recording: this tick's snapshot and its history entry describe
+    // the fresh origin, and resetLife() clears the jump edges so the respawn
+    // can't itself launch a jump.
     if (this.input.reset) {
       this.input.reset = false;
       this.respawn();
     }
+
+    copy(this.prevPos, this.currPos);
+    this.prevEye = this.currEye;
 
     // PlayerMove: shot upward fast enough (jump pad, boost) and you are not on
     // the ground, whatever the last categorize said. Must precede the duck

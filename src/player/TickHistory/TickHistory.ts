@@ -36,6 +36,17 @@ export class TickHistory {
   private readonly contactCounts = new Uint8Array(HISTORY_CAPACITY);
   private readonly contacts = new Float32Array(HISTORY_CAPACITY * CONTACT_CAPACITY * CONTACT_STRIDE);
 
+  /**
+   * Drop every recorded tick. A respawn/teleport is a hard lifecycle
+   * boundary — the new life's first tick must be recorded as tick 0 at the
+   * new origin, with no entries from the life before it lingering behind.
+   * The backing arrays are reused as-is (slots get overwritten on record);
+   * only the rolling cursor needs resetting.
+   */
+  clear(): void {
+    this.total = 0;
+  }
+
   record(ctx: MovementContext): void {
     const slot = this.total % HISTORY_CAPACITY;
     const s = slot * 6;

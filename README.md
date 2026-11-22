@@ -144,7 +144,7 @@ Everything is exported from `@unsurf/cs-movement`.
 
 - `PlayerController` — the main class. Constructor: `(world, settings, spawn, opts?)`
 - `PlayerOptions` — `{ log?: (msg: string) => void }`
-- Methods: `tick(dt)`, `respawn()`, `bindInput(el)`, `tickHistoryText()`
+- Methods: `tick(dt)`, `respawn()`, `teleport(origin)`, `bindInput(el)`, `tickHistoryText()`
 - Properties: `origin`, `velocity`, `yaw`, `pitch`, `onGround`, `ducked`, `surfing`, `onLadder`, `input`, `stamina`, `lastHopQuality`, `horizontalSpeed`, `eyeHeight`, `mins`, `maxs`, `prevPos`/`currPos`, `prevEye`/`currEye`, `landingVelocity`, `landPunch`
 
 ### World & Collision
