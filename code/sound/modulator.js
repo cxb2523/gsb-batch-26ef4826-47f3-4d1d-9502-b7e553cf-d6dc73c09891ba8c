@@ -19,6 +19,8 @@ class Modulator {
         this.#implementation.oscillator.start();
         this.#implementation.output = this.#implementation.depthNode;
         this.#implementation.deactivate = _ => {
+            if (this.#implementation.isDeactivated) return;
+            this.#implementation.isDeactivated = true;
             this.#implementation.oscillator.stop();
             this.#implementation.oscillator.disconnect();
             this.#implementation.depthNode.disconnect();

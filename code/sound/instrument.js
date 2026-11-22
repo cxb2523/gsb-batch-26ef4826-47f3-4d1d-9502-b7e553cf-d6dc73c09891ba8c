@@ -200,8 +200,6 @@ class Instrument extends ModulatorSet {
         super.amplitudeModulationData = dataset.amplitudeModulation.absoluteFrequency;
         for (let [_, tone] of this.#implementation.tones) {
             tone.data = dataset;
-            tone.frequencyModulationData = dataset.frequencyModulation.relativeFrequency;
-            tone.amplitudeModulationData = dataset.amplitudeModulation.relativeFrequency;
             tone.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
             super.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
         } //loop
