@@ -1,7 +1,35 @@
 {
-    "title": "",
-    "media": [],
-    "cover": "",
+    "title": "Scritch samples",
+    "media": [
+        {
+            "file": "sample-alpha.wav",
+            "title": "Alpha (audio, own cover)",
+            "cover": "cover-alpha.png",
+            "info": "Short sine-wave sample: a track with its own cover image.",
+            "feature": true
+        },
+        {
+            "file": "sample-video.webm",
+            "title": "Bravo (video)",
+            "type": "video",
+            "info": "Short VP9/Opus clip: the video takes over the cover area."
+        },
+        {
+            "file": "sample-bravo.wav",
+            "title": "Charlie (audio, global cover)",
+            "info": "Short sine-wave sample: falls back to the global cover."
+        },
+        {
+            "file": "sample-delta.wav",
+            "title": "Delta (audio preview)",
+            "cover": "cover-bravo.png",
+            "previewStart": 0.25,
+            "previewEnd": 1.25,
+            "originalDuration": "0:04",
+            "info": "A preview section drawn from the middle of a longer track."
+        }
+    ],
+    "cover": "cover-global.png",
     "theme": {
         "coverSize": 480,
         "layoutStyle": "vertical",
@@ -9,5 +37,5 @@
         "contentWidth": 400,
         "nativePlayer": false
     },
-    "description": ""
+    "description": "Local sample album used to exercise prefetch cancellation, cover switching, and preview scrubbing."
 }

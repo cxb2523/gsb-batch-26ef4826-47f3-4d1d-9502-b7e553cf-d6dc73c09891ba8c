@@ -6,6 +6,35 @@ Scritch player is a simple HTML media player designed for ease of creation and c
 
 The original intention was to create a media player for musicians to use to upload their albums to [itch.io](https://itch.io). Something for them to easily copy/migrate their existing albums from sites like bandcamp.
 
+## Sample media & browser tests
+
+The repository ships with a tiny local sample album so the player can be run
+and verified without any external files:
+
+- `media/sample-alpha.wav`, `media/sample-bravo.wav`, `media/sample-delta.wav`
+  -- short sine-wave audio clips
+- `media/sample-video.webm` -- a short VP9/Opus video clip
+- `media/cover-global.png`, `media/cover-alpha.png`, `media/cover-bravo.png`
+  -- cover images (global + per-track)
+- `config.json` wires these into four tracks covering audio with its own
+  cover, a video, an audio track that falls back to the global cover, and an
+  audio preview region.
+
+Serve the folder with any static server (e.g. `npx serve .`) and open
+`index.html` to play with it.
+
+To run the browser-side verification suite (headless Chrome over the DevTools
+protocol, no third-party packages required):
+
+```
+node tests/verify-switching.mjs
+```
+
+It covers rapid consecutive track switching, video/audio round trips with
+cover and scrubber resets, late prefetch responses that must not overwrite the
+current track, and progress-bar drags that must not be disturbed by late
+loads. Set `CHROME_PATH` if Chrome is not auto-detected.
+
 ## How to
 
 ### Scritch editor

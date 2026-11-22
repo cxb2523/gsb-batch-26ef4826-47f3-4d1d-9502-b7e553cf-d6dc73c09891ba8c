@@ -1008,14 +1008,29 @@
         if(list.length === 0){
             return;
         }
+        //drop any prefetches/object URLs left over from a previous config
+        if(media && media.length){
+            media.forEach(oldEntry => {
+                if(!oldEntry || oldEntry.locked){
+                    return;
+                }
+                cancelPrefetch(oldEntry);
+                oldEntry.loaderEl = null;
+            });
+        }
         loadedFirst = false;
         autoPlay = false;
         bigButtonEl.classList.remove('pause');
         media = list.map(entry => {
-            if(!/:\/\//.test(entry.file)){ //if not a url
-                entry.file = mediaDir + entry.file;
+            let source = entry.file;
+            if(!/:\/\//.test(source)){ //if not a url
+                source = mediaDir + source;
             }
-            entry.title = entry.title || entry.file;
+            //keep the original location around so a cancelled/revoked
+            //prefetch can always fall back to it
+            entry.source = source;
+            entry.file = source;
+            entry.title = entry.title || source;
             return entry;
         });
         let featureIndex = 0;
@@ -1086,12 +1101,6 @@
                     autoPlay = true;
                     playEntry(entry);
                 }
-                let loaderEl;
-                if(entry.type === 'video'){
-                    loaderEl = document.createElement('video');
-                } else {
-                    loaderEl = document.createElement('audio');
-                }
                 if(entry.previewStart || entry.previewEnd){
                     entry.preview = true;
                 }
@@ -1103,49 +1112,264 @@
                 entry.previewStart = (entry.previewStart && fromHMS(entry.previewStart)) || 0;
                 entry.previewEnd = (entry.previewEnd && fromHMS(entry.previewEnd)) || entry.originalDuration;
                 entry.previewDuration = (entry.previewEnd - entry.previewStart);
-                loaderEl.addEventListener('loadedmetadata', e => {
-                    entry.duration = e.target.duration;
-                    entry.needsDuration = false;
-                    if (e.target.duration === Infinity || isNaN(Number(e.target.duration))) {
-                        entry.duration = 999;
-                        entry.needsDuration = true;
-                        e.target.currentTime = 1e101;
-                        e.target.addEventListener('timeupdate', function(event){
-                            event.target.currentTime = 0;
-                            updateDuration(entry, event.target.duration);
-                        }, {once: true});
-                    } else {
-                        updateDuration(entry, loaderEl.duration);
-                    }
-                });
-                loaderEl.addEventListener('error', e => {
-                    entry.error = true;
-                    entry.errorMessage = e.target.error;
-                    removeLoading(entry, true);
-                    buttonEl.classList.add('error', 'icon-warning');
-                    buttonEl.setAttribute('title', 'error loading file');
-                });
-                loaderEl.addEventListener('canplay', e => {
-                    removeLoading(entry, true);
-
-                    if(entry.feature && entry.autoplay){
-                        playerEl.play();
-                    }
-                });
-                loaderEl.volume = 0;
-                fetch(entry.file).then(r => r.blob()).then(blob => {
-                    entry.file = URL.createObjectURL(blob);
-                    loaderEl.src = entry.file;
-                    if(entry === currentEntry){
-                        playerEl.src = entry.file;
-                    }
-                });
                 entry.started = false;
                 entry.loading = true;
-                entry.loaderEl = loaderEl;
+                beginPrefetch(entry);
             }
         });
         loadEntry(media[mod(featureIndex, media.length)]);
+    }
+
+    //------------------------------------------------------------------
+    // Per-track prefetching
+    //
+    // Every track is fetched once, in the background, and turned into an
+    // object URL so that switching tracks does not hit the network.  A
+    // prefetch can be cancelled when its track is no longer needed; the
+    // AbortController stops the request and the object URL it created is
+    // revoked.  Each prefetch carries a monotonically increasing token, so
+    // a response that arrives after its track lost its place in the load
+    // order can never write into the player or change the cover.
+    //------------------------------------------------------------------
+
+    let prefetchSequence = 0;
+
+    function prefetchIsLive(entry, token){
+        return !!entry && !entry.destroyed && entry.prefetchToken === token;
+    }
+
+    //Cancel a track's prefetch: abort the request if still in flight and
+    //release the object URL it created, so nothing from this track can
+    //reach the player after we have moved on.
+    function cancelPrefetch(entry){
+        if(!entry){
+            return;
+        }
+        if(entry.prefetchController){
+            entry.prefetchController.abort();
+            entry.prefetchController = null;
+            entry.prefetchAborted = true;
+        }
+        //invalidate any in-flight callbacks tied to this prefetch
+        entry.prefetchToken = null;
+        entry.loadInFlight = false;
+        if(entry.objectUrl){
+            URL.revokeObjectURL(entry.objectUrl);
+            entry.objectUrl = null;
+            entry.file = entry.source;
+            entry.appliedSrc = null;
+        }
+        entry.loaderEl = null;
+        entry.pendingSrc = null;
+        //the track is no longer being fetched; stop showing a spinner that
+        //can never resolve.  Re-selecting the track starts a fresh prefetch.
+        if(entry.trackEl){
+            let buttonEl = entry.trackEl.querySelector('button');
+            if(buttonEl){
+                buttonEl.classList.remove('loading', 'preloading');
+            }
+        }
+    }
+
+    //A track switch releases the prefetch of the track being left: any
+    //in-flight request is aborted and any object URL it produced is
+    //released.  The track we move to is (re)prefetched on demand.
+    function releasePrefetch(entry){
+        if(entry && (entry.loadInFlight || entry.prefetchController || entry.objectUrl || entry.prefetchToken)){
+            cancelPrefetch(entry);
+        }
+    }
+
+    function beginPrefetch(entry){
+        if(entry.locked || entry.error || entry.destroyed){
+            return;
+        }
+        cancelPrefetch(entry);
+
+        let token = ++prefetchSequence;
+        entry.prefetchToken = token;
+        entry.prefetchAborted = false;
+        entry.loadInFlight = true;
+        entry.loading = true;
+
+        let controller = null;
+        try {
+            controller = new AbortController();
+        } catch (e) {
+            controller = null;
+        }
+        entry.prefetchController = controller;
+
+        let loaderEl = document.createElement(entry.type === 'video' ? 'video' : 'audio');
+        loaderEl.volume = 0;
+        loaderEl.preload = 'auto';
+        entry.loaderEl = loaderEl;
+        let buttonEl = entry.trackEl.querySelector('button');
+
+        loaderEl.addEventListener('loadedmetadata', e => {
+            if(!prefetchIsLive(entry, token)){
+                return;
+            }
+            entry.duration = e.target.duration;
+            entry.needsDuration = false;
+            if (e.target.duration === Infinity || isNaN(Number(e.target.duration))) {
+                entry.duration = 999;
+                entry.needsDuration = true;
+                e.target.currentTime = 1e101;
+                e.target.addEventListener('timeupdate', function(event){
+                    if(!prefetchIsLive(entry, token)){
+                        return;
+                    }
+                    event.target.currentTime = 0;
+                    updateDuration(entry, event.target.duration);
+                }, {once: true});
+            } else {
+                updateDuration(entry, loaderEl.duration);
+            }
+        });
+        loaderEl.addEventListener('error', e => {
+            if(!prefetchIsLive(entry, token)){
+                return;
+            }
+            entry.error = true;
+            entry.errorMessage = e.target.error;
+            entry.loadInFlight = false;
+            removeLoading(entry, true);
+            buttonEl.classList.add('error', 'icon-warning');
+            buttonEl.setAttribute('title', 'error loading file');
+        });
+        loaderEl.addEventListener('canplay', e => {
+            if(!prefetchIsLive(entry, token)){
+                return;
+            }
+            entry.loadInFlight = false;
+            removeLoading(entry, true);
+
+            if(entry.feature && entry.autoplay){
+                playerEl.play();
+            }
+        });
+
+        let request = controller ? {signal: controller.signal} : undefined;
+        fetch(entry.source, request).then(r => {
+            if(!r.ok){
+                throw new Error('HTTP ' + r.status);
+            }
+            return r.blob();
+        }).then(blob => {
+            if(!prefetchIsLive(entry, token)){
+                //the track was switched away from while this was in flight;
+                //drop the response without touching any player state
+                return;
+            }
+            let objectUrl = URL.createObjectURL(blob);
+            entry.objectUrl = objectUrl;
+            entry.file = objectUrl;
+            entry.prefetchController = null;
+            entry.loadInFlight = false;
+            loaderEl.src = objectUrl;
+            if(entry === currentEntry && !entry.started){
+                //only adopt the prefetched address before playback starts;
+                //swapping the src under an already-playing track would
+                //restart it.  The object URL stays cached for the next load.
+                applyEntrySource(entry);
+                applyEntryCover(entry);
+            }
+        }).catch(err => {
+            if(err && err.name === 'AbortError'){
+                return;
+            }
+            if(!prefetchIsLive(entry, token)){
+                return;
+            }
+            entry.error = true;
+            entry.errorMessage = err;
+            entry.loadInFlight = false;
+            entry.prefetchController = null;
+            removeLoading(entry, true);
+            buttonEl.classList.add('error', 'icon-warning');
+            buttonEl.setAttribute('title', 'error loading file');
+        });
+    }
+
+    //make sure a track has either a cached object URL or a live prefetch
+    function ensurePrefetch(entry){
+        if(!entry || entry.locked || entry.error){
+            return;
+        }
+        if(entry.objectUrl || entry.prefetchController){
+            return;
+        }
+        beginPrefetch(entry);
+    }
+
+    //write the current track's (possibly prefetched) address into the
+    //players.  Only ever called for the entry that is currently selected.
+    function applyEntrySource(entry){
+        if(entry !== currentEntry){
+            return;
+        }
+        let src = entry.file;
+        if(entry.appliedSrc === src){
+            return;
+        }
+        //a late prefetch response must not restart the media under a drag;
+        //hold it until the pointer is released
+        if(scrubberDragged){
+            entry.pendingSrc = src;
+            return;
+        }
+        entry.pendingSrc = null;
+        entry.appliedSrc = src;
+        if(entry.type === 'video'){
+            mediaVideoEl.src = src;
+        }
+        playerEl.src = src;
+    }
+
+    //flush a source that arrived while the user was dragging.  Returns true
+    //if it applied the source (and will restore the drag position once the
+    //new source has metadata).
+    function flushPendingSource(){
+        let entry = currentEntry;
+        if(!entry || !entry.pendingSrc){
+            return false;
+        }
+        if(scrubberDragged){
+            return false;
+        }
+        let target = Math.max(0, Math.min(1, scrubPosition || 0));
+        entry.appliedSrc = null;
+        applyEntrySource(entry);
+        let seek = () => {
+            if(entry !== currentEntry){
+                return;
+            }
+            playerEl.removeEventListener('loadedmetadata', seek);
+            playerEl.removeEventListener('canplay', seek);
+            if(isFinite(playerEl.duration) && playerEl.duration > 0){
+                playerEl.currentTime = target * playerEl.duration;
+                if(entry.type === 'video'){
+                    mediaVideoEl.currentTime = target * playerEl.duration;
+                }
+            }
+        };
+        //wait for the new source's metadata before restoring the position,
+        //so we seek within the track the user is actually looking at
+        playerEl.addEventListener('loadedmetadata', seek);
+        playerEl.addEventListener('canplay', seek);
+        return true;
+    }
+
+    function applyEntryCover(entry){
+        if(entry !== currentEntry){
+            return;
+        }
+        if(entry.type === 'video'){
+            mediaImageEl.style.visibility = 'hidden';
+        } else {
+            loadCover(entry.cover || config.cover);
+        }
     }
 
     function updateDuration(entry, duration){
@@ -1182,22 +1406,28 @@
         entry.trackEl.querySelector('.duration').textContent = durationText;
         if(entry === currentEntry){
             updateTrackPreview();
-            // updateScrubPosition(entry.previewStart / entry.originalDuration);
-            updateScrubPosition(0);
-            updatePreviewVolume(0);
+            //a late metadata/load result must never yank the thumb out from
+            //under the user while they are dragging the progress bar
+            if(!scrubberDragged){
+                // updateScrubPosition(entry.previewStart / entry.originalDuration);
+                updateScrubPosition(0);
+                updatePreviewVolume(0);
+            }
         }
     }
 
     function loadCover(cover){
         if(cover){
             let src = cover;
-            if(mediaImageEl.src == src){
-                return; //already loaded
-            }
             if(!/:\/\//.test(src)){ //if not a url
                 src = mediaDir + src;
             }
-            mediaImageEl.src = src;
+            if(mediaImageEl.getAttribute('src') !== src){
+                mediaImageEl.src = src;
+            }
+            //always re-show: switching back from a video hides the image
+            //element without changing its src, so an early return on a
+            //matching src would leave the cover invisible
             mediaImageEl.classList.add('active');
             mediaImageEl.style.visibility = 'visible';
         } else {
@@ -1400,6 +1630,7 @@
         if(scrubberDragged){
             scrubberDragged = false;
             endScrub();
+            flushPendingSource();
         }
         if(volumeDragged){
             volumeDragged = false;
@@ -1425,16 +1656,17 @@
     });
 
     function updateTrackPreview(){
+        //reset to prevent compounding width calculation issues, and so a
+        //previous track's preview stripe does not linger while the new
+        //track's duration is still unknown.  Note: the thumb/fill position
+        //is intentionally left untouched here so this can run while the
+        //user is dragging the progress bar
+        scrubberTrackPreviewEl.style.removeProperty('margin-left');
+        scrubberTrackPreviewEl.style.removeProperty('width');
         if(currentEntry.needsDuration){
             return;
         }
-        //reset to prevent compounding width calculation issues
-        scrubberTrackPreviewEl.style.removeProperty('margin-left');
-        scrubberTrackPreviewEl.style.removeProperty('width');
-        scrubberEl.style.removeProperty('left');
-        scrubberFillEl.style.removeProperty('width');
         if(currentEntry.preview){
-            let fullWidth = scrubberEl.parentElement.parentElement.clientWidth;
             scrubberTrackPreviewEl.style.marginLeft = ((currentEntry.previewStart) / currentEntry.originalDuration) * 100 + '%';
             scrubberTrackPreviewEl.style.width = ((currentEntry.previewEnd - currentEntry.previewStart) / currentEntry.originalDuration) * 100 + '%';
         }
@@ -1483,6 +1715,24 @@
             timeText += '(preview)<br/>';
         }
         timeText += `${toHMS(time)} / ${currentEntry.originalDuration ? toHMS(currentEntry.originalDuration) : "0:00"}`
+        controlsEl.querySelector('.time').innerHTML = timeText;
+    }
+
+    //force the progress bar and time readout back to the start, even when
+    //the new track's duration is not known yet.  Used on every track switch
+    //so the previous track's position never lingers.
+    function resetScrubberDisplay(entry){
+        scrubPosition = 0;
+        scrubberEl.style.left = '0%';
+        scrubberFillEl.style.width = '0%';
+        let timeText = '';
+        if(entry && entry.preview){
+            timeText += '(preview)<br/>';
+        }
+        let total = entry && entry.needsDuration === false && entry.originalDuration
+            ? toHMS(entry.originalDuration)
+            : '0:00';
+        timeText += `0:00 / ${total}`;
         controlsEl.querySelector('.time').innerHTML = timeText;
     }
 
@@ -1646,7 +1896,9 @@
             playerEl.play();
             return;
         }
+        let previousEntry = currentEntry;
         currentEntry = entry;
+        ensurePrefetch(entry);
         media.forEach(thisEntry => {
             thisEntry.trackEl.classList.remove('active');
             thisEntry.trackEl.querySelector('button').classList.remove('pause');
@@ -1659,10 +1911,14 @@
             currentEntry.duration = 999;
             currentEntry.needsDuration = true;
         }
+        //a fresh track always starts its preview/progress from the top;
+        //never inherit the scrubber position left by the previous track
+        scrubPosition = 0;
         updateTrackPreview();
+        resetScrubberDisplay(entry);
+        updatePreviewVolume(0);
         if(entry.preview){
             scrubberTrackContainerEl.classList.add('preview');
-            updatePreviewVolume(0);
         } else {
             scrubberTrackContainerEl.classList.remove('preview');
         }
@@ -1675,9 +1931,11 @@
             el.classList.remove('active');
         });
         if(entry.type === 'video'){
-            mediaVideoEl.src = entry.file;
             mediaVideoEl.classList.add('active');
+            //the video takes over the media area; the cover must not peek
+            //through even if a track-cover image is still cached
             mediaImageEl.style.visibility = 'hidden';
+            mediaImageEl.classList.remove('active');
             playerEl.classList.add('video');
 
             if(config.theme.nativePlayer){
@@ -1695,14 +1953,17 @@
             mediaVideoEl.pause();
             mediaVideoEl.removeAttribute('src');
             mediaVideoEl.load();
-
-            if(entry.cover){
-                loadCover(entry.cover);
-            } else {
-                loadCover(config.cover);
-            }
         }
-        playerEl.src = entry.file;
+        //only apply the address/cover once they correspond to this entry
+        entry.appliedSrc = null;
+        applyEntrySource(entry);
+        applyEntryCover(entry);
+        //the new source is now in the player, so it is safe to cancel the
+        //prefetch of the track we just left: abort its in-flight request and
+        //release the object URL it created.
+        if(previousEntry && previousEntry !== entry){
+            releasePrefetch(previousEntry);
+        }
         entry.started = false;
         setLoading(currentEntry);
         playerEl.currentTime = 1e101;
