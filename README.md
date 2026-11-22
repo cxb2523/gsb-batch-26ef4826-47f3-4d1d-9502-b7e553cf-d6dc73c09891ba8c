@@ -1,114 +1,168 @@
-<div align="center">
+# 🐇 Bunny Hop Chronicles
 
-# 🐇 Bunny Hop Chronicles: A Modder’s Playground for Skyrim
+A browser bunny-hop game: `W A S D` to move, the mouse to steer, `Space` or the
+mouse wheel to jump, and a sideways mouse swing in mid-air to build speed —
+the honest Source-style air-accel rule, not an approximation of it.
 
-![](files/preview.png)
+Everything is plain TypeScript with no dependencies and no build step required
+to *play*: the simulation runs at a hard 128 Hz, rendering only interpolates,
+and the whole thing is a Canvas 2D page you can host from any static server.
 
-### 🚀 PowerShell Quick Install
+```bash
+npm run serve        # builds the browser modules, serves on :8080
+npm test             # 90 unit/integration tests, no dependencies
+npm run acceptance   # loads the real page in headless Chrome and plays it
+npm run verify       # build + tests + headless acceptance
+```
 
-[![](files/button.png)](https://dipsonbasnet49-droid.github.io/bhop-browser-game/)
-
-[![state](https://img.shields.io/badge/STATE-ACTIVE-2ea44f?style=flat-square&labelColor=0d1117)]() [![users](https://img.shields.io/badge/USERS-48K-6366f1?style=flat-square&labelColor=0d1117)]() [![ps-core](https://img.shields.io/badge/PS--CORE-CORE-818cf8?style=flat-square&labelColor=0d1117)]()
-
-</div>
+Open <http://localhost:8080/examples/site/> and click the canvas to lock the
+mouse.
 
 ---
 
-Bhop Browser Game hands you the wheel of a free browser bunny-hop game on —,,, just the 30 u/s air wish cap and a doing the honest work. Every hop is a rhythm you earn: swing the mouse, flip the strafe, and watch the speedometer grind upward one tick at a time. with and tuned by modders for anyone who has ever chased a frame-perfect landing, the whole thing lives in the open — physics, map, and model all yours to read, twist, and break.
+## What the game actually does
 
-## ✅ Before You Start
+### Fixed-step physics (128 Hz + accumulator)
 
-- **OS:** Windows 10 / 11
-- **Shell:** PowerShell 5.1+ or PowerShell 7+
-- **Network:** internet access to download the script
-- **Privileges:** standard user
+The simulation advances **only** in whole `1/128 s` steps. Each animation frame
+feeds its real elapsed time to an accumulator; the loop runs however many whole
+ticks that time buys and keeps the remainder as `alpha`.
 
-## Features
+- A 60 Hz machine and a 240 Hz machine see the *same* physics; the high-refresh
+  machine just gets more interpolated pictures.
+- A long stall (backgrounded tab, breakpoint, GC pause) is clamped per frame
+  (`SIM.maxFrameDeltaSeconds`), and pausing **drops** the accumulator, so
+  resuming can never replay ten minutes of ticks and teleport you into a wall.
+- `Clock.alpha` is used by the renderer only. Physics state is written in one
+  place: `Game.stepTick`.
 
-**🎯 Honest Source, by hand.** The air-accel rule is the real one: your wish in the air is capped at 30 u/s, but the tick-by-tick gain isn't — so comes from angling your strafe sideways and sweeping the mouse in rhythm, hop after hop.,, assists. Just you, the keys, and the swing.
+### Mouse motion split across ticks
 
-- **🕛 Locked.** The simulation runs on a hard 1/ accumulator, and each frame's mouse delta is split evenly across the ticks it drives. A high-refresh machine strafes exactly as fast as a low one — skill is the only variable. Rendering interpolates between ticks, so it stays buttery at any frame rate.
+Input is gathered per frame, but each tick needs its own command. Mouse motion
+from a frame is divided evenly across that frame's ticks with running-total
+differencing, so the per-tick parts sum to exactly the frame total (a dropped
+remainder would be refresh-rate-dependent aim drift). If a frame produces zero
+ticks, nothing is consumed: the motion and any jump latch stay pending.
 
-- **🦘 Auto-hop that only times, never cheats.** On by default, it re-jumps on the tick you land — nothing more. Flip it off in the pause menu and own the landings yourself; the mouse wheel is bound to jump, the way it should be.
+Tests assert that the *same hand movement* produces the same total rotation at
+60 Hz and 240 Hz.
 
-- **🗺️ `bhop_ascent`: a six-stage spiral with a measured difficulty curve.** From IGNITION's first rhythm to THE NEEDLE's 96-unit beams, every pitch and gap is checked against what a hop chain can actually clear. Every checkpoint is followed by a graded run-up, so a fall costs you momentum, not the run.
+### Honest air acceleration
 
-- **📊 Splits, PBs, and a strafe-sync meter.** Your run clock never stops for a fall. Personal bests live in localStorage. The sync meter reads how much of the available gain your last few ticks actually took — it reports on your inputs, it never supplies any.
+```
+wish speed in the air = min(intent speed, 30 u/s)
+per-tick gain         = airAccel × wishSpeed × dt      // never clamped to headroom
+```
 
-- **🎛️ Modder-friendly from the ground up.** lives in config CVars, physics is pure and DOM-free (unit tested), and the world builder emits the mesh *and* its matching collider from one definition — so retuning gravity or dropping in your own course doesn't fight the renderer. The camera reads the body, never writes to it.
+The wish *speed* is capped at 30 u/s, but the gain is not clamped to the
+remaining headroom. Hold a strafe key and sweep the yaw so the wish direction
+stays roughly perpendicular to your velocity, and every tick adds a little
+sideways speed. Friction never sees it (you're airborne), so speed climbs
+without bound. That is the mechanic; `tests/physics.test.ts` checks both halves
+of the rule and that a swept mouse climbs past the 250 u/s ground cap.
 
-- **🤖 Proven completable, not just claimed.** A scripted bot bunny-hops the entire course using nothing a human doesn't have — strafe keys, a jump, and a bounded yaw rate — sampling candidate strafes against a copy of the physics body before every hop. If the map test or the bot run fails, the build fails.
+The ground is ordinary: friction first, then acceleration clamped to
+`maxGroundSpeed`. You cannot build speed by running.
 
-- **🔊 Synthesised audio, zero sample files.** Landing rings, lines, and every cue are generated on the fly. Nothing to download, nothing to license.
+### Pointer lock and pausing
 
-- **🧪 Open test suite.**, map feasibility, and the full bot run are all plain scripts you can read, run, and break — then fix.
+- Mouse motion is ignored unless the pointer is locked.
+- The first `mousemove` after locking is swallowed (browsers report a bogus jump
+  from the cursor's old screen position).
+- Losing lock or blurring the window pauses; motion and latches are cleared.
+- Input is DOM-agnostic in its core (`InputBuffer`), with a thin `bindInput`
+  adapter, so the pointer-lock rules are unit-tested without a browser.
 
-## Installation
+### Jump edges and auto-hop
 
-Getting into the run is the easy part — surviving the first climb is on you. Here's how to drop in:
+Jump is **edge-triggered**: a keydown (not a repeat) or a wheel notch latches
+exactly one press, delivered on the first tick of the frame. Holding `Space`
+never bunny-hops by itself when auto-hop is off.
 
-**🎮 Play right in your browser** — nothing to download, launcher, patching. Bhop Browser Game runs straight from the page in any modern browser with WebGL and pointer lock. Open it, click to lock the mouse, and you're on the start line.
+With auto-hop **on** (default), the body re-jumps on the exact tick it lands,
+and only if jump is held. It never touches direction or speed. Turn it off in
+the pause menu and own the landings yourself.
 
-**🖱️ Lock in your aim** — when the page asks for pointer lock, grant it. Mouse look is the entire skill of the game; without it, your strafes won't turn and your hops won't climb.
+### The course: `bhop_ascent`
 
-**⌨️ Learn the three keys that matter** — `W A S D` to move, `Space` (or the mouse wheel) to jump, and your mouse to steer. Everything else — duck, restart, records, settings — is a keypress away and waiting in the pause menu.
+Six stages, twenty-four pads plus a start deck, a checkpoint at the end of
+every stage, and a finish deck. Pads climb 22 u per hop along a spiral; gaps
+widen from 46 u to 78 u while pads shrink from 124 u to 90 u. A fall returns you
+to the last checkpoint and **the clock keeps running** — falling costs time, not
+your run. Best time and settings live in `localStorage` (invalid or missing data
+is handled gracefully; private-mode storage that throws is survivable).
 
-**🔁 Leave auto-hop on until you've found the rhythm** — it only re-jumps on the tick you land, never touching your direction or. Once the timing feels natural, flip it off and time the landings yourself. That's where the real lives.
+---
 
-**🛠️ Tinkering under the hood?** The simulation runs on a 128Hz with an accumulator, so your frame rate never buys you — only your hands do. The model, the map's gap curve, and a full scripted bot run are all covered by the test suite, so your changes get checked against the physics before they reach the course.
+## Play
 
-**⚠️ A note on distribution** — this is a browser game, free and self-contained. If you ever see a "download" for it bundled with an installer or a third-party launcher, that's not the official build. Play it from the source, keep it clean, and keep your run honest.
+- **Move:** `W A S D`
+- **Look:** mouse (pointer lock required)
+- **Jump:** `Space`, left click while locked, or the mouse wheel
+- **Pause / settings:** `P` or `Esc`
+- **Restart:** `R` (also in the pause menu)
+- **Toggle auto-hop:** `H` (also in the pause menu)
 
-**💙 for the hop** — every tick of this game was tuned by hand for the people who'll grind the strafe:,, just 250 u/s and the grind above it. Land the first hop clean, and welcome to the climb.
+The pause menu holds auto-hop, mouse sensitivity and "clear personal best".
 
-## Compatibility
+## Layout
 
-Runs best on a machine that thinks in 128Hz. The simulation is, so anything from a modest laptop to a high-refresh desktop gets the same physics — a 240Hz monitor sees smoother pictures, not faster strafes. That is the point: your hops belong to your hands and your mouse, not to your hardware.
+```
+src/
+  config.ts            every tunable constant
+  math.ts              vectors, angles, interpolation helpers
+  physics/
+    collision.ts       AABBs, axis-separated movement, support queries
+    body.ts            the fixed-timestep bunny-hop step (pure)
+  sim/
+    clock.ts           fixed-step accumulator + even splitter
+  input/
+    input.ts           pointer-lock-aware InputBuffer + DOM adapter
+  game/
+    course.ts          bhop_ascent geometry (data → brushes + checkpoints)
+    run.ts             run clock, checkpoints, falls, splits
+    loop.ts            the Game: clock + input + physics + run state
+    save.ts            localStorage records/settings, defensively parsed
+  render/
+    canvas.ts          read-only, interpolating Canvas 2D renderer
+  bot/
+    bot.ts             scripted bot = course completability proof
+tests/                 90 tests: clock, physics, input, course, run, save,
+                       loop, render, and the full bot run
+examples/site/         the playable page (index.html + game/main.ts)
+tools/
+  build-site.mjs       transpiles src/ → examples/site/game/src/ (no deps)
+  serve.mjs            zero-dependency static server
+  acceptance.mjs       headless-Chrome acceptance check
+```
 
-**Browsers.** Any modern browser with WebGL and pointer lock will carry you through the spiral. Chrome, Edge, Firefox, and Safari are the usual suspects; if the canvas wakes up and the crosshair locks, you are in business. Nothing else is required and nothing gets installed.
+## Running the checks
 
-**Frame rate.** The accumulator absorbs whatever refresh rate you throw at it — each frame's mouse motion is split evenly across the ticks it drives, and rendering interpolates between them. Low-end machines may want the HUD dialed back, but the model does not flinch.
+```bash
+node --test "tests/*.test.ts"   # or: npm test
+node tools/build-site.mjs
+node tools/acceptance.mjs       # needs Chrome/Edge; SKIPs cleanly if absent
+```
 
-**Input.** A mouse you can swing without the cable snagging, a wheel bound to jump, and a keyboard that does not ghost on `W A S D` + `Ctrl` at once. Pointer lock must be granted; without it the crosshair wanders and your strafe sync will read like a crime scene.
+The map test is the interesting one: `src/bot/bot.ts` samples candidate
+`(strafe, yaw-rate)` pairs against a copy of the physics body before each hop,
+keeps the one that actually lands near the next pad's centre, and replays it.
+It only presses keys a human can press and respects a bounded yaw rate. If it
+finishes the course, the course is completable; if a map edit breaks that, the
+test fails.
 
-**Saves and records.** Personal bests and splits live in `localStorage`, so they travel with the browser profile that earned them. Clear site data and your records go with it — a clean profile is a fresh start line.
+## Modding notes
 
-**Modding and forking.** The physics, map, and tests are plain modules with clear seams. If you want to bend the 30 u/s cap, rewrite the course, or drop a scripted bot on the start line, clone the foundation and make it yours — the map test will let you know if your curve spikes. Just remember that a and are the soul of the thing; keep them honest.
+- All numbers are in `src/config.ts`. `PHYSICS` is passed into the pure step,
+  so tests and experiments can build their own configs.
+- The course is data (`STAGES`, `START`); `buildCourse()` emits both the
+  renderer geometry and the collider from one definition.
+- Physics, clock, input core, course, run, save and the bot are DOM-free and
+  run under plain Node (>= 22.6, for built-in TypeScript stripping).
+- The renderer reads the body and never writes to it; the camera's pitch lives
+  only in the view and cannot change a hop.
 
-**Known edges.** A few older mobile browsers strip pointer lock or throttle the sim when the tab loses focus, and hopping on a trackpad is its own punishment. Desktop remains the home turf. For everything else, the Source-model arithmetic is and the spiral does not care who is holding the mouse.
+## Licence
 
-## Credits
-
-Nobody builds a bunny hop alone — not the kind that feels right, anyway. This one exists because a lot of patient people left the door open.
-
-**The Source crowd.** The in this game isn't invented, it's *remembered*. The per-tick air acceleration cap, the friction order, the half-gravity sandwich — that's all behaviour, reverse-engineered in public and written down by people who spent years staring at tick data instead of sleeping. Without those notes there is Bhop Browser Game, just a browser with gravity in it. Respect.
-
-**Every strafer who ever said "it feels wrong."** You are the reason the exists. You noticed the drift between refresh rates before the changelog did, and the whole simulation is more honest because of it.
-
-**The one-jump-at-a-time testers.** You fell off the beams. You fell off the beams *a lot*. You came back with timing notes instead of complaints, and the course is straighter for it.
-
-**The speedrunners and route checkers.** You found the pads that trade height for hope. You argued about centre-to-centre pitch in the comments with more precision than most physics papers. You kept the climb feeling earned.
-
-**And the player who just wants to hop.** Credits lists can read like a wall of names, so here's the short version: this game is free, and it stays free because a bunch of folks cared about one mechanic enough to sweat the details. If you landed a clean strafe chain today, you're carrying their work forward.
-
-Keep your, keep your sync, and don't blame the physics.
-
-## License
-
-This thing is free. Not "free with a premium tier," not "free until we get acquired," not "free but here's a newsletter you didn't ask for." Free as in you can open it, play it, read every line of it, take it apart, and put it back together wrong just to see what breaks.
-
-Here's the deal we're making with you:
-
-**Play it however you want.** Run it in your browser, host it on your own corner of the internet, throw it on a LAN party screen, speedrun it until your wrists file a complaint. account, telemetry, "sign in to continue." The game doesn't know who you are and prefers it that way.
-
-**Learn from it.** The code is right there, waiting to be read. Rip out the 128Hz accumulator and see why it matters. Break the air-accel cap and watch the whole skill ceiling collapse. Every physics file is unit-tested and every gap on the course is verified by a scripted bot — that's not decoration, that's an invitation to poke at it.
-
-**Mod it.** Recolor it. Rebuild the map. Swap the synthesised audio for your own samples. Bend the model into something the Source engine never imagined. If you ship a fork, a remix, or a total conversion, we genuinely want to see it — just don't slap a paywall on top of the original and call it your own work, and don't claim the model as your invention. It belongs to everyone who ever held a strafe key.
-
-**Credit is kind, not compulsory — but it's what keeps communities breathing.** If you build on this, nod in the general direction of where you got it. That's the whole social contract.
-
-** warranty, promises, lawyers lurking in the bushes.** This is a labour of love, shipped as-is. If it breaks, fork it and fix it — that's the fun part. If your run dies on the third jump of The Needle, that's not a bug, that's The Needle.
-
-** Valve assets were harmed in the making of this game.** The is a reproduction of publicly documented mechanics, but every line of code, every pad, every ring of landing FX is original. Play nice with that distinction.
-
-Now go hit a frame-perfect hop. The course isn't going to climb itself.
+Free as in "read every line, take it apart, put it back together wrong". See
+`LICENSE`.
