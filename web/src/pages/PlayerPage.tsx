@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { useLocation, useNavigate, useParams, Link } from 'react-router-dom';
 import { api, joinApiBase } from '../api';
-import type { MediaItem, SubtitleData } from '../types';
+import type { Cue, MediaItem, SubtitleData } from '../types';
 import {
   initialState,
   reduce,
@@ -33,9 +33,14 @@ import {
 import { linkedPlaybackPosition, playbackStartPosition } from '../player/playbackPosition';
 import { episodeNavigation } from '../player/episodeNavigation';
 import { formatClock, seekTimeFromFraction, progressFraction } from '../player/playerControls';
+import { realignCueIndex } from '../player/subtitleTimeline';
+import { nextAnalysisSelection } from '../player/selectionPin';
+import { createOffsetSync, type OffsetSyncResult } from '../player/offsetSync';
+import { createProgressSaver } from '../player/progressSync';
 
 const PLAYER_WIDTH_KEY = 'player-main-width';
 const SUBTITLE_ALWAYS_ON_KEY = 'player-subtitles-always-on';
+const NO_CUES: Cue[] = [];
 
 export default function PlayerPage() {
   const { id } = useParams();
@@ -65,6 +70,36 @@ export default function PlayerPage() {
   const [fullscreen, setFullscreen] = useState(false);
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
   const [episodeError, setEpisodeError] = useState(false);
+  const [offsetError, setOffsetError] = useState(false);
+  const subsRef = useRef<SubtitleData | null>(null);
+  const selectedCueIdxRef = useRef<number | null>(null);
+  // 上一轮渲染时的字幕与播放时间：用来区分“字幕时间轴被替换”和“用户移动了播放位置”。
+  const lastTimelineRef = useRef<{ cues: Cue[]; time: number } | null>(null);
+  // 偏移刷新后临时钉住的选中句，直到播放时间变化（用户 seek/继续播放）才解除。
+  const pinnedSelectionRef = useRef<{ cues: Cue[]; time: number } | null>(null);
+
+  useEffect(() => { subsRef.current = subs; }, [subs]);
+  useEffect(() => { selectedCueIdxRef.current = selectedAnalysisCueIdx; }, [selectedAnalysisCueIdx]);
+
+  // 偏移刷新落地：字幕换成新时间轴，选中句按“同一句”映射过去。
+  const applyOffsetResult = useCallback((result: OffsetSyncResult) => {
+    const nextIdx = realignCueIndex(subsRef.current, result.data, selectedCueIdxRef.current);
+    subsRef.current = result.data;
+    setSubs(result.data);
+    setSelectedAnalysisCueIdx(nextIdx);
+    setOffsetError(false);
+  }, []);
+
+  // 两个协调器都要跨渲染保持内部状态（代次、已载入媒体），因此只创建一次。
+  const [progressSaver] = useState(() =>
+    createProgressSaver((mediaId, positionSec) => { void api.saveProgress(mediaId, positionSec); }));
+  const [offsetSync] = useState(() =>
+    createOffsetSync({
+      setOffset: api.setOffset,
+      loadSubtitles: api.subtitles,
+      apply: applyOffsetResult,
+      onError: () => setOffsetError(true),
+    }));
 
   useEffect(() => {
     playerWidthRef.current = playerWidth;
@@ -83,7 +118,9 @@ export default function PlayerPage() {
   useEffect(() => {
     let cancelled = false;
     setSubs(null);
+    subsRef.current = null;
     setSubError(false);
+    setOffsetError(false);
     setLearn((state) => ({ ...initialState, alwaysOn: state.alwaysOn }));
     setTime(0);
     setDuration(0);
@@ -92,11 +129,24 @@ export default function PlayerPage() {
     setPanelMode('analysis');
     setExplainRequest({ id: 0, sentence: null });
     lastReplayAtRef.current = null;
+    lastTimelineRef.current = null;
+    pinnedSelectionRef.current = null;
+    offsetSync.invalidate();
+    progressSaver.mediaChanged();
     api.subtitles(mediaId)
-      .then((result) => { if (!cancelled) setSubs(result); })
+      .then((result) => {
+        if (cancelled) return;
+        subsRef.current = result;
+        setSubs(result);
+        offsetSync.reset(mediaId, result.offsetMs);
+      })
       .catch(() => { if (!cancelled) setSubError(true); });
-    return () => { cancelled = true; };
-  }, [mediaId]);
+    return () => {
+      cancelled = true;
+      // 离开页面时丢弃在途的偏移响应，避免它对已卸载的界面写回。
+      offsetSync.invalidate();
+    };
+  }, [mediaId, offsetSync, progressSaver]);
 
   useEffect(() => {
     api.listMedia()
@@ -130,14 +180,30 @@ export default function PlayerPage() {
     };
   }, [mediaId, initialSearch, navigate]);
 
-  const cues = subs?.cues ?? [];
+  const cues = subs?.cues ?? NO_CUES;
   const cueIdx = useMemo(() => currentCueIndex(cues, time), [cues, time]);
   const cue = cueIdx >= 0 ? cues[cueIdx] : null;
   const analysisCue = selectedAnalysisCueIdx == null ? null : cues[selectedAnalysisCueIdx] ?? null;
 
+  // 播放时间移动也会触发：暂停时在同一句内 seek，cueIdx 不变，但必须解除偏移刷新时
+  // 钉住的选中句，让面板跟随当前句。播放中 timeupdate 会频繁触发，但选中值不变时
+  // React 不会重渲染。
   useEffect(() => {
-    setSelectedAnalysisCueIdx((selectedCueIdx) => analysisCueIndex(selectedCueIdx, cueIdx, learn.paused));
-  }, [cueIdx, learn.paused]);
+    const previous = lastTimelineRef.current;
+    lastTimelineRef.current = { cues, time };
+    const next = nextAnalysisSelection({
+      cues,
+      time,
+      cueIdx,
+      paused: learn.paused,
+      selected: selectedCueIdxRef.current,
+      previous,
+      pin: pinnedSelectionRef.current,
+      followPaused: analysisCueIndex,
+    });
+    pinnedSelectionRef.current = next.pin;
+    setSelectedAnalysisCueIdx(next.selected);
+  }, [cueIdx, learn.paused, cues, time]);
 
   const runEffects = useCallback((effects: Effect[]) => {
     const v = videoRef.current;
@@ -208,32 +274,26 @@ export default function PlayerPage() {
     return () => window.removeEventListener('keydown', onKey);
   });
 
-  async function adjustOffset(deltaMs: number) {
+  function adjustOffset(deltaMs: number) {
     lastReplayAtRef.current = null;
-    if (!subs) return;
-    const next = subs.offsetMs + deltaMs;
-    await api.setOffset(mediaId, next);
-    const fresh = await api.subtitles(mediaId);
-    setSubs(fresh);
+    setOffsetError(false);
+    void offsetSync.adjust(deltaMs);
   }
 
-  const saveVideoPosition = useCallback((video: HTMLVideoElement | null) => {
-    if (video && Number.isFinite(video.currentTime) && video.currentTime > 0) {
-      void api.saveProgress(mediaId, video.currentTime);
-    }
-  }, [mediaId]);
-
-  // 視聴位置の保存（5 秒毎 + 一時停止/ページ移動時）
+  // 視聴位置の保存（5 秒毎 + 一時停止/ページ移動時）。
+  // 保存先は「その時点で実際に読み込まれている media」だけ。切集時に新しい <video> の
+  // currentTime を旧 mediaId へ書かないよう、保存は progressSaver の載入状態で判定する。
   useEffect(() => {
     const t = setInterval(() => {
       const v = videoRef.current;
-      if (v && !v.paused) saveVideoPosition(v);
+      if (v && !v.paused) progressSaver.save(mediaId, v.currentTime);
     }, 5000);
     return () => {
       clearInterval(t);
-      saveVideoPosition(videoRef.current);
+      // 旧 media の最後に記録した位置だけを補存する。新しい <video> は読まない。
+      progressSaver.flush();
     };
-  }, [saveVideoPosition]);
+  }, [mediaId, progressSaver]);
 
   const subtitleVisible = learn.alwaysOn || learn.revealed;
   const episodes = useMemo(() => episodeNavigation(mediaItems, mediaId), [mediaItems, mediaId]);
@@ -300,6 +360,8 @@ export default function PlayerPage() {
       <div className="player-main">
         <div ref={videoWrapRef} className={`video-wrap${isPaused ? ' is-paused' : ''}`}>
           <video
+            // 媒体元素与集数一一绑定：切集时重建，避免旧 src 的迟到事件按新 mediaId 归属。
+            key={mediaId}
             ref={videoRef}
             src={joinApiBase(`/api/media/${mediaId}/stream`)}
             autoPlay
@@ -315,13 +377,20 @@ export default function PlayerPage() {
               e.preventDefault();
               e.stopPropagation();
             }}
-            onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+            onLoadedMetadata={(e) => {
+              setDuration(e.currentTarget.duration);
+              // 元数据到达并完成起播定位之后，这一集的时间才可以归属 mediaId。
+              progressSaver.mediaLoaded(mediaId);
+            }}
             onDurationChange={(e) => setDuration(e.currentTarget.duration)}
-            onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+            onTimeUpdate={(e) => {
+              setTime(e.currentTarget.currentTime);
+              progressSaver.record(mediaId, e.currentTarget.currentTime);
+            }}
             onPlay={() => { setIsPaused(false); dispatch({ type: 'EXTERNAL_PLAY' }); }}
             onPause={(e) => {
               setIsPaused(true);
-              saveVideoPosition(e.currentTarget);
+              progressSaver.save(mediaId, e.currentTarget.currentTime);
               dispatch({ type: 'EXTERNAL_PAUSE' });
             }}
           />
@@ -412,6 +481,7 @@ export default function PlayerPage() {
           </section>
         )}
         {subError && <p className="warn">この動画に字幕がありません。学習モードは使えません。</p>}
+        {offsetError && <p className="warn" role="alert">字幕の時間調整を保存できませんでした。もう一度 [ / ] を押してください。</p>}
       </div>
       <div
         className="player-resizer"

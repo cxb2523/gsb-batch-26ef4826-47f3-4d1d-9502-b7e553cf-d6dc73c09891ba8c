@@ -95,6 +95,7 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
 | 文件名解析：支持 `SxxExx`、点分隔 scene 命名（`A.B.S02E01.1080p...-GROUP`）、`- NN`、`第NN話`；剥掉年份/版本 v2/发布组/画质/编码尾巴，得到干净作品名+集数，供 jimaku 按标题+集数匹配 | media/filename.ts |
 | H.265/HEVC Main 10 只在已验证的 macOS 浏览器路径 remux；Windows/Linux 保守标记「要トランスコード」，H.264 10-bit 等不兼容源同样不放行 | media/ffmpeg.ts decidePlayability |
 | 学习模式：首次默认无字幕；Space 暂停+显示；A 回句首（快速连按回上一句）；←/→ 跳句；S 常显且开关在浏览器本地保持；[ ] 偏移±100ms；右侧解析独立保持已选句，重听时不消失；页面快捷键提示可直接点击 | player/learningMode.ts + PlayerPage |
+| 字幕偏移贯通与竞态隔离：调整偏移后重新拉取字幕，当前句索引/解析面板选中句/字幕可见性都按新时间轴重算；解析面板按源时间轴把同一句映射到新索引并临时钉住，直到播放时间变化才恢复跟随；偏移请求串行化+代次标记，快速连按合并为累计目标、过期响应丢弃；切集/离页只保存当前 mediaId 的进度（`progressSync` 记录已载入媒体，`<video key>` 与集数绑定），偏移响应不会写回已切走的字幕 | player/subtitleTimeline.ts + offsetSync.ts + progressSync.ts + selectionPin.ts + PlayerPage |
 | 桌面播放器布局：视频/解析面板之间可拖动调宽并记住宽度；自定义全屏会将视频、状态和字幕层一起全屏 | PlayerPage + playerLayout.ts |
 | 播放控制条：不用原生 controls（各浏览器行为不一、会自动隐藏且此环境不渲染），改自绘常显进度条+当前/总时长+播放暂停+可拖动 seek；全屏按钮与进度条默认隐藏，hover 到画面或暂停时才出现；去掉了会挡画面的模式徽章 | PlayerPage + playerControls.ts |
 | 播放器同目录选集：列出当前物理目录中的可播放视频，提供上一话、下一话与直接选集；切集时重置字幕、学习句和讲解状态 | PlayerPage + episodeNavigation.ts |
@@ -103,7 +104,7 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
 | AI 深度讲解：D 键，设置页可选 Anthropic、DeepSeek、OpenAI（Codex / GPT）或 Google Gemini；统一输出{翻译/语法结构/表现/语气}，只给原句中出现的日语汉字标读音，解释新增术语不标；讲解语言中/英二选一，默认按浏览器 `Accept-Language`（→ 服务器 OS locale → en）自动判定，设置页可固定；按格式版本/服务/模型/语言/句子缓存 | ai/explain.ts + ai/language.ts |
 | jimaku 字幕匹配：每系列候选选一次→存 jimaku_mapping→**同系列其余集自动下载**（选完立即 reconcile，2.5s 间隔防限流，.srt 优先跳过压缩包）；启动/扫描/watcher 也会补下有映射的缺字幕集 | jimaku/* + sync.ts |
 | 生词本：词/句收藏（带出处+时间戳，去重），详情页显示本地释义、既有 AI 缓存和精准播放链接；一键创建/更新 Anki 的 `tanku Anime` 牌组 | vocab/anki.ts + routes.ts + VocabPage + VocabDetailPage |
-| 观看进度：5 秒一存，暂停/离页补存；重新进入自动恢复，带 `?t=` 的生词链接一次性优先 | misc/routes.ts + playbackPosition.ts + PlayerPage |
+| 观看进度：5 秒一存，暂停/离页补存；保存绑定到当前载入视频的 mediaId，切集时只补存上一集最后记录的位置；重新进入自动恢复，带 `?t=` 的生词链接一次性优先 | misc/routes.ts + playbackPosition.ts + progressSync.ts + PlayerPage |
 | 动画发现：首页实时显示当前季/上季、学习向 3 部推荐、日/英/罗马字搜索、响应式卡片 | catalog/* + DiscoverPage |
 | 作品详情：简介/评分/制作公司、AniList HTTPS 官方播放与官网链接、本地媒体库入口 | AnimeDetailPage |
 | 本机下载交接：按季度过滤错季结果，整季/可直接播放/1080p/可信/多字幕智能排序，再用合法 magnet 交给本机下载器 | resource/* + ResourceResults |
@@ -293,6 +294,18 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
   针对性测试覆盖“重扫修复损坏副本”和“remux 后自动回退 H.264”；实际 `npm test` 为 server 260、web 63 全绿，server
   `tsc --noEmit` 通过。该回退只处理原本可 remux、却生成了无效副本的文件，不改变 H.264 10-bit 等主动判为不兼容源的策略。
 
+- 2026-11-23：**字幕偏移与原句对齐、观看进度切集隔离**。`[` `]` 调整后不再只改服务端：重新拉取字幕后，
+  当前句/解析面板选中句/字幕可见性都按新时间轴重算；解析面板用 `realignCueIndex` 按源时间轴找到同一句
+  （偏移只平移时间、不改变源时间），并临时钉到播放时间变化为止（`selectionPin`，StrictMode 双次调用幂等）。
+  偏移请求经 `createOffsetSync` 串行化并发代次：快速连按合并成累计目标，过期 PUT/GET 响应一律丢弃；
+  失败回退到服务端已确认的偏移。观看进度改由 `createProgressSaver` 记录“已载入视频的 mediaId”，
+  切集先补存上一集最后位置再解绑，`<video key={mediaId}>` 与集数绑定，旧 src 迟到事件不会写到新一集。
+  浏览器实测（隔离 DATA_DIR/MEDIA_DIR、320×180 无音轨 WebM 样片、两集、全程静音/暂停）：
+  4.5s 处连按 5 次 `[` → 偏移 -500ms，列表/覆盖层重算到二句目、解析面板保持一句目，seek 后恢复跟随；
+  切集后第 2 集进度为 0、第 1 集保持原值；人为卡住第 1 集偏移 PUT 再切集，响应到达后第 2 集
+  偏移与字幕不受影响，控制台无报错。新增纯逻辑测试覆盖偏移重算、快速连按/乱序响应、切集保存隔离；
+  web 测试 96 项、server 261 项全绿，两端 `tsc --noEmit` 与 web production build 通过。
+
 ## 4. 关键决策记录（为什么这么做）
 
 - **本地 Web 应用而非 Electron/mpv 插件**：开发快、UI 灵活、用户可远程访问；用户确认过。
@@ -458,6 +471,14 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
   `/` 开头且非 `//` 的站内路径。取得方法写成日文 3 步 + 直达按钮，数据放纯模块便于改文案与测试；不做应用内 OAuth/注册代办。
 - **可调参数只走环境变量，脚本零交互**（2026-08-17）：`curl | bash` / `irm | iex` 下 stdin 是管道，无法可靠提问；
   `TANKU_INSTALL_DIR` / `TANKU_REF` / `TANKU_NO_LAUNCH` / `TANKU_SKIP_JMDICT` 四个开关够用。
+- **偏移调整是“服务端持久化 + 重新拉取”，不在前端本地平移 cue**（2026-11-23）：服务端 GET 已经应用
+  `offset_ms`，前端再平移会双重计数；重新拉取还能保证与服务端取整后的值一致。解析面板的“保持同一句”
+  以源时间轴（`start - offsetMs/1000`）为同一性依据，而不是索引——偏移只平移时间，源时间不变。
+- **偏移请求串行化 + 代次，而不是防抖**（2026-11-23）：串行保证服务端按顺序落库，代次保证只有最新一次
+  的响应能写回界面；连按被合并成一个累计目标，所以连续微调不会因为网络乱序回跳。
+- **进度保存绑定“已载入视频的 mediaId”，而不是渲染时的 mediaId**（2026-11-23）：`<video>` 换 src 到
+  元数据载入之间存在时间窗，此时 `currentTime` 仍是旧值；只信任 `loadedmetadata` 之后的归属才能
+  避免把上一集的时间写到新一集。
 
 ## 5. 已知小问题 / 待打磨
 
