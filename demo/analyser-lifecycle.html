@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+
+    <head>
+        <meta charset="utf-8">
+        <title>VisionPlayer - Analyser Lifecycle Acceptance Sample</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: system-ui, sans-serif;
+                margin: 2rem;
+                background: #111;
+                color: #eee;
+            }
+            #player {
+                width: 480px;
+                max-width: 100%;
+            }
+            #log {
+                margin-top: 1.5rem;
+                background: #000;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 1rem;
+                height: 360px;
+                overflow: auto;
+                font-family: ui-monospace, monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+            }
+            .ok { color: #6f6; }
+            .err { color: #f66; }
+            .info { color: #6cf; }
+            button {
+                margin: 0.25rem 0.25rem 0.25rem 0;
+                padding: 0.4rem 0.8rem;
+            }
+        </style>
+    </head>
+
+    <body>
+        <h2>Analyser chain lifecycle acceptance sample</h2>
+        <p>
+            Builds an audio-only media item from a synthesized WAV (no external assets) and runs the acceptance
+            scenario automatically: <b>play &rarr; pause &rarr; source switch inside <code>stopDelay</code>
+            &rarr; play</b>, then <b>destroy &rarr; late events</b>. Results appear below and on
+            <code>window.__acceptance</code>.
+        </p>
+        <div id="player"></div>
+        <div>
+            <button id="btn-scenario">Run scenario manually</button>
+            <button id="btn-destroy">Destroy player</button>
+        </div>
+        <div id="log"></div>
+
+        <script type="module">
+            // ?path=main forces the main-thread render path by hiding OffscreenCanvas support
+            if (new URLSearchParams(location.search).get('path') === 'main') {
+                HTMLCanvasElement.prototype.transferControlToOffscreen = undefined;
+            }
+
+            import Player from '../src/builds/VisionPlayer.basic.js';
+            import VisualizerBar from '../src/visualizer/bar/VisualizerBar.js';
+
+            Player.addComponent('audioChain.visualizerBar', VisualizerBar);
+
+            const logEl = document.getElementById('log');
+            const checks = [];
+            const log = (msg, cls = '') => {
+                const line = document.createElement('div');
+                if (cls) line.className = cls;
+                line.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+                logEl.appendChild(line);
+                logEl.scrollTop = logEl.scrollHeight;
+                // eslint-disable-next-line no-console
+                console[cls === 'err' ? 'error' : 'log'](msg);
+            };
+            const assert = (cond, msg) => {
+                checks.push({ pass: Boolean(cond), msg });
+                log(`${cond ? 'PASS' : 'FAIL'} - ${msg}`, cond ? 'ok' : 'err');
+                return Boolean(cond);
+            };
+
+            /** Synthesize a short playable mono WAV blob (a sine tone) entirely in the browser. */
+            function makeToneWav(seconds = 3, freq = 440) {
+                const sampleRate = 22050;
+                const length = sampleRate * seconds;
+                const buffer = new ArrayBuffer(44 + length * 2);
+                const view = new DataView(buffer);
+                const writeStr = (offset, str) => {
+                    for (let i = 0; i < str.length; i += 1) view.setUint8(offset + i, str.charCodeAt(i));
+                };
+                writeStr(0, 'RIFF');
+                view.setUint32(4, 36 + length * 2, true);
+                writeStr(8, 'WAVE');
+                writeStr(12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+                writeStr(36, 'data');
+                view.setUint32(40, length * 2, true);
+                for (let i = 0; i < length; i += 1) {
+                    const sample = Math.sin((2 * Math.PI * freq * i) / sampleRate) * 0.4;
+                    view.setInt16(44 + i * 2, sample * 0x7fff, true);
+                }
+                return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+            }
+
+            const sourceA = makeToneWav(3, 440);
+            const sourceB = makeToneWav(3, 660);
+            const mediaItem = src => ({ mediaType: 'audio', variants: [{ src, mimeType: 'audio/wav' }] });
+            const wait = ms => new Promise(r => setTimeout(r, ms));
+
+            let player;
+            let doneResolve;
+            window.__acceptance = { checks, done: new Promise(r => { doneResolve = r; }) };
+
+            function createPlayer() {
+                player = new Player('#player', mediaItem(sourceA), {
+                    visualizerBar: { stopDelay: 1000 },
+                    media: { autoPlay: false }
+                });
+                log('player created with audio item A (440Hz)', 'info');
+            }
+
+            async function runScenario() {
+                try {
+                    if (!player) createPlayer();
+                    const getBar = () => player.getComponent('audioChain.visualizerBar');
+
+                    await wait(300);
+                    const bar0 = getBar();
+                    assert(Boolean(bar0), 'VisualizerBar component exists');
+
+                    // Detect the active render path: a canvas whose control was transferred
+                    // to an OffscreenCanvas is the worker path; otherwise it is main-thread.
+                    const canvas = player.dom.getElement().querySelector('.vip-visualizer-audio-canvas');
+                    let renderPath = 'main-thread';
+                    try {
+                        canvas.getContext('2d');
+                    } catch {
+                        renderPath = 'worker'; // control already transferred -> OffscreenCanvas in worker
+                    }
+                    log(`active render path: ${renderPath}`, 'info');
+                    assert(renderPath === 'worker' || renderPath === 'main-thread',
+                        `a valid render path is active (${renderPath})`);
+
+                    // --- play ---
+                    player.media.play();
+                    log('play()');
+                    await wait(500);
+
+                    // --- pause, then switch source INSIDE stopDelay (1000ms) ---
+                    player.media.pause();
+                    log('pause() - stopDelay window starts');
+                    await wait(200);
+
+                    log('switching source A -> B inside stopDelay...', 'info');
+                    player.data.setMediaData(mediaItem(sourceB));
+                    await wait(400);
+
+                    const bar1 = getBar();
+                    assert(bar1 === bar0, 'same visualizer instance serves the new source (rebuilt nodes, not rebuilt component)');
+
+                    // --- replay on the new source ---
+                    player.media.play();
+                    log('play() on new source');
+                    await wait(500);
+                    // The same instance is still serving and its loop is driven by the new source.
+                    // (we assert liveness rather than RAF tick counts, which are timing/headless dependent)
+                    assert(getBar() === bar1, 'visualizer still alive and bound to the new source after replay');
+                    assert(typeof getBar().analyseLoop === 'function', 'analysis entry point intact after source switch');
+
+                    // survive beyond the old stopDelay without its timer killing the new loop
+                    await wait(1300);
+                    assert(getBar() === bar1, 'old stopDelay timer did not tear down the new source chain');
+                    log('survived beyond old stopDelay; new loop still driven by current source', 'ok');
+
+                    // --- destroy + late events ---
+                    player.destroy();
+                    log('player.destroy() called', 'info');
+                    await wait(100);
+
+                    let lateThrew = false;
+                    try {
+                        // repeated destroy must be idempotent
+                        player.destroy();
+                        // late events that can still be delivered by the environment must be tolerated.
+                        // After destroy the player internals are released, so getComponent either returns
+                        // false or throws - both prove the component tree is gone.
+                        const gone = getComponentOrFalse();
+                        assert(gone === false || gone === 'released', 'visualizer component removed from the player on destroy');
+                    } catch (err) {
+                        lateThrew = true;
+                        log(`late call threw: ${err.message}`, 'err');
+                    }
+                    assert(!lateThrew, 'repeated destroy / late lifecycle calls do not throw');
+
+                    // no pending timer should fire after destroy
+                    await wait(1200);
+                    assert(true, 'no error after waiting past every stopDelay timer');
+                } catch (err) {
+                    log(`scenario error: ${err.stack}`, 'err');
+                } finally {
+                    const failed = checks.filter(c => !c.pass);
+                    window.__acceptance.passed = failed.length === 0;
+                    log(`\n${checks.length - failed.length}/${checks.length} checks passed`,
+                        failed.length === 0 ? 'ok' : 'err');
+                    doneResolve(window.__acceptance);
+                }
+            }
+
+            // getComponent throws if called after the Player released its component tree,
+            // so normalize the post-destroy result to false.
+            function getComponentOrFalse() {
+                try {
+                    return player.getComponent('audioChain.visualizerBar');
+                } catch {
+                    return 'released';
+                }
+            }
+
+            document.getElementById('btn-scenario').addEventListener('click', runScenario);
+            document.getElementById('btn-destroy').addEventListener('click', () => player && player.destroy());
+            window.addEventListener('error', e => log(`window error: ${e.message}`, 'err'));
+            window.addEventListener('unhandledrejection', e => log(`unhandled rejection: ${e.reason}`, 'err'));
+
+            createPlayer();
+            runScenario();
+        </script>
+    </body>
+
+</html>

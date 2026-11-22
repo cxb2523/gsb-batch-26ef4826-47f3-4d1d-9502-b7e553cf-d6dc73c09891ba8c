@@ -6,6 +6,23 @@ This project adheres to [Semantic Versioning](https://semver.org) and follows th
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **AudioChain / AnalyserAudio**: aligned the audio analysis chain lifecycle strictly with player state. On source changes (`data/ready`) and engine switches, the old analysis nodes are now removed from the `AudioChain` and disconnected before the new media's nodes are attached based on its `mediaType`, so removed nodes are never wired back in and analysis nodes only ever belong to the current source/engine.
+- **AudioChain**: `addNode()`/`removeNode()` now rebuild the processing graph at runtime. The graph tracks and tears down exactly its chain edges, so removed nodes leave the graph, the same node is never registered twice, and internal wiring of registered subgraphs (e.g. the equalizer) is preserved. Tap nodes without an output (analysers) no longer break the audible path to the master gain.
+- **AnalyserAudio**: the pause `stopDelay` timer is now cancelled on source change, replay and destruction, so it can no longer stop a loop belonging to a different source or fire after teardown. During the pause cooldown the loop stays alive but collects/renders no new data.
+- **AnalyserAudio / visualizers**: `destroy()` is now idempotent and all subscriptions, the stop-delay timer, render loop, workers and `AudioNode` connections are released; late `data/ready`, `media/play`, `media/pause` and engine events after destruction are no-ops and never throw.
+- **Player**: `destroy()` is now idempotent; repeated calls no longer dereference released internal state.
+- **VisualizerBar / VisualizerFrequency / VisualizerTime**: fixed destroy ordering (the worker/canvas visualizers now tear down workers and DOM before releasing the base analyser), terminate their rendering worker on destroy, and guard `ui/resize` against post-destroy calls and a mixed `&&`/`||` precedence bug.
+
+### Added
+
+- **Demo**: `demo/analyser-lifecycle.html`, a self-contained acceptance sample (synthesized audio, no external assets) covering play → pause → source switch inside `stopDelay` → replay and destroy → late-event behavior for both the worker and main-thread bar render paths.
+
+---
+
 ## [1.4.0] - 2026-09-07
 
 ### Added

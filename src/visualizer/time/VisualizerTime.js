@@ -58,6 +58,12 @@ export default class VisualizerTime extends AnalyserAudio {
     #worker;
 
     /**
+     * Flag indicating if this component has been destroyed.
+     * @type {boolean}
+     */
+    #destroyed = false;
+
+    /**
      * Indicates if OffscreenCanvas worker rendering is used.
      * @type {OffscreenCanvas|undefined}
      */
@@ -190,8 +196,8 @@ export default class VisualizerTime extends AnalyserAudio {
      */
     #resize = () => {
 
-        // TODO: maybe a bit too brittle, refactor later with own state?
-        if (!this.#canvas && !this.#worker || !this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
+        if (this.#destroyed || (!this.#canvas && !this.#worker)) return;
+        if (!this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
 
         const ele = this.#dom.canvas,
               deviceRatio = window.devicePixelRatio ?? 1,
@@ -210,12 +216,15 @@ export default class VisualizerTime extends AnalyserAudio {
      */
     destroy() {
 
+        if (this.#destroyed) return;
+        this.#destroyed = true;
+
         this.#worker?.terminate();
+        this.#worker = null;
         this.#dom.destroy();
         this.#player.unsubscribe(this.#subscriptions);
-        this.#player = this.#dom = this.#worker = this.#canvas = this.#apiKey = null;
-
         super.destroy();
+        this.#player = this.#dom = this.#canvas = this.#apiKey = null;
 
     }
 

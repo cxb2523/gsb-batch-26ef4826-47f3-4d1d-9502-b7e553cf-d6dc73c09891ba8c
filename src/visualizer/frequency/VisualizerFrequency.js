@@ -75,6 +75,12 @@ export default class VisualizerFrequency extends AnalyserAudio {
     #worker;
 
     /**
+     * Flag indicating if this component has been destroyed.
+     * @type {boolean}
+     */
+    #destroyed = false;
+
+    /**
      * Creates an instance of the VisualizerFrequency component.
      * @param {module:src/core/Player}     player            Reference to the VisionPlayer instance.
      * @param {module:src/util/AudioChain} parent            Reference to the parent instance.
@@ -170,7 +176,8 @@ export default class VisualizerFrequency extends AnalyserAudio {
     #resize = () => {
 
         // TODO: maybe a bit too brittle, refactor later with own state?
-        if (!this.#canvas && !this.#worker || !this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
+        if (this.#destroyed || (!this.#canvas && !this.#worker)) return;
+        if (!this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
 
         const ele = this.#dom.canvas,
               deviceRatio = window.devicePixelRatio ?? 1,
@@ -189,11 +196,15 @@ export default class VisualizerFrequency extends AnalyserAudio {
      */
     destroy() {
 
+        if (this.#destroyed) return;
+        this.#destroyed = true;
+
         this.#worker?.terminate();
+        this.#worker = null;
         this.#dom.destroy();
         this.#player.unsubscribe(this.#subscriptions);
-        this.#player = this.#dom = this.#worker = this.#apiKey = null;
         super.destroy();
+        this.#player = this.#dom = this.#apiKey = null;
 
     }
 

@@ -75,6 +75,12 @@ export default class VisualizerBar extends AnalyserAudio {
     #worker;
 
     /**
+     * Flag indicating if this component has been destroyed.
+     * @type {boolean}
+     */
+    #destroyed = false;
+
+    /**
      * Creates an instance of the VisualizerBar component.
      * @param {module:src/core/Player}     player            Reference to the main player instance.
      * @param {module:src/util/AudioChain} parent            Reference to the parent instance.
@@ -173,7 +179,8 @@ export default class VisualizerBar extends AnalyserAudio {
     #resize = () => {
 
         // TODO: maybe a bit too brittle, refactor later with own state?
-        if (!this.#canvas && !this.#worker || !this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
+        if (this.#destroyed || (!this.#canvas && !this.#worker)) return;
+        if (!this.#player.dom.getElement(this.#apiKey).classList.contains('has-audio-analyser')) return;
 
         const ele = this.#dom.canvas,
               deviceRatio = window.devicePixelRatio ?? 1,
@@ -188,14 +195,20 @@ export default class VisualizerBar extends AnalyserAudio {
     };
 
     /**
-     * Cleans up all events, subscriptions, and DOM nodes created by this component.
+     * Cleans up all events, subscriptions, workers and DOM nodes created by this component.
      */
     destroy() {
 
+        if (this.#destroyed) return;
+        this.#destroyed = true;
+
+        this.#worker?.terminate();
+        this.#worker = null;
         this.#dom.destroy();
-        this.#dom = this.#apiKey = null;
         this.#player.unsubscribe(this.#subscriptions);
         super.destroy();
+        this.#dom = this.#canvas = this.#apiKey = null;
+        this.#player = null;
 
     }
 

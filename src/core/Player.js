@@ -713,8 +713,12 @@ export default class Player {
      * This is the "cleanup method" which should be called when removing the player.
      * It is strongly recommended to do so to prevent memory leaks and possible other unwanted side effects.
      * This method removes all component, as well as the player root element.
+     * Safe to call repeatedly: after the first call every subsequent invocation is a no-op.
      */
     destroy() {
+
+        // idempotent teardown - late or duplicated destroy() calls must not throw
+        if (!this.#components) return;
 
         if (this.#config.player.initOnIntersection) this.#intersectionObserver.disconnect();
         if (this.#config.player.initOnIdle) {
