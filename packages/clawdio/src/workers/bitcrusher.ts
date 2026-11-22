@@ -31,6 +31,12 @@ class BitcrusherWorklet extends AudioWorkletProcessor {
   bits = 4;
   normfreq = 0.1;
 
+  /**
+   * Bits received via `set-bits` before the WASM module finished loading.
+   * They're applied when `init-module` arrives so early messages aren't lost.
+   */
+  pendingBits: number | null = null;
+
   constructor() {
     super();
 
@@ -49,14 +55,23 @@ class BitcrusherWorklet extends AudioWorkletProcessor {
 
     if (event.type === "init-module") {
       const { bits } = event.data;
-      this.bits = bits;
-      this.worklet = BitcrusherModule.new(bits);
+      // A `set-bits` message may have arrived before the module was ready;
+      // that value wins over the initial config.
+      this.bits = this.pendingBits ?? bits;
+      this.pendingBits = null;
+      this.worklet = BitcrusherModule.new(this.bits);
     }
 
     // Setters for internal properties (since we can't mutate this directly)
     if (event.type === "set-bits") {
       this.bits = event.data;
-      // @TODO: Update the underylinng module
+      if (this.worklet) {
+        // Forward to the Rust module so the next process() uses the new value.
+        this.worklet.set_bits(event.data);
+      } else {
+        // WASM not ready yet - remember it for init-module.
+        this.pendingBits = event.data;
+      }
     }
     if (event.type === "set-normfreq") {
       this.normfreq = event.data;

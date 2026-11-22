@@ -111,28 +111,28 @@ export const items = [
 
 ### Resonance
 
+The helper returns `setResonance`, which posts a message to the worklet. The
+worklet forwards it to the Rust module's `set_resonance`, which recomputes the
+filter coefficients immediately so the next audio block uses the new value —
+no node rebuild, no audio interruption. Negative values are clamped to 0 and
+`NaN` is ignored.
+
 ```tsx
 const moog = await createMoogNode(context);
-const moogNode = moog.node;
 
-const setResonance = (resonance: number) => {
-  moogNode.port.postMessage({ type: "set-resonance", data: resonance });
-};
-
-// Set the bits inside worklet anytime you need
-setResonance(1);
+// Adjust resonance anytime, e.g. from a slider
+moog.setResonance(1);
 ```
 
 ### Cutoff
 
 ```tsx
 const moog = await createMoogNode(context);
-const moogNode = moog.node;
 
-const setCutoff = (cutoff: number) => {
-  moogNode.port.postMessage({ type: "set-cutoff", data: cutoff });
-};
-
-// Set the bits inside worklet anytime you need
-setCutoff(1);
+// Adjust cutoff anytime, e.g. from a slider
+moog.setCutoff(1);
 ```
+
+Cutoff is clamped to `0..=1`. If either message arrives before the WASM module
+finished initializing, the worklet caches it and applies it when `init-module`
+arrives, so parameter changes made during startup aren't lost.

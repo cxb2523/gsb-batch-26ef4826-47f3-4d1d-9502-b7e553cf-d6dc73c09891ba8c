@@ -1,6 +1,10 @@
 import BitcrusherWorklet from "@/workers/bitcrusher.ts?worker&url";
 import "clawdio-bitcrusher/clawdio_bitcrusher_bg.wasm?no-inline";
 import BitcrusherWasmPath from "clawdio-bitcrusher/clawdio_bitcrusher_bg.wasm?url&no-inline";
+import type {
+  BitcrusherEventSetBits,
+  BitcrusherEventSetNormfreq,
+} from "@/workers/bitcrusher";
 import { CustomAudioWorkletNode } from "./types";
 import { assertNode, createWorkletNode } from "./utils";
 
@@ -21,15 +25,25 @@ const createBitcrusherNode = async (
 ) => {
   let nodeRef: AudioWorkletNode | null = null;
 
-  // Setter functions to communicate with worklet params
+  // Setter functions to communicate with worklet params. These always post a
+  // message to the worklet's MessagePort so the parameter update reaches the
+  // WASM module it owns. Never mutate the worklet state directly.
   const setBits = (newBits: number) => {
     if (!nodeRef) return;
-    nodeRef.port.postMessage({ type: "set-bits", data: newBits });
+    const message: BitcrusherEventSetBits = {
+      type: "set-bits",
+      data: newBits,
+    };
+    nodeRef.port.postMessage(message);
   };
 
   const setNormfreq = (newFreq: number) => {
     if (!nodeRef) return;
-    nodeRef.port.postMessage({ type: "set-normfreq", data: newFreq });
+    const message: BitcrusherEventSetNormfreq = {
+      type: "set-normfreq",
+      data: newFreq,
+    };
+    nodeRef.port.postMessage(message);
   };
 
   // Create the node and return it

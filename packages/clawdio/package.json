@@ -19,6 +19,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "test": "node --import ./test/support/register-loader.mjs --test \"test/*.test.mjs\"",
+    "test:e2e": "node --import ./test/support/register-real-loader.mjs --test \"test/*.e2e.mjs\"",
     "format": "prettier --write src/**/*.{css,js,tsx,json}",
     "preview": "vite preview",
     "commit": "npx cz"

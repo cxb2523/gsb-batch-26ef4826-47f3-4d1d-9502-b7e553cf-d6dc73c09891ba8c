@@ -1,4 +1,4 @@
-import { AudioWorkletInitWasmEvent } from "./types";
+import type { AudioWorkletInitWasmEvent } from "./types";
 
 export const initWasm = (
   event: AudioWorkletInitWasmEvent,

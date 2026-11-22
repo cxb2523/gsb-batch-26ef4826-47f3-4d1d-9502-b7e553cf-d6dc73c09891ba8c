@@ -1,6 +1,7 @@
 import MoogWorklet from "@/workers/moog.ts?worker&url";
 import "clawdio-moog/clawdio_moog_bg.wasm?no-inline";
 import MoogWasmPath from "clawdio-moog/clawdio_moog_bg.wasm?url&no-inline";
+import type { MoogEventSetCutoff, MoogEventSetResonance } from "@/workers/moog";
 import { CustomAudioWorkletNode } from "./types";
 import { assertNode, createWorkletNode } from "./utils";
 
@@ -21,15 +22,25 @@ const createMoogNode = async (
 ) => {
   let nodeRef: AudioWorkletNode | null = null;
 
-  // Setter functions to communicate with worklet params
+  // Setter functions to communicate with worklet params. These always post a
+  // message to the worklet's MessagePort so the parameter update reaches the
+  // WASM module it owns. Never mutate the worklet state directly.
   const setResonance = (newResonance: number) => {
     if (!nodeRef) return;
-    nodeRef.port.postMessage({ type: "set-resonance", data: newResonance });
+    const message: MoogEventSetResonance = {
+      type: "set-resonance",
+      data: newResonance,
+    };
+    nodeRef.port.postMessage(message);
   };
 
   const setCutoff = (newCutoff: number) => {
     if (!nodeRef) return;
-    nodeRef.port.postMessage({ type: "set-cutoff", data: newCutoff });
+    const message: MoogEventSetCutoff = {
+      type: "set-cutoff",
+      data: newCutoff,
+    };
+    nodeRef.port.postMessage(message);
   };
 
   // Create the node and return it

@@ -112,32 +112,30 @@ export const items = [
 
 ### Bits
 
+The helper returns `setBits`, which posts a message to the worklet. The worklet
+forwards it to the Rust module's `set_bits` so the next audio block already
+crushes at the new depth — no node rebuild, no audio interruption. Values are
+clamped to `1..=32`; `NaN` is ignored.
+
 ```tsx
 const bitcrusher = await createBitcrusherNode(context, 4, 0.1);
-const bitcrusherNode = bitcrusher.node;
 
-const setBits = (newBits: number) => {
-  bitcrusherNode.port.postMessage({ type: "set-bits", data: newBits });
-};
-
-// Set the bits inside worklet anytime you need
-setBits(4);
+// Adjust the depth anytime, e.g. from a slider
+bitcrusher.setBits(2);
 ```
 
 ### Norm Freq
 
 ```tsx
 const bitcrusher = await createBitcrusherNode(context, 4, 0.1);
-const bitcrusherNode = bitcrusher.node;
-
-const setNormfreq = (newFreq: number) => {
-  if (!nodeRef) return;
-  nodeRef.port.postMessage({ type: "set-normfreq", data: newFreq });
-};
 
 // Set the norm freq inside worklet anytime you need
-setNormfreq(1);
+bitcrusher.setNormfreq(1);
 ```
+
+If a `set-bits`/`set-normfreq` message arrives before the WASM module finished
+initializing, the worklet caches it and applies it when `init-module` arrives,
+so parameter changes made during startup aren't lost.
 
 ## Video Example
 

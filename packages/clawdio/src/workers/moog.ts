@@ -31,6 +31,13 @@ class MoogWorklet extends AudioWorkletProcessor {
   cutoff = 0.065;
   resonance = 3.5;
 
+  /**
+   * Parameter messages received before the WASM module was initialized.
+   * They're applied once `init-module` arrives so early messages aren't lost.
+   */
+  pendingCutoff: number | null = null;
+  pendingResonance: number | null = null;
+
   constructor() {
     super();
 
@@ -48,17 +55,39 @@ class MoogWorklet extends AudioWorkletProcessor {
     initWasm(event as AudioWorkletInitWasmEvent, init, this.port);
 
     if (event.type === "init-module") {
-      const { cutoff = 0.065, resonance = 3.5 } = event.data;
-      this.worklet = MoogModule.new(cutoff, resonance);
+      const {
+        cutoff = this.cutoff,
+        resonance = this.resonance,
+      } = event.data;
+
+      // Values that arrived before init-module take precedence over the
+      // initial config, so a slider moved during startup still wins.
+      this.cutoff = this.pendingCutoff ?? cutoff;
+      this.resonance = this.pendingResonance ?? resonance;
+      this.pendingCutoff = null;
+      this.pendingResonance = null;
+
+      this.worklet = MoogModule.new(this.cutoff, this.resonance);
     }
 
     // Setters for internal properties (since we can't mutate this directly)
     if (event.type === "set-cutoff") {
       this.cutoff = event.data;
-      // @TODO: Update the underylinng module
+      if (this.worklet) {
+        // Forward to the Rust module so the next process() uses the new value.
+        this.worklet.set_cutoff(event.data);
+      } else {
+        // WASM not ready yet - remember it for init-module.
+        this.pendingCutoff = event.data;
+      }
     }
     if (event.type === "set-resonance") {
       this.resonance = event.data;
+      if (this.worklet) {
+        this.worklet.set_resonance(event.data);
+      } else {
+        this.pendingResonance = event.data;
+      }
     }
   };
 
