@@ -181,19 +181,26 @@ export class AllpassNodeUI extends DSPNode {
     onRemoved() {
         if (this.workletNode) {
             try { this.inputNode.disconnect(this.workletNode); } catch (e) { }
-            try { this.workletNode.disconnect(); } catch (e) { }
             try { this.workletNode.port.postMessage({ type: 'reset' }); } catch (e) { }
+            try { this.workletNode.port.onmessage = null; } catch (e) { }
+            try { this.workletNode.disconnect(); } catch (e) { }
             this.workletNode = null;
         }
         if (this.legacyGraph) {
-            try { this.delay.disconnect(); } catch (e) { }
-            try { this.g_ff.disconnect(); } catch (e) { }
-            try { this.g_fb.disconnect(); } catch (e) { }
-            try { this.sumIn.disconnect(); } catch (e) { }
-            try { this.sumOut.disconnect(); } catch (e) { }
+            if (this.delay) { try { this.delay.disconnect(); } catch (e) { } }
+            if (this.g_ff) { try { this.g_ff.disconnect(); } catch (e) { } }
+            if (this.g_fb) { try { this.g_fb.disconnect(); } catch (e) { } }
+            if (this.sumIn) { try { this.sumIn.disconnect(); } catch (e) { } }
+            if (this.sumOut) { try { this.sumOut.disconnect(); } catch (e) { } }
+            this.delay = null;
+            this.g_ff = null;
+            this.g_fb = null;
+            this.sumIn = null;
+            this.sumOut = null;
+            this.legacyGraph = false;
         }
-        try { this.inputNode.disconnect(); } catch (e) { }
-        try { this.outputNode.disconnect(); } catch (e) { }
+        if (this.inputNode) { try { this.inputNode.disconnect(); } catch (e) { } }
+        if (this.outputNode) { try { this.outputNode.disconnect(); } catch (e) { } }
     }
 }
 

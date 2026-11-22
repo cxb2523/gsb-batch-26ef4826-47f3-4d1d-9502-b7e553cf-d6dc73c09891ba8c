@@ -130,6 +130,7 @@ export class EnvelopeFollowerNode extends DSPNode {
             } catch (e) {
                 console.warn('Error disconnecting envelope follower worklet:', e);
             }
+            this.workletNode = null;
         }
         if (this.analyserNode) {
             try {
@@ -137,7 +138,9 @@ export class EnvelopeFollowerNode extends DSPNode {
             } catch (e) {
                 console.warn('Error disconnecting envelope follower analyser:', e);
             }
+            this.analyserNode = null;
         }
+        this.subscribers = [];
         if (this.app && typeof this.app.unregisterDynamicNode === 'function') {
             this.app.unregisterDynamicNode(this);
         }

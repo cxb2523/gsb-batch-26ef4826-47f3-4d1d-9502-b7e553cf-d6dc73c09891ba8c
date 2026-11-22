@@ -145,6 +145,23 @@ export class DiffuserNodeUI extends DSPNode {
     }
 
     onRemoved() {
+        // Stop and disconnect the modulating LFO oscillators and their gains.
         this.cleanupModulation();
+        // Disconnect the allpass filter cascade and the I/O gains so no part
+        // of the internal graph keeps processing audio after removal.
+        if (this.filterChain) {
+            this.filterChain.forEach(ap => {
+                try { ap.disconnect(); } catch (e) { }
+            });
+            this.filterChain = [];
+        }
+        if (this.inputGain) {
+            try { this.inputGain.disconnect(); } catch (e) { }
+            this.inputGain = null;
+        }
+        if (this.outputGain) {
+            try { this.outputGain.disconnect(); } catch (e) { }
+            this.outputGain = null;
+        }
     }
 }

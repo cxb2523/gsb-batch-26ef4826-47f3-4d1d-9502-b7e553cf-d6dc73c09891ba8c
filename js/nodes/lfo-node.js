@@ -320,6 +320,7 @@ export class LFONodeUI extends DSPNode {
             try { this.outputGain.disconnect(); } catch (e) { }
             this.outputGain = null;
         }
+        this.subscribers = [];
         this.app.unregisterDynamicNode(this);
     }
 }

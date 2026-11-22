@@ -303,9 +303,7 @@ export class App {
     }
 
     reset() {
-        if (this.connections.length > 0) {
-            this.connections.forEach(c => this.disconnect(c));
-        }
+        this.teardownGraph();
         this.clearSelection();
         this.draggingSelection = null;
         this.draggingAnchor = null;
@@ -315,12 +313,6 @@ export class App {
         this.panStart = null;
         this.panStartOffset = null;
         this.canvas.style.cursor = 'default';
-        this.connections = [];
-        this.nodes.forEach(n => {
-            if (this.dynamicNodes.has(n)) this.unregisterDynamicNode(n);
-            if (typeof n.onRemoved === 'function') n.onRemoved();
-        });
-        this.dynamicNodes.clear();
         this.nodes = [];
         this.activeSourceForLoad = null;
         const width = this.displayWidth || window.innerWidth;
@@ -485,13 +477,7 @@ export class App {
 
         await this.startAudio();
 
-        this.connections.forEach(c => this.disconnect(c));
-        this.connections = [];
-        this.nodes.forEach(n => {
-            if (this.dynamicNodes.has(n)) this.unregisterDynamicNode(n);
-            if (typeof n.onRemoved === 'function') n.onRemoved();
-        });
-        this.dynamicNodes.clear();
+        this.teardownGraph();
         this.nodes = [];
         this.activeSourceForLoad = null;
         this.clearSelection();
@@ -652,11 +638,69 @@ export class App {
         }
     }
 
+    // Full recycling chain for a single node: severs every connection and
+    // modulation subscription touching it (in both directions), unregisters
+    // it from the dynamic tick set and lets it release its audio resources.
+    teardownNode(node) {
+        if (!node) return;
+
+        // 1. Disconnect every recorded connection (audio + param) that
+        //    touches this node. Param disconnects remove the entry from the
+        //    target's paramModulators and from the source's subscribers.
+        this.connections = this.connections.filter(c => {
+            if (c.fromNode === node || c.toNode === node) {
+                this.disconnect(c);
+                return false;
+            }
+            return true;
+        });
+
+        // 2. Defensive sweep: drop any stale modulation subscription that
+        //    references this node even if no connection record exists, so a
+        //    later connection to the same param never reuses an old entry.
+        this.nodes.forEach(other => {
+            if (other === node) return;
+            if (Array.isArray(other.paramModulators)) {
+                other.paramModulators.forEach((modList, idx) => {
+                    if (!Array.isArray(modList)) return;
+                    const filtered = modList.filter(entry => !entry || entry.node !== node);
+                    if (filtered.length !== modList.length) {
+                        other.paramModulators[idx] = filtered;
+                        if (typeof other.updateParam === 'function') other.updateParam(idx);
+                    }
+                });
+            }
+            if (Array.isArray(other.subscribers)) {
+                other.subscribers = other.subscribers.filter(s => !s || s.node !== node);
+            }
+        });
+
+        // 3. Stop background ticking and release audio resources
+        //    (oscillators, worklets, internal graphs).
+        if (this.dynamicNodes.has(node)) this.unregisterDynamicNode(node);
+        if (typeof node.onRemoved === 'function') node.onRemoved();
+
+        // 4. Clear the node's own subscription state so it can no longer
+        //    act as a stale modulation source or target.
+        if (Array.isArray(node.paramModulators)) {
+            node.paramModulators = node.paramModulators.map(() => []);
+        }
+        if (Array.isArray(node.subscribers)) {
+            node.subscribers = [];
+        }
+    }
+
+    // Tear down the entire graph through the same per-node recycling chain.
+    teardownGraph() {
+        this.nodes.slice().forEach(n => this.teardownNode(n));
+        this.connections = [];
+        this.dynamicNodes.clear();
+    }
+
     deleteNode(node) {
         console.log(`Deleting node ID: ${node.id}`);
         if (node.type === 'output') return; // Keep output
-        if (this.dynamicNodes.has(node)) this.unregisterDynamicNode(node);
-        if (typeof node.onRemoved === 'function') node.onRemoved();
+        this.teardownNode(node);
         if (this.activeSourceForLoad === node) this.activeSourceForLoad = null;
         if (this.selectedNodes.has(node)) {
             this.selectedNodes.delete(node);
@@ -673,13 +717,6 @@ export class App {
             }
         }
 
-        this.connections = this.connections.filter(c => {
-            if (c.fromNode === node || c.toNode === node) {
-                this.disconnect(c);
-                return false;
-            }
-            return true;
-        });
         this.nodes = this.nodes.filter(n => n !== node);
         console.log(`Deleted node ID: ${node.id}`);
     }
