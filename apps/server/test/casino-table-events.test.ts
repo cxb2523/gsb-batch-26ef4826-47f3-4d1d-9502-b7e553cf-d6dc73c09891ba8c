@@ -1,15 +1,18 @@
 import { GameEventSchema, PluginsPayloadSchema, type GameEvent } from "@gl3/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import type { Redis } from "ioredis";
 import { uuidv7 } from "uuidv7";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { dealTable, type BjTableState } from "@gl3/plugin-blackjack";
 import { GAME_EVENTS_CHANNEL } from "../src/bus/publish.js";
 import { loadConfig } from "../src/config.js";
 import { locations, playerStats } from "../src/db/schema/index.js";
 import { createSubscriber } from "../src/redis.js";
 import { resetDb, testDb } from "./helpers/db.js";
-import { propertiesPlugin as propertiesTable } from "./helpers/plugin-tables.js";
+import {
+  casinoSeats, casinoTables, propertiesPlugin as propertiesTable,
+} from "./helpers/plugin-tables.js";
 import { registerVerifiedPlayer } from "./helpers/register.js";
 import { bootTestServer } from "./helpers/server.js";
 import { seedVenues } from "./helpers/venues.js";
@@ -17,7 +20,9 @@ import { awaitOwnEvent } from "./helpers/events.js";
 
 /**
  * The casino hub's one event: a SILENT `table` tick, published to every seat
- * at the end of a mutating table transaction (`publishTableTick`).
+ * at the end of a mutating table transaction — and to the seats each lazy-clock
+ * step found and left, when one read advances the table several steps
+ * (`publishTableTick`).
  *
  * Two properties, and they are separate places in the system. On the WIRE the
  * tick is an ordinary `plugin.event` — nothing about it says "silent", because
@@ -30,7 +35,11 @@ import { awaitOwnEvent } from "./helpers/events.js";
  * Recipients are the seat set before the change UNIONED with the seat set
  * after it, which the leave case below is the point of: a freed seat appears
  * in neither the response nor the post-change set, and is the client with the
- * stalest cache.
+ * stalest cache. The lazy-clock cases at the bottom are the same rule one
+ * level down: a single read can deal, auto-stand every seat and settle, and
+ * each of those steps is its own change with its own union — including the
+ * settle that empties and deletes the table, whose pre-settle seats get the
+ * last tick the table ever produces.
  *
  * RULE 4 THROUGHOUT: `game:events` is one global channel shared by every test
  * file in the run, so every assertion here filters by the ACTING player's own
@@ -114,6 +123,54 @@ function leave(token: string) {
     method: "POST", url: "/api/casino/table/leave",
     headers: { authorization: `Bearer ${token}` }, payload: {},
   });
+}
+
+function tableView(token: string) {
+  return app.inject({
+    method: "GET", url: "/api/casino/table",
+    headers: { authorization: `Bearer ${token}` },
+  });
+}
+
+async function tableRow(tableId: string) {
+  const [row] = await db.select().from(casinoTables).where(eq(casinoTables.id, tableId));
+  return row;
+}
+
+async function seatRow(tableId: string, playerId: string) {
+  const [row] = await db.select().from(casinoSeats)
+    .where(and(eq(casinoSeats.tableId, tableId), eq(casinoSeats.playerId, playerId)));
+  return row;
+}
+
+async function setSeed(tableId: string, seed: string): Promise<void> {
+  await db.update(casinoTables).set({ seed }).where(eq(casinoTables.id, tableId));
+}
+
+/**
+ * Lapses the table's clock by writing a PAST `deadline_at` — the substitute
+ * for waiting, borrowed from `casino-table-clock.test.ts`. 300 seconds puts
+ * every successor deadline of a whole hand (30s per turn) in the past too,
+ * which is what lets ONE read owe the deal, every auto-stand and the settle.
+ */
+async function backdate(tableId: string, secondsAgo: number): Promise<void> {
+  await db.update(casinoTables)
+    .set({ deadlineAt: new Date(Date.now() - secondsAgo * 1000) })
+    .where(eq(casinoTables.id, tableId));
+}
+
+/** `casino-table-clock.test.ts`'s scanner: a case that needs a particular
+ *  deal FINDS a seed for it rather than hand-building state. */
+function probeSeed(
+  seats: { seat: number; wager: bigint }[],
+  pred: (state: BjTableState) => boolean,
+  prefix: string,
+): string {
+  for (let i = 0; i < 4000; i += 1) {
+    const seed = `${prefix}-${i}`;
+    if (pred(dealTable(seats, seed))) return seed;
+  }
+  throw new Error(`no seed matched for ${prefix}`);
 }
 
 /** `casino-table-clock.test.ts`'s opener: a town with a solvent house and
@@ -353,5 +410,110 @@ describe("POST /api/casino/table/sit", () => {
 
     const ticks = await collected;
     expect(tickedPlayerIds(ticks)).toEqual([seated.playerId, arriving.playerId].sort());
+  });
+});
+
+/**
+ * The lazy clock's own ticks. A read that finds deadlines in the past plays
+ * the hand forward — deal, auto-stands, settle — and EVERY one of those steps
+ * publishes to the seats it found unioned with the seats it left
+ * (`advanceTable`). The counts below are exact on purpose: they are the
+ * per-step publishing rule, not an approximation of it.
+ */
+describe("the lazy clock's per-step ticks", () => {
+  it("ticks the seats each step found and left as one read deals, auto-stands and settles", async () => {
+    const { tableId, players } = await seatTable(3);
+    const [a, b, c] = players as [typeof players[0], typeof players[0], typeof players[0]];
+
+    // A and B stake; C never does, and is one idle hand from the kick — the
+    // deal's sweep frees C's seat in the middle of the read.
+    expect((await bet(a.token, 10_000n)).statusCode).toBe(200);
+    const seed = probeSeed(
+      [{ seat: 0, wager: 10_000n }, { seat: 1, wager: 10_000n }],
+      (s) => s.hands.every((h) => h.phase === "playing"),
+      "tick-steps",
+    );
+    await setSeed(tableId, seed);
+    expect((await bet(b.token, 10_000n)).statusCode).toBe(200);
+    await db.update(casinoSeats).set({ idleHands: 2 })
+      .where(and(eq(casinoSeats.tableId, tableId), eq(casinoSeats.playerId, c.playerId)));
+
+    // Every deadline this hand will ever set is already in the past, so one
+    // read owes the deal, both auto-stands and the settle between them.
+    await backdate(tableId, 300);
+
+    // Three steps, each published to the seats it found ∪ the seats it left:
+    // the deal kicks C and ticks {A,B,C}; each auto-stand ticks {A,B}. C's
+    // single tick is the whole point — the freed seat appears in no later
+    // step's set, and its client's cached table is the one that is wrong.
+    const collected = armed(collectOwnTicks(a.playerId, 7));
+    const res = await tableView(a.token);
+    expect(res.statusCode).toBe(200);
+
+    const ticks = await collected;
+    expect(tickedPlayerIds(ticks)).toEqual(
+      [a.playerId, a.playerId, a.playerId, b.playerId, b.playerId, b.playerId, c.playerId].sort(),
+    );
+    for (const tick of ticks) {
+      expect(tick.actorId).toBe(a.playerId);
+      expect(tick.payload).toEqual({ tableId });
+    }
+
+    // The hand really did play out on the one read: back to betting, C's
+    // seat freed by the sweep, A and B still seated with the hand settled.
+    const payload = res.json<{ table: { phase: string; seats: unknown[] } | null }>().table;
+    expect(payload?.phase).toBe("betting");
+    expect(payload?.seats).toHaveLength(2);
+    expect(await seatRow(tableId, c.playerId)).toBeUndefined();
+    expect((await tableRow(tableId))?.phase).toBe("betting");
+  });
+
+  it("ticks the seats a settle frees when it empties and deletes the table, and answers the empty table", async () => {
+    const { tableId, players } = await seatTable(2);
+    const [a, b] = players as [typeof players[0], typeof players[0]];
+
+    expect((await bet(a.token, 10_000n)).statusCode).toBe(200);
+    const seed = probeSeed(
+      [{ seat: 0, wager: 10_000n }, { seat: 1, wager: 10_000n }],
+      (s) => s.hands.every((h) => h.phase === "playing"),
+      "tick-delete",
+    );
+    await setSeed(tableId, seed);
+    expect((await bet(b.token, 10_000n)).statusCode).toBe(200);
+
+    // Both walk away mid-hand: the stakes keep the seats until the settle.
+    for (const p of [a, b]) {
+      const res = await leave(p.token);
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ left: true, deferred: true });
+    }
+
+    await backdate(tableId, 300);
+
+    // Deal, two auto-stands, settle — and the settle frees BOTH deferred
+    // seats, which empties the table and deletes the row. Three steps, two
+    // seats each; the last tick is the final word the table's seats ever get
+    // about it, published to the pre-settle set alone.
+    const collected = armed(collectOwnTicks(a.playerId, 6));
+    const res = await tableView(a.token);
+    expect(res.statusCode).toBe(200);
+    // The empty table, never the deleted row's last snapshot.
+    expect(res.json()).toEqual({ table: null });
+    expect(await tableRow(tableId)).toBeUndefined();
+
+    const ticks = await collected;
+    expect(tickedPlayerIds(ticks)).toEqual(
+      [a.playerId, a.playerId, a.playerId, b.playerId, b.playerId, b.playerId].sort(),
+    );
+    for (const tick of ticks) {
+      expect(tick.actorId).toBe(a.playerId);
+      expect(tick.payload).toEqual({ tableId });
+    }
+
+    // B was not the reader — the tick is what tells B's client the table is
+    // gone, and the read it triggers really does answer the empty table.
+    const again = await tableView(b.token);
+    expect(again.statusCode).toBe(200);
+    expect(again.json()).toEqual({ table: null });
   });
 });

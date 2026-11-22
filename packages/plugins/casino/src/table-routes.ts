@@ -16,7 +16,7 @@ import {
   readMaxBet, readMinBet, readTableBetSeconds, readTableMaxSeats,
 } from "./settings.js";
 import {
-  advanceTable, applyStep, assertTableCanCover, clockLapsed, dealIfReady, lockTable,
+  advanceTable, applyStep, assertTableCanCover, dealIfReady, lockTable,
   publishTableTick, readTableUnlocked, refundTableCredits,
   type LockedTable, type SeatRow,
 } from "./table-engine.js";
@@ -123,11 +123,6 @@ const sitRoute = route({
 
       const locked = await lockTable(tx, ctx, target, [player.id]);
       if (locked === null) throw new PluginError("no_such_table", 404);
-      // Copied BEFORE the clock runs, because the clock can free seats: an
-      // idle sweep kicks whoever sat the deal out, and `dealIfReady` swaps
-      // `locked.seats` for a filtered array rather than mutating this one.
-      // Those players are half the reason the tick's recipient set is a union.
-      const before = [...locked.seats];
       // THE CLOCK BEFORE THE SEAT ROW EXISTS. A lapsed betting deadline deals
       // to whoever bet and bumps the idle count of whoever did not, and a
       // newcomer who was not at the table when that deadline ran must not be
@@ -151,12 +146,11 @@ const sitRoute = route({
       await tx.db.insert(casinoSeats).values({
         id: uuidv7(), tableId: target, playerId: player.id, seatNo,
       });
-      // Pre ∪ post: everyone who was at the table when this transaction took
-      // the lock, everyone `advanceTable` left there, and the caller — whose
-      // seat row was inserted one line ago and so appears in neither set.
-      await publishTableTick(
-        tx, ctx, [...before, ...advanced.seats, { playerId: player.id }], target,
-      );
+      // The clock already told everyone it moved past — it publishes every
+      // step it takes. This tick is for the seat THIS transaction added: the
+      // post-clock seats, plus the caller, whose row was inserted one line
+      // ago and so appears in no seat set the clock ever saw.
+      await publishTableTick(tx, ctx, [...advanced.seats, { playerId: player.id }], target);
       return { status: 200, body: { tableId: target, seat: seatNo, station: advanced.table.station } };
     });
   },
@@ -169,9 +163,6 @@ const sitRoute = route({
  */
 async function freeSeat(
   tx: PluginTx, ctx: PluginCtx, locked: LockedTable, mine: SeatRow,
-  /** Seats that were at the table earlier in this transaction and are not in
-   *  `locked.seats` any more — the clock's casualties, when `leave` ran it. */
-  alsoTell: readonly { playerId: string }[] = [],
 ): Promise<{ status: 200; body: { left: boolean; deferred: boolean } }> {
   await refundTableCredits(tx, locked.table, mine);
   await tx.db.delete(casinoSeats).where(eq(casinoSeats.id, mine.id));
@@ -179,11 +170,11 @@ async function freeSeat(
     await tx.db.delete(casinoTables).where(eq(casinoTables.id, locked.table.id));
   }
   // `locked.seats` is the seat set BEFORE this delete, and freeing a seat only
-  // ever removes from it — so with `alsoTell` it is the full pre ∪ post union.
-  // The leaver is therefore told about the leave that freed them, and the last
-  // player out is told the table is gone: their client holds a `casinoTable`
-  // cache entry that no read will correct until the poll comes round.
-  await publishTableTick(tx, ctx, [...alsoTell, ...locked.seats], locked.table.id);
+  // ever removes from it — so it is the full pre ∪ post union on its own. The
+  // leaver is told about the leave that freed them, and the last player out is
+  // told the table is gone: their client holds a `casinoTable` cache entry
+  // that no read will correct until the poll comes round.
+  await publishTableTick(tx, ctx, locked.seats, locked.table.id);
   return { status: 200, body: { left: true, deferred: false } };
 }
 
@@ -209,10 +200,6 @@ const leaveRoute = route({
       await tx.locks.location(seat.locationId);
       const locked = await lockTable(tx, ctx, seat.tableId);
       if (locked === null) throw new PluginError("not_seated", 404);
-      // The seat set before the clock runs (`sit`'s `before`, same reason):
-      // `advanceTable` can idle-kick or settle seats away, and those players
-      // are precisely who the union half of the tick's recipient set is for.
-      const before = [...locked.seats];
       const mine = locked.seats.find((s) => s.playerId === player.id);
       if (mine === undefined) throw new PluginError("not_seated", 404);
 
@@ -253,17 +240,15 @@ const leaveRoute = route({
         // settle pays it normally and frees the seat at hand end. The wager-0
         // test is the spec's in-hand definition — NEVER phase.
         await tx.db.update(casinoSeats).set({ leaving: true }).where(eq(casinoSeats.id, post.id));
-        // Pre ∪ post: the caller's seat is still there, marked, so it is in
-        // both — but the clock ran on the way here and may have settled a hand
-        // that freed somebody else's.
-        await publishTableTick(
-          tx, ctx, [...before, ...advanced.seats], advanced.table.id,
-        );
+        // Everyone still at the table sees the leaving mark on the next
+        // render; anyone the clock freed on the way here was already told by
+        // the step that freed them.
+        await publishTableTick(tx, ctx, advanced.seats, advanced.table.id);
         return { status: 200, body: { left: true, deferred: true } };
       }
       // The clock settled the hand on the way through, so the stake is paid
       // out and the seat frees NOW rather than at some later read.
-      return freeSeat(tx, ctx, advanced, post, before);
+      return freeSeat(tx, ctx, advanced, post);
     });
   },
 });
@@ -375,24 +360,18 @@ const readRoute = route({
       await tx.locks.location(seat.locationId);
       const locked = await lockTable(tx, ctx, seat.tableId);
       if (locked === null) return { status: 200, body: { table: null } };
-      // ASKED UNDER THE LOCK, before the clock runs. A READ that publishes is
-      // unusual, and this is what keeps it honest: another transaction can have
-      // advanced the table while this one queued for the location lock, in
-      // which case `advanceTable` returns on its first test having changed
-      // nothing, and a tick for a table that did not move would be a lie every
-      // seat pays for with a refetch. `clockLapsed` is that first test, shared
-      // rather than restated so the two cannot drift apart.
-      const owed = clockLapsed(locked.table);
-      const before = [...locked.seats];
+      // The clock publishes every step it takes (`advanceTable`), so this
+      // route publishes nothing itself — a tick for a table that did not move
+      // is a lie every seat pays for with a refetch, and `advanceTable`
+      // returns having published nothing when another transaction beat this
+      // one to the lapse while it queued for the location lock.
       const advanced = await advanceTable(tx, ctx, locked, game);
       if (advanced === null) {
-        // The settle emptied the table and deleted it. `before` is the whole
-        // union — every one of those seats is gone, and this reader is the only
-        // request that will ever know it happened.
-        if (owed) await publishTableTick(tx, ctx, before, seat.tableId);
+        // The settle emptied the table and deleted it; the clock's last step
+        // already told every seat that was there. Answer the empty table,
+        // never the pre-settle snapshot.
         return { status: 200, body: { table: null } };
       }
-      if (owed) await publishTableTick(tx, ctx, [...before, ...advanced.seats], advanced.table.id);
       return {
         status: 200,
         body: { table: await renderTablePayload(tx, ctx, advanced, game, player.id) },
@@ -439,10 +418,6 @@ async function lockedSeat(
   phase: "betting" | "acting",
 ): Promise<{
   locked: LockedTable; game: TableGameDef; mine: SeatRow;
-  /** The seat set as `lockTable` read it, BEFORE the clock ran — the pre half
-   *  of the tick's recipient union, and the only record of a seat the clock
-   *  idle-kicked or settled away inside this call. */
-  before: readonly SeatRow[];
 }> {
   const seat = await seatOf(tx, playerId);
   if (seat === null) throw new PluginError("not_seated", 404);
@@ -453,7 +428,6 @@ async function lockedSeat(
   await tx.locks.location(seat.locationId);
   const locked = await lockTable(tx, ctx, seat.tableId);
   if (locked === null) throw new PluginError("not_seated", 404);
-  const before = [...locked.seats];
   const game = registry.get(locked.table.gameId);
   if (game === undefined) throw new PluginError("no_such_game", 404);
   // THE CLOCK, before a single check below reads the table. A deadline can
@@ -463,13 +437,14 @@ async function lockedSeat(
   // The refusals it produces are the right ones: a bet arriving after the
   // betting deadline dealt without the caller gets `wrong_phase`, an act
   // arriving after the caller's turn was auto-stood gets `not_your_turn`, and
-  // a swept-or-settled seat gets `not_seated`.
+  // a swept-or-settled seat gets `not_seated`. Every step it takes publishes
+  // its own tick, so the routes below notify only their OWN writes.
   const advanced = await advanceTable(tx, ctx, locked, game);
   if (advanced === null) throw new PluginError("not_seated", 404);
   const mine = advanced.seats.find((s) => s.playerId === playerId);
   if (mine === undefined) throw new PluginError("not_seated", 404);
   if (advanced.table.phase !== phase) throw new PluginError("wrong_phase", 409);
-  return { locked: advanced, game, mine, before };
+  return { locked: advanced, game, mine };
 }
 
 const betRoute = route({
@@ -485,7 +460,7 @@ const betRoute = route({
     const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
 
     return ctx.transaction(async (tx) => {
-      const { locked, game, mine, before } = await lockedSeat(tx, ctx, player.id, registry, "betting");
+      const { locked, game, mine } = await lockedSeat(tx, ctx, player.id, registry, "betting");
       // One stake per seat per hand. Raising it is the game's business
       // (`wagerDelta`, mid-hand and bounded), never a second bet.
       if (mine.wager > 0n) throw new PluginError("already_bet", 409);
@@ -537,15 +512,20 @@ const betRoute = route({
       }
 
       // Not forced: this deals only if every non-leaving seat has now bet.
-      // The lapsed-deadline deal is the clock's (Task 11).
+      // The lapsed-deadline deal is the clock's (Task 11). Captured BEFORE it
+      // runs: a deal that completes the table can idle-kick a seat, and the
+      // kicked player is in neither the post-write set nor any tick the clock
+      // published (the clock is not what dealt here) — so this route's tick
+      // covers pre-deal ∪ post-write, its OWN change's union.
+      const preDeal = [...locked.seats];
       await dealIfReady(tx, ctx, locked, game, false);
 
-      // Pre ∪ post. The post half is read back AFTER the write
-      // (`renderAfter`'s re-read), because a bet that completes the table
-      // deals and a deal that settles on the spot frees seats — those players
-      // are in `before` and nowhere else.
+      // The post half is read back AFTER the write (`renderAfter`'s re-read),
+      // because a bet that completes the table deals and a deal that settles
+      // on the spot frees seats — those players are in `preDeal` and nowhere
+      // else.
       const { result, seats } = await renderAfter(tx, ctx, locked.table.id, game, player.id);
-      await publishTableTick(tx, ctx, [...before, ...seats], locked.table.id);
+      await publishTableTick(tx, ctx, [...preDeal, ...seats], locked.table.id);
       return result;
     });
   },
@@ -565,7 +545,7 @@ const actRoute = route({
     const registry = await buildTableRegistry(ctx, ctx.installedPluginIds);
 
     return ctx.transaction(async (tx) => {
-      const { locked, game, mine, before } = await lockedSeat(tx, ctx, player.id, registry, "acting");
+      const { locked, game, mine } = await lockedSeat(tx, ctx, player.id, registry, "acting");
       if (locked.table.turnSeat !== mine.seatNo) throw new PluginError("not_your_turn", 409);
       // Unreachable while `phase` and `state` move together (`applyStep` writes
       // both, `settleHand` clears both), but the column is nullable and a game
@@ -576,11 +556,15 @@ const actRoute = route({
       const step = guardGame(locked.table.gameId, "act", () =>
         game.act(fromStorableState(locked.table.state), mine.seatNo, action));
       // The acting seat, so a `wagerDelta` from THIS seat (a double) is
-      // allowed and one naming any other seat is refused.
+      // allowed and one naming any other seat is refused. Captured BEFORE the
+      // step runs: a step that settles frees the deferred leavers, and those
+      // players are in the pre-step set and nowhere else — the same union
+      // discipline as `bet`'s, for this route's OWN write.
+      const preStep = [...locked.seats];
       await applyStep(tx, ctx, locked, game, step, mine.seatNo);
 
       const { result, seats } = await renderAfter(tx, ctx, locked.table.id, game, player.id);
-      await publishTableTick(tx, ctx, [...before, ...seats], locked.table.id);
+      await publishTableTick(tx, ctx, [...preStep, ...seats], locked.table.id);
       return result;
     });
   },

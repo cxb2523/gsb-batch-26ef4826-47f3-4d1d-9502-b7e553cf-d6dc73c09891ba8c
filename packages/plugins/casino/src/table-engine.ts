@@ -48,10 +48,11 @@ export const tableTickEvent = {
 } satisfies PluginEventDecl;
 
 /**
- * Whether the table's clock owes this transaction something. Exactly the test
- * `advanceTable`'s loop opens with, named so GET's slow path can ask the same
- * question before it publishes — the two drifting apart is how a tick gets
- * published for a table that did not move.
+ * Whether the table's clock owes this transaction something: a deadline in
+ * the past. Exactly the test `advanceTable`'s loop opens with — GET's fast
+ * path restates it inline (`deadline === null || deadline > now`), and the
+ * two drifting apart is how a read would take the slow path (and its locks)
+ * for a table that owes nothing.
  */
 export function clockLapsed(table: TableRow, now: number = Date.now()): boolean {
   return table.deadlineAt !== null && table.deadlineAt.getTime() <= now;
@@ -63,13 +64,15 @@ export function clockLapsed(table: TableRow, now: number = Date.now()): boolean 
  * commit, so rule 5 holds without the caller doing anything — and a rollback
  * drops these with everything else, which is the point.
  *
- * `seats` is the UNION of the seat set before the change and the seat set
- * after it, which is why this deduplicates by player id rather than trusting
- * `p_casino_seats`' game-wide UNIQUE(player_id). The union is deliberate: a
- * seat this transaction FREED — by leaving, by the idle sweep, or by a settle
- * that emptied and deleted the table — is exactly the client whose cache is
- * now most wrong, and the post-change set is the one place it does not appear.
- * Telling it costs one more send and saves it a wait on the 15s poll.
+ * Callers: `advanceTable` once per clock step, and each table route once for
+ * its OWN mutation (a sit, a leave, a bet, an act). `seats` is the UNION of
+ * the seat set before the change and the seat set after it, which is why this
+ * deduplicates by player id rather than trusting `p_casino_seats`' game-wide
+ * UNIQUE(player_id). The union is deliberate: a seat this transaction FREED —
+ * by leaving, by the idle sweep, or by a settle that emptied and deleted the
+ * table — is exactly the client whose cache is now most wrong, and the
+ * post-change set is the one place it does not appear. Telling it costs one
+ * more send and saves it a wait on the 15s poll.
  *
  * The actor is the caller throughout, recipients included — the client dedupes
  * by cache semantics, and one uniform loop beats a special case for the seat
@@ -515,6 +518,18 @@ export async function dealIfReady(
  * and the table needing one poll per seat to clear. Spec §5 says it directly —
  * "repeat until the clock is in the future or the hand settles".
  *
+ * EVERY STEP PUBLISHES. One read can deal, auto-stand every seat and settle,
+ * and each step is published to the union of the seat set it found and the
+ * seat set it left (`publishTableTick`): a seat the step FREED — the deal's
+ * idle sweep, the settle's deferred leavers — is exactly the client whose
+ * cached table is now wrong, and it appears in no later step's set. When the
+ * settle empties the table and deletes the row, that last publish goes to the
+ * pre-settle seats alone: the final word those players ever get about the
+ * table, after which this returns `null` and the reader answers the empty
+ * table. The publishes are buffered like every in-transaction event, so a
+ * rollback — a later step's throw, or the calling route's — drops them with
+ * everything else, which is why the routes never re-publish the clock's work.
+ *
  * The `null` return is never a stale snapshot: a settle that emptied the table
  * deleted it, and rendering the pre-settle `LockedTable` would show a table
  * that no longer exists. Callers answer `{ table: null }` / `not_seated`.
@@ -532,10 +547,16 @@ export async function advanceTable(
     const { table } = current;
     // The null test narrows `lapsed` for the calls below (which date each step
     // FROM it — the eager-equivalence property above); `clockLapsed` owns the
-    // comparison itself, so GET's slow path asks precisely this question
-    // before it publishes a tick.
+    // comparison itself, so GET's fast path asks precisely this question
+    // before it takes a single lock.
     const lapsed = table.deadlineAt;
     if (lapsed === null || !clockLapsed(table)) return current;
+
+    // The seat set BEFORE this step. Captured by reference before the step
+    // runs: `dealIfReady` SWAPS `current.seats` for a filtered array when the
+    // idle sweep kicks, so the pre-step set survives untouched behind this
+    // binding. A step never adds seats, only frees them.
+    const before = current.seats;
 
     if (table.phase === "betting") {
       await dealIfReady(tx, ctx, current, game, true, lapsed);
@@ -557,6 +578,12 @@ export async function advanceTable(
     }
 
     const reread = await lockTable(tx, ctx, table.id);
+    // THE PER-STEP TICK. The union is the seats this step found and the seats
+    // it left — when the settle emptied the table and deleted the row the
+    // post set is empty and the pre-settle seats get their last word about
+    // the table. Published before the `null` return deliberately: the
+    // notification is part of the step, not of any caller's bookkeeping.
+    await publishTableTick(tx, ctx, [...before, ...(reread?.seats ?? [])], table.id);
     if (reread === null) return null;
     current = reread;
   }
