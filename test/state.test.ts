@@ -9,6 +9,7 @@ const STATE_PROPS: [string, any][] = [
   ["lineCap", "round"],
   ["lineJoin", "round"],
   ["miterLimit", 3],
+  ["lineDashOffset", 5],
   ["globalAlpha", 0.5],
   ["globalCompositeOperation", "copy"],
   ["shadowBlur", 5],

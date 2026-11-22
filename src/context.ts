@@ -20,6 +20,7 @@ import { Matrix, Transform } from "./transform.js";
 import { LineCap, LineJoin, strokePolygons, Subpath } from "./stroke.js";
 import { allFinite, PathBuilder, requireArgs, samePoint } from "./path.js";
 import { mapPath, Path2D } from "./path2d.js";
+import { dashSubpaths, normalizeLineDash } from "./dash.js";
 
 // Matches a CSS size token: digits+optional-decimal followed by a unit, plus an optional /line-height suffix.
 const FONT_SIZE_RE = /^(\d*\.?\d+)(px|pt|em|rem|ex|ch|vw|vh|%)(\/.*)?$/i;
@@ -122,7 +123,6 @@ export class Context extends PathBuilder {
   public fontStretch: string;
   public fontVariantCaps: string;
   public letterSpacing: string;
-  public lineDashOffset: number;
   public textRendering: string;
   public wordSpacing: string;
   public shadowBlur: number;
@@ -170,7 +170,8 @@ export class Context extends PathBuilder {
     this.fontStretch = "normal";
     this.fontVariantCaps = "normal";
     this.letterSpacing = "0px";
-    this.lineDashOffset = 0;
+    this._lineDash = [];
+    this._lineDashOffset = 0;
     this.textRendering = "auto";
     this.wordSpacing = "0px";
     this._lineCap = "butt";
@@ -228,6 +229,9 @@ export class Context extends PathBuilder {
   private _lineCap: LineCap;
   private _lineJoin: LineJoin;
   private _miterLimit: number;
+  /** the current dash pattern: an even list of alternating on/off lengths, empty for solid */
+  private _lineDash: number[];
+  private _lineDashOffset: number;
 
   /** How the ends of open subpaths are drawn: butt (the default), round or square. */
   get lineCap(): LineCap {
@@ -252,6 +256,43 @@ export class Context extends PathBuilder {
   set miterLimit(val: number) {
     const v = Number(val);
     if (Number.isFinite(v) && v > 0) this._miterLimit = v;
+  }
+
+  /**
+   * The dash pattern: alternating on/off line distances. An empty list means a solid line.
+   * Negative, NaN or infinite members make the whole list invalid, so the current pattern is
+   * kept; an odd-length list is doubled, as the spec requires.
+   *
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/setLineDash
+   */
+  setLineDash(segments: number[] | Iterable<number>): void {
+    requireArgs(arguments.length, 1, "setLineDash");
+    const normalized = normalizeLineDash(segments);
+    if (normalized !== null) this._lineDash = normalized;
+  }
+
+  /**
+   * A copy of the current dash pattern, so mutating the returned array cannot change the
+   * context's state. Returns the empty list for a solid line.
+   *
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/getLineDash
+   */
+  getLineDash(): number[] {
+    return this._lineDash.slice();
+  }
+
+  /**
+   * How far into the dash pattern the line starts, in user-space units. Numeric strings are
+   * converted as WebIDL does; NaN and infinite values are ignored, leaving the value set.
+   *
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/lineDashOffset
+   */
+  get lineDashOffset(): number {
+    return this._lineDashOffset;
+  }
+  set lineDashOffset(val: number) {
+    const v = Number(val);
+    if (Number.isFinite(v)) this._lineDashOffset = v;
   }
 
   private _globalAlpha: number;
@@ -456,6 +497,8 @@ export class Context extends PathBuilder {
       lineCap: this.lineCap,
       lineJoin: this.lineJoin,
       miterLimit: this.miterLimit,
+      _lineDash: this._lineDash.slice(),
+      _lineDashOffset: this._lineDashOffset,
       shadowBlur: this.shadowBlur,
       shadowColor: this.shadowColor,
       shadowOffsetX: this.shadowOffsetX,
@@ -1115,7 +1158,11 @@ export class Context extends PathBuilder {
     if (!det || !Number.isFinite(det)) return null;
     const inverse = this._transform.cloneTransform();
     inverse.invert();
-    const subpaths = pathToSubpaths(path, (pt) => inverse.transformPoint(pt));
+    const subpaths = dashSubpaths(
+      pathToSubpaths(path, (pt) => inverse.transformPoint(pt)),
+      this._lineDash,
+      this._lineDashOffset,
+    );
     const polygons = strokePolygons(subpaths, {
       width: this._lineWidth,
       cap: this._lineCap,
