@@ -275,7 +275,9 @@ class HolographicTicketApp {
   }
 
   public selectTier(tierId: TierEditionId): void {
-    this.currentTier = TIER_SPECS[tierId]
+    const nextTier = TIER_SPECS[tierId]
+    const editionChanged = nextTier !== this.currentTier
+    this.currentTier = nextTier
     this.passUniforms.uFoilMode.value = this.currentTier.foilMode
 
     document.querySelectorAll<HTMLButtonElement>('.tier-option').forEach((btn) => {
@@ -286,19 +288,25 @@ class HolographicTicketApp {
 
     this.texGen.updateTicket(this.currentTier, this.currentSeat)
     this.updateCheckoutSummaryText()
-    this.sound.playCardFlexWhoosh(0.45)
 
-    // Subtle tactile ripple on the Verlet card when re-stamping foil edition
-    for (let r = 0; r <= UPPER_SEAM_ROW; r++) {
-      for (let c = 0; c < NUM_COLS; c++) {
-        const i3 = this.verlet.idx(r, c) * 3
-        const wave = Math.sin((c / COLS) * Math.PI) * 0.012
-        this.verlet.pos[i3 + 2] += wave
+    if (editionChanged) {
+      // Switching editions is a full re-issue: fresh seam, fresh stub, fresh CTA
+      this.reissuePassAfterSelection()
+    } else {
+      this.sound.playCardFlexWhoosh(0.45)
+      // Subtle tactile ripple on the Verlet card when re-stamping foil edition
+      for (let r = 0; r <= UPPER_SEAM_ROW; r++) {
+        for (let c = 0; c < NUM_COLS; c++) {
+          const i3 = this.verlet.idx(r, c) * 3
+          const wave = Math.sin((c / COLS) * Math.PI) * 0.012
+          this.verlet.pos[i3 + 2] += wave
+        }
       }
     }
   }
 
   public selectSeat(seat: SeatOption): void {
+    const seatChanged = seat.id !== this.currentSeat.id
     this.currentSeat = seat
     document.querySelectorAll<HTMLButtonElement>('.seat-pill').forEach((btn) => {
       btn.classList.toggle('is-selected', btn.dataset.seat === seat.id)
@@ -309,7 +317,37 @@ class HolographicTicketApp {
 
     this.texGen.updateTicket(this.currentTier, this.currentSeat)
     this.updateCheckoutSummaryText()
-    this.sound.playCardFlexWhoosh(0.35)
+
+    if (seatChanged) {
+      // Switching seats is a full re-issue: fresh seam, fresh stub, fresh CTA
+      this.reissuePassAfterSelection()
+    } else {
+      this.sound.playCardFlexWhoosh(0.35)
+    }
+  }
+
+  /**
+   * Full "re-issue" used whenever the user manually switches tier edition or seat:
+   * the new ticket face is drawn first (synchronously, so no stale texture can
+   * flash over the new one), then the Verlet engine is reset so all 25
+   * perforation fibers are intact again, the lower stub is re-attached at its
+   * rest pose with zero residual velocity, any in-flight auto-tear / grab /
+   * slice interaction is cancelled, and the fiber strip, status badge, CTA
+   * button and X-Ray telemetry are refreshed to the pending state.
+   *
+   * resetPass() never routes through severSeamColumn()/handleCompleteDetachment(),
+   * so no fiber-rip ticks or verification chord can fire during the reset.
+   */
+  private reissuePassAfterSelection(): void {
+    this.isPointerDown = false
+    this.isSlicingSeam = false
+    this.lastSliceU = null
+    this.seamHoverAmount = 0
+
+    this.verlet.resetPass(true)
+    this.sound.playCardFlexWhoosh(0.6)
+    this.syncPerforationUI()
+    this.updateXRayTelemetryDOM()
   }
 
   private updateCheckoutSummaryText(): void {
@@ -348,9 +386,14 @@ class HolographicTicketApp {
   }
 
   public issueFreshPass(): void {
+    this.isPointerDown = false
+    this.isSlicingSeam = false
+    this.lastSliceU = null
+    this.seamHoverAmount = 0
     this.verlet.resetPass(true)
     this.sound.playCardFlexWhoosh(0.8)
     this.syncPerforationUI()
+    this.updateXRayTelemetryDOM()
   }
 
   private bindStageInteractions(): void {
