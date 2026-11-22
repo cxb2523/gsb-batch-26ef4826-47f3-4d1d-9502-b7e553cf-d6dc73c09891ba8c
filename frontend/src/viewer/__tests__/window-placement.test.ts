@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  FALLBACK_ANCHOR_DISTANCE,
+  FALLBACK_CAPTURE_TANGENT,
   MAX_DEPTH_SCALE,
   MIN_DEPTH_SCALE,
+  NEAR_ANCHOR_QUANTILE,
+  clipFarField,
+  computePlacement,
   computeWindowPlacement,
   computeTrueWindowPlacement,
   estimateCaptureAspect,
   estimateCaptureTangent,
   estimateDepthQuantile,
   findFarFieldCut,
+  planScenePlacement,
   MAX_ZOOM,
   MIN_ZOOM,
   MIN_EYE_FRACTION,
@@ -395,9 +401,9 @@ describe('trading framing against apparent size, which a small screen forces', (
   });
 });
 
-describe('finding the empty band in a scene’s depth, for a future trim', () => {
-  // Nothing consumes this yet: the camera's far clip has no effect on splats,
-  // so a trim has to remove the gaussians, which belongs in the backend.
+describe('finding the empty band in a scene’s depth', () => {
+  // Consumed by clipFarField, which removes what lies beyond the band; the
+  // viewer then places only what survives and stops drawing at the cut.
   const bimodal = () => {
     const v: number[] = [];
     for (let i = 0; i < 3000; i++) v.push(0, 0, -(2 + (i % 100) / 100));
@@ -421,5 +427,245 @@ describe('finding the empty band in a scene’s depth, for a future trim', () =>
   it('reports nothing rather than guessing when there is too little to read', () => {
     expect(findFarFieldCut(undefined)).toBe(null);
     expect(findFarFieldCut(new Float32Array([0, 0, -3]), { stride: 1 })).toBe(null);
+  });
+});
+
+describe('one placement chain for both modes', () => {
+  it('is what the mode-specific entry points compute', () => {
+    for (const sizeScale of [0.3, 1, 3]) {
+      for (const zoom of [0.5, 1, 2]) {
+        expect(computePlacement({ ...options, sizeScale, zoom, mode: 'photo' }))
+          .toEqual(computeWindowPlacement({ ...options, sizeScale, zoom }));
+        expect(computePlacement({ ...options, sizeScale, zoom, mode: 'trueWindow' }))
+          .toEqual(computeTrueWindowPlacement({ ...options, modelScale: sizeScale * zoom }));
+      }
+    }
+  });
+
+  it('places the same scene identically in either mode at rest', () => {
+    // This is what keeps a mode switch from jumping the anchor, the visible
+    // fraction or the background depth: with the controls untouched the two
+    // modes are the same placement.
+    const photo = computePlacement({ ...options, mode: 'photo' });
+    const window = computePlacement({ ...options, mode: 'trueWindow' });
+    expect(photo.scale).toBeCloseTo(window.scale, 12);
+    expect(photo.translation).toEqual(window.translation);
+    expect(photo.anchorDepth).toBeCloseTo(window.anchorDepth, 12);
+    expect(photo.windowHalfHeight).toBe(1);
+    expect(window.windowHalfHeight).toBe(1);
+    expect(photo.visibleFraction).toBe(1);
+    expect(window.visibleFraction).toBe(1);
+  });
+
+  it('lets zoom resize the window only in photo mode', () => {
+    const photo = computePlacement({ ...options, zoom: 2, mode: 'photo' });
+    const window = computePlacement({ ...options, zoom: 2, mode: 'trueWindow' });
+    expect(photo.windowHalfHeight).toBeCloseTo(0.5, 12);
+    expect(photo.visibleFraction).toBeCloseTo(0.5, 12);
+    // The true window's aperture is always the physical screen; the same
+    // control grows the miniature instead.
+    expect(window.windowHalfHeight).toBe(1);
+    expect(window.scale)
+      .toBeCloseTo(computePlacement({ ...options, mode: 'trueWindow' }).scale * 2, 12);
+  });
+
+  it('falls back to safe values rather than building a degenerate frustum', () => {
+    const restPhoto = computePlacement({ ...options, mode: 'photo' });
+    const restWindow = computePlacement({ ...options, mode: 'trueWindow' });
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -2]) {
+      expect(computePlacement({ ...options, zoom: bad, mode: 'photo' })).toEqual(restPhoto);
+      expect(computePlacement({ ...options, sizeScale: bad, mode: 'photo' })).toEqual(restPhoto);
+      expect(computePlacement({ ...options, zoom: bad, mode: 'trueWindow' })).toEqual(restWindow);
+      expect(computePlacement({ ...options, sizeScale: bad, mode: 'trueWindow' }))
+        .toEqual(restWindow);
+    }
+    // Extreme but finite values clamp instead of running away.
+    expect(computePlacement({ ...options, zoom: 1e6, mode: 'photo' }).windowHalfHeight)
+      .toBeCloseTo(1 / MAX_ZOOM, 12);
+    expect(computePlacement({ ...options, zoom: 1e-9, mode: 'photo' }).windowHalfHeight)
+      .toBeCloseTo(1 / MIN_ZOOM, 12);
+    expect(computePlacement({ ...options, sizeScale: 1e-9, mode: 'trueWindow' }).scale)
+      .toBeCloseTo((apex / options.anchorDistance) * MIN_DEPTH_SCALE, 12);
+    expect(computePlacement({ ...options, sizeScale: 1e9, mode: 'trueWindow' }).scale)
+      .toBeCloseTo((apex / options.anchorDistance) * MAX_DEPTH_SCALE, 12);
+    // The two numbers there is no safe guess for still refuse.
+    expect(() => computePlacement({ ...options, captureTangent: Number.NaN, mode: 'photo' }))
+      .toThrow();
+    expect(() => computePlacement({ ...options, anchorDistance: -1, mode: 'trueWindow' }))
+      .toThrow();
+  });
+});
+
+describe('cutting the far field at the empty band', () => {
+  // A flat near band, so the anchor quantile lands on exactly the same depth
+  // however many far splats the cut removes.
+  const scene = () => {
+    const v: number[] = [];
+    for (let i = 0; i < 2000; i++) v.push(0, 0, -2);
+    for (let i = 0; i < 1000; i++) v.push(0, 0, -(4 + (i % 50) / 10));
+    for (let i = 0; i < 1500; i++) v.push(0, 0, -(40 + (i % 100)));
+    return new Float32Array(v);
+  };
+
+  it('removes only what lies beyond the gap, in order', () => {
+    const centers = scene();
+    const clip = clipFarField(centers, { stride: 1 });
+    expect(clip.cut).not.toBe(null);
+    const kept = clip.centers!;
+    expect(kept.length).toBeLessThan(centers.length);
+    // Nothing beyond the cut survives.
+    for (let i = 0; i + 2 < kept.length; i += 3) {
+      expect(Math.hypot(kept[i], kept[i + 1], kept[i + 2])).toBeLessThanOrEqual(clip.cut!);
+    }
+    // Everything this side of the gap is still there, exactly as it was.
+    const expected: number[] = [];
+    for (let i = 0; i + 2 < centers.length; i += 3) {
+      if (Math.hypot(centers[i], centers[i + 1], centers[i + 2]) <= clip.cut!) {
+        expected.push(centers[i], centers[i + 1], centers[i + 2]);
+      }
+    }
+    expect(kept.length).toBe(expected.length);
+    for (let i = 0; i < expected.length; i++) expect(kept[i]).toBe(expected[i]);
+    // And the fraction it reports is the fraction that remains.
+    expect(clip.visibleFraction).toBeCloseTo(kept.length / centers.length, 12);
+    expect(clip.visibleFraction).toBeLessThan(1);
+  });
+
+  it('leaves the near anchor where it was', () => {
+    const centers = scene();
+    const before = estimateDepthQuantile(centers, { quantile: NEAR_ANCHOR_QUANTILE, stride: 1 });
+    const clip = clipFarField(centers, { stride: 1 });
+    expect(estimateDepthQuantile(clip.centers, { quantile: NEAR_ANCHOR_QUANTILE, stride: 1 }))
+      .toBe(before);
+  });
+
+  it('cuts nothing when the histogram has no gap', () => {
+    const even: number[] = [];
+    for (let i = 0; i < 6000; i++) even.push(0, 0, -(2 + (i % 1000) / 20));
+    const centers = new Float32Array(even);
+    const clip = clipFarField(centers, { stride: 1 });
+    expect(clip.cut).toBe(null);
+    // The same array, not a copy: nothing happened.
+    expect(clip.centers).toBe(centers);
+    expect(clip.visibleFraction).toBe(1);
+  });
+
+  it('cuts nothing when there is nothing to read', () => {
+    expect(clipFarField(undefined).cut).toBe(null);
+    expect(clipFarField(undefined).centers).toBe(undefined);
+    expect(clipFarField(undefined).visibleFraction).toBe(1);
+    const tiny = new Float32Array([0, 0, -3]);
+    expect(clipFarField(tiny, { stride: 1 }).centers).toBe(tiny);
+  });
+});
+
+describe('planning a scene’s placement end to end', () => {
+  // The same flat-near bimodal scene as the clipping tests.
+  const scene = () => {
+    const v: number[] = [];
+    for (let i = 0; i < 2000; i++) v.push(0, 0, -2);
+    for (let i = 0; i < 1000; i++) v.push(0, 0, -(4 + (i % 50) / 10));
+    for (let i = 0; i < 1500; i++) v.push(0, 0, -(40 + (i % 100)));
+    return new Float32Array(v);
+  };
+
+  it('clips the far field and places what survives', () => {
+    const centers = scene();
+    const plan = planScenePlacement({
+      centers, captureTangent: 0.4, anchorDistance: 2, mode: 'photo', anchorStride: 1, cutOptions: { stride: 1 },
+    });
+    expect(plan.farCut).not.toBe(null);
+    expect(plan.sceneVisibleFraction).toBeLessThan(1);
+    expect(plan.sceneVisibleFraction).toBeCloseTo(plan.centers!.length / centers.length, 12);
+    // The placement is the unified chain's answer for the recomputed inputs.
+    expect(plan.placement).toEqual(computePlacement({
+      captureTangent: plan.captureTangent,
+      anchorDistance: plan.anchorDistance,
+      mode: 'photo',
+    }));
+  });
+
+  it('recomputes the anchor after clipping without moving it off the glass', () => {
+    const centers = scene();
+    const before = estimateDepthQuantile(centers, { quantile: NEAR_ANCHOR_QUANTILE, stride: 1 });
+    for (const mode of ['photo', 'trueWindow'] as const) {
+      const plan = planScenePlacement({
+        centers, captureTangent: 0.4, anchorDistance: 2, mode, anchorStride: 1, cutOptions: { stride: 1 },
+      });
+      // The cut only removed the background, so the near anchor is unchanged...
+      expect(plan.anchorDistance).toBe(before);
+      // ...and the near end stays behind the glass.
+      expect(plan.placement.anchorDepth).toBeLessThanOrEqual(1e-9);
+    }
+  });
+
+  it('cuts nothing and changes nothing when the histogram has no gap', () => {
+    const even: number[] = [];
+    for (let i = 0; i < 6000; i++) even.push(0, 0, -(2 + (i % 1000) / 20));
+    const centers = new Float32Array(even);
+    const plan = planScenePlacement({
+      centers, captureTangent: 0.4, anchorDistance: 2, mode: 'photo', anchorStride: 1, cutOptions: { stride: 1 },
+    });
+    expect(plan.farCut).toBe(null);
+    expect(plan.sceneVisibleFraction).toBe(1);
+    expect(plan.centers).toBe(centers);
+    expect(plan.anchorDistance).toBe(
+      estimateDepthQuantile(centers, { quantile: NEAR_ANCHOR_QUANTILE, stride: 1 }),
+    );
+  });
+
+  it('falls back to safe values when the scene and the parameters say nothing', () => {
+    const plan = planScenePlacement({
+      centers: undefined,
+      captureTangent: Number.NaN,
+      anchorDistance: 0,
+      mode: 'photo',
+    });
+    expect(plan.captureTangent).toBe(FALLBACK_CAPTURE_TANGENT);
+    expect(plan.anchorDistance).toBe(FALLBACK_ANCHOR_DISTANCE);
+    expect(plan.farCut).toBe(null);
+    expect(plan.sceneVisibleFraction).toBe(1);
+    expect(Number.isFinite(plan.placement.scale)).toBe(true);
+    expect(plan.placement.windowHalfHeight).toBe(1);
+    expect(plan.placement.anchorDepth).toBeLessThanOrEqual(1e-9);
+  });
+
+  it('re-estimates a missing tangent from the scene itself', () => {
+    const tangent = 0.4;
+    const values: number[] = [];
+    for (let i = 0; i < 4000; i++) {
+      const depth = 2 + (i % 40) / 10;
+      const y = ((i % 81) / 80 * 2 - 1) * tangent * depth;
+      values.push((i % 17) / 16, y, -depth);
+    }
+    const plan = planScenePlacement({
+      centers: new Float32Array(values),
+      captureTangent: Number.NaN,
+      anchorDistance: 2,
+      mode: 'photo',
+    });
+    expect(plan.captureTangent).toBeGreaterThan(tangent * 0.9);
+    expect(plan.captureTangent).toBeLessThanOrEqual(tangent * 1.02);
+  });
+
+  it('gives both modes the same scene when the mode switches', () => {
+    const centers = scene();
+    const inputs = {
+      centers, captureTangent: 0.4, anchorDistance: 2, anchorStride: 1, cutOptions: { stride: 1 },
+    };
+    const photo = planScenePlacement({ ...inputs, mode: 'photo' });
+    const window = planScenePlacement({ ...inputs, mode: 'trueWindow' });
+    // The scene-level decisions do not depend on the mode at all.
+    expect(photo.farCut).not.toBe(null);
+    expect(window.anchorDistance).toBe(photo.anchorDistance);
+    expect(window.farCut).toBe(photo.farCut);
+    expect(window.captureTangent).toBe(photo.captureTangent);
+    expect(window.sceneVisibleFraction).toBe(photo.sceneVisibleFraction);
+    // And at rest the placement itself is identical, so switching modes
+    // cannot jump the anchor, the scale or the background depth.
+    expect(window.placement.scale).toBeCloseTo(photo.placement.scale, 12);
+    expect(window.placement.translation).toEqual(photo.placement.translation);
+    expect(window.placement.anchorDepth).toBeCloseTo(photo.placement.anchorDepth, 12);
+    expect(window.placement.windowHalfHeight).toBe(photo.placement.windowHalfHeight);
   });
 });

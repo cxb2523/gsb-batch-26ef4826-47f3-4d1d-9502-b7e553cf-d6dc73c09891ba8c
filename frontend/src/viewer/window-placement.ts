@@ -282,6 +282,108 @@ export function lifeSizeViewingDistance(captureTangent: number): number {
 }
 
 /**
+ * Which of the two window semantics a placement is built for.
+ *
+ * Both modes are the same scene fitted by the same chain, so that switching
+ * between them cannot jump the anchor, the visible fraction or the background
+ * depth. What differs is what the controls mean. `photo` puts the capture
+ * camera where the viewer's eye is and lets `zoom` resize the *virtual*
+ * window around it, which may be larger or smaller than the physical glass.
+ * `trueWindow` keeps the window exactly the physical screen and lets the same
+ * controls rescale the miniature behind it.
+ */
+export type PlacementMode = 'photo' | 'trueWindow';
+
+/**
+ * The one placement chain both window modes are built from.
+ *
+ * Given the capture tangent, the depth to anchor on the glass, the size and
+ * zoom controls, and the mode, this produces the whole framing decision --
+ * scale, translation, window half-height, anchored depth and visible fraction
+ * -- so the two modes cannot drift into computing their own versions of it.
+ *
+ * Invalid or extreme control values fall back to safe ones rather than
+ * producing a degenerate view volume: non-finite or non-positive size and
+ * zoom become 1 and are then clamped to their supported ranges. The tangent
+ * and the anchor depth have no safe default -- a scene placed from a wrong
+ * viewpoint is worse than no placement -- so those still throw.
+ */
+export function computePlacement({
+  captureTangent,
+  anchorDistance,
+  sizeScale = 1,
+  zoom = 1,
+  mode,
+}: {
+  /** Tangent of half the capture camera's vertical field of view. */
+  captureTangent: number;
+  /**
+   * The depth that lands in the plane of the window, in the scene's own units.
+   *
+   * Anchor the *nearest* content here, not the subject. Anchoring the median
+   * put the front of the scene 26 to 31 per cent of the way from the window to
+   * the eye, and parallax is fiercest in front of the glass, so the near relief
+   * came out violently exaggerated -- reported from a device as exactly that.
+   * With the near edge on the glass the whole miniature sits behind it, which
+   * is what a window is.
+   */
+  anchorDistance: number;
+  /** How large to make the miniature. Larger is bigger, and flatter. */
+  sizeScale?: number;
+  /**
+   * How far into the frame to crop. 1 shows the whole photograph; above that
+   * the picture grows towards life-sized and the edges of the frame go. In
+   * True Window mode this instead joins `sizeScale` as a physical model scale.
+   */
+  zoom?: number;
+  mode: PlacementMode;
+}): WindowPlacement {
+  if (!(captureTangent > 0) || !Number.isFinite(captureTangent)) {
+    throw new Error('captureTangent must be a positive, finite number.');
+  }
+  if (!(anchorDistance > 0) || !Number.isFinite(anchorDistance)) {
+    throw new Error('anchorDistance must be a positive, finite number.');
+  }
+  const sizeIn = Number.isFinite(sizeScale) && sizeScale > 0 ? sizeScale : 1;
+  const zoomIn = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const apex = apexDistance(captureTangent);
+
+  if (mode === 'trueWindow') {
+    // A literal window: the aperture is always the physical screen, and the
+    // two controls combine into one physical scale for the miniature and its
+    // capture viewpoint alike, leaving the near-depth anchor on the glass.
+    const model = Math.min(Math.max(sizeIn * zoomIn, MIN_DEPTH_SCALE), MAX_DEPTH_SCALE);
+    const scaledApex = apex * model;
+    const scale = scaledApex / anchorDistance;
+    return {
+      scale,
+      translation: { x: 0, y: 0, z: scaledApex },
+      windowHalfHeight: 1,
+      anchorDepth: scaledApex - scale * anchorDistance,
+      visibleFraction: 1,
+    };
+  }
+
+  // The capture camera goes where the photograph's viewpoint belongs. The
+  // tracked head position is mapped onto it by `mapTrackedEye`, so a
+  // comfortable holding distance *is* the apex rather than a place the viewer
+  // never reaches.
+  const size = Math.min(Math.max(sizeIn, MIN_DEPTH_SCALE), MAX_DEPTH_SCALE);
+  const crop = Math.min(Math.max(zoomIn, MIN_ZOOM), MAX_ZOOM);
+  const scale = (apex / anchorDistance) * size;
+  return {
+    scale,
+    translation: { x: 0, y: 0, z: apex },
+    // At crop one this equals the physical screen. Other crop values are an
+    // intentional virtual-frame scale used only by photo mode.
+    windowHalfHeight: 1 / crop,
+    anchorDepth: apex - scale * anchorDistance,
+    /** The fraction of the original frame still visible. */
+    visibleFraction: 1 / crop,
+  };
+}
+
+/**
  * Place a metric scene for the source-photo-preserving mode.
  *
  * The rule is one line: **put the capture camera where the viewer's eye is.**
@@ -304,55 +406,12 @@ export function computeWindowPlacement({
   sizeScale = 1,
   zoom = 1,
 }: {
-  /** Tangent of half the capture camera's vertical field of view. */
   captureTangent: number;
-  /**
-   * The depth that lands in the plane of the window, in the scene's own units.
-   *
-   * Anchor the *nearest* content here, not the subject. Anchoring the median
-   * put the front of the scene 26 to 31 per cent of the way from the window to
-   * the eye, and parallax is fiercest in front of the glass, so the near relief
-   * came out violently exaggerated -- reported from a device as exactly that.
-   * With the near edge on the glass the whole miniature sits behind it, which
-   * is what a window is.
-   */
   anchorDistance: number;
-  /** How large to make the miniature. Larger is bigger, and flatter. */
   sizeScale?: number;
-  /**
-   * How far into the frame to crop. 1 shows the whole photograph; above that
-   * the picture grows towards life-sized and the edges of the frame go.
-   */
   zoom?: number;
 }): WindowPlacement {
-  if (!(captureTangent > 0) || !Number.isFinite(captureTangent)) {
-    throw new Error('captureTangent must be a positive, finite number.');
-  }
-  if (!(anchorDistance > 0) || !Number.isFinite(anchorDistance)) {
-    throw new Error('anchorDistance must be a positive, finite number.');
-  }
-  const size = Math.min(
-    Math.max(Number.isFinite(sizeScale) && sizeScale > 0 ? sizeScale : 1, MIN_DEPTH_SCALE),
-    MAX_DEPTH_SCALE,
-  );
-  const crop = Math.min(Math.max(Number.isFinite(zoom) && zoom > 0 ? zoom : 1, MIN_ZOOM), MAX_ZOOM);
-
-  // The capture camera goes where the photograph's viewpoint belongs. The
-  // tracked head position is mapped onto it by `mapTrackedEye`, so a
-  // comfortable holding distance *is* the apex rather than a place the viewer
-  // never reaches.
-  const apex = apexDistance(captureTangent);
-  const scale = (apex / anchorDistance) * size;
-  return {
-    scale,
-    translation: { x: 0, y: 0, z: apex },
-    // At crop one this equals the physical screen. Other crop values are an
-    // intentional virtual-frame scale used only by photo mode.
-    windowHalfHeight: 1 / crop,
-    anchorDepth: apex - scale * anchorDistance,
-    /** The fraction of the original frame still visible. */
-    visibleFraction: 1 / crop,
-  };
+  return computePlacement({ captureTangent, anchorDistance, sizeScale, zoom, mode: 'photo' });
 }
 
 /**
@@ -373,25 +432,13 @@ export function computeTrueWindowPlacement({
   anchorDistance: number;
   modelScale?: number;
 }): WindowPlacement {
-  if (!(captureTangent > 0) || !Number.isFinite(captureTangent)) {
-    throw new Error('captureTangent must be a positive, finite number.');
-  }
-  if (!(anchorDistance > 0) || !Number.isFinite(anchorDistance)) {
-    throw new Error('anchorDistance must be a positive, finite number.');
-  }
-  const size = Math.min(
-    Math.max(Number.isFinite(modelScale) && modelScale > 0 ? modelScale : 1, MIN_DEPTH_SCALE),
-    MAX_DEPTH_SCALE,
-  );
-  const scaledApex = apexDistance(captureTangent) * size;
-  const scale = scaledApex / anchorDistance;
-  return {
-    scale,
-    translation: { x: 0, y: 0, z: scaledApex },
-    windowHalfHeight: 1,
-    anchorDepth: scaledApex - scale * anchorDistance,
-    visibleFraction: 1,
-  };
+  return computePlacement({
+    captureTangent,
+    anchorDistance,
+    sizeScale: modelScale,
+    zoom: 1,
+    mode: 'trueWindow',
+  });
 }
 
 /**
@@ -452,4 +499,162 @@ export function findFarFieldCut(
   if (!(counts[emptiest] < mean * 0.5)) return null;
 
   return Math.exp(logLow + ((emptiest + 0.5) / bins) * (logHigh - logLow));
+}
+
+/** What `clipFarField` decided about a scene. */
+export type FarFieldClip = {
+  /**
+   * The centers with everything beyond the cut removed. When there is no gap
+   * to cut at this is the input itself, unmodified and uncopied.
+   */
+  centers: Float32Array | undefined;
+  /** Where the far field was cut, in the scene's own units; null for no cut. */
+  cut: number | null;
+  /** How much of the scene survives, from 0 to 1; 1 when nothing was cut. */
+  visibleFraction: number;
+};
+
+/**
+ * Remove the background beyond the empty band `findFarFieldCut` finds.
+ *
+ * This is where the far-field cut stops being a measurement and starts acting
+ * on the scene. Only what lies *beyond* the gap is removed: the subject and
+ * the near content the glass anchor is measured from sit in front of the gap
+ * and are kept exactly as they were, so the anchor does not move when the far
+ * field goes.
+ *
+ * When the depth histogram has no gap the honest answer is to cut nothing,
+ * and that is what happens: the same array comes back, with a visible
+ * fraction of 1.
+ */
+export function clipFarField(
+  centers: Float32Array | undefined,
+  options: { stride?: number; bins?: number } = {},
+): FarFieldClip {
+  const cut = findFarFieldCut(centers, options);
+  if (!centers || cut === null || !(cut > 0)) {
+    return { centers, cut: null, visibleFraction: 1 };
+  }
+  const kept = new Float32Array(centers.length);
+  let write = 0;
+  for (let i = 0; i + 2 < centers.length; i += 3) {
+    const x = centers[i];
+    const y = centers[i + 1];
+    const z = centers[i + 2];
+    // Beyond the gap is the only thing removed. A splat whose radius cannot
+    // be computed is not beyond anything, so it stays.
+    if (Math.hypot(x, y, z) > cut) continue;
+    kept[write] = x;
+    kept[write + 1] = y;
+    kept[write + 2] = z;
+    write += 3;
+  }
+  const total = Math.floor(centers.length / 3);
+  return {
+    // A copy, not a view, so the full-length buffer can be released.
+    centers: kept.slice(0, write),
+    cut,
+    visibleFraction: total > 0 ? (write / 3) / total : 1,
+  };
+}
+
+/**
+ * Effectively the nearest gaussian, sampled densely enough that a lone stray
+ * cannot set the placement for the whole scene. Anything in front of the
+ * glass magnifies faster than the rest as the eye approaches, without bound.
+ */
+export const NEAR_ANCHOR_QUANTILE = 0.001;
+export const NEAR_ANCHOR_STRIDE = 16;
+
+/**
+ * Used when neither the caller nor the gaussians can say how the scene was
+ * captured or how far away its nearest surface is. A scene framed from a
+ * plausible guess still sits behind the glass; one framed from zero or NaN
+ * produces a degenerate view volume.
+ */
+export const FALLBACK_CAPTURE_TANGENT = 0.5;
+export const FALLBACK_ANCHOR_DISTANCE = 3;
+
+/** The whole framing decision for one scene, ready to apply. */
+export type ScenePlacementPlan = {
+  /** Where the scene goes, from the unified placement chain. */
+  placement: WindowPlacement;
+  /** The capture tangent actually used, after any fallback. */
+  captureTangent: number;
+  /** The anchor depth actually used, recomputed after the far-field clip. */
+  anchorDistance: number;
+  /** Where the far field was cut, in scene units; null when there was no gap. */
+  farCut: number | null;
+  /** The centers with the far background removed (the input when uncut). */
+  centers: Float32Array | undefined;
+  /** How much of the scene survives the cut, from 0 to 1. */
+  sceneVisibleFraction: number;
+};
+
+/**
+ * Frame one scene, end to end: clip the far field, then place what remains.
+ *
+ * This is the reusable chain both window modes are decided by. The far-field
+ * cut is applied to the scene depth first; the anchor depth and the capture
+ * tangent are then measured from what survives, so removing the background
+ * cannot move the near end -- it stays behind the glass, because the cut only
+ * ever removes what lies beyond the gap.
+ *
+ * Invalid or extreme inputs fall back to safe values rather than producing a
+ * degenerate view volume: a missing or non-finite tangent is re-estimated
+ * from the scene and finally guessed; a missing anchor is re-measured from
+ * the clipped scene and finally defaulted; size and zoom are sanitised and
+ * clamped inside `computePlacement`.
+ */
+export function planScenePlacement({
+  centers,
+  captureTangent,
+  anchorDistance,
+  sizeScale = 1,
+  zoom = 1,
+  mode,
+  anchorQuantile = NEAR_ANCHOR_QUANTILE,
+  anchorStride = NEAR_ANCHOR_STRIDE,
+  cutOptions,
+}: {
+  /** The gaussian positions, xyz per splat, in the scene's own coordinates. */
+  centers?: Float32Array;
+  /** Tangent of half the capture camera's vertical field of view, if known. */
+  captureTangent: number;
+  /** The depth to anchor on the glass, if the scene cannot be measured. */
+  anchorDistance: number;
+  sizeScale?: number;
+  zoom?: number;
+  mode: PlacementMode;
+  anchorQuantile?: number;
+  anchorStride?: number;
+  /** Sampling for the far-field cut, passed through to `findFarFieldCut`. */
+  cutOptions?: { stride?: number; bins?: number };
+}): ScenePlacementPlan {
+  const clip = clipFarField(centers, cutOptions);
+  const measured = estimateDepthQuantile(clip.centers, {
+    quantile: anchorQuantile,
+    stride: anchorStride,
+  });
+  const anchor = measured
+    ?? (Number.isFinite(anchorDistance) && anchorDistance > 0
+      ? anchorDistance
+      : FALLBACK_ANCHOR_DISTANCE);
+  const tangent = Number.isFinite(captureTangent) && captureTangent > 0
+    ? captureTangent
+    : estimateCaptureTangent(clip.centers) ?? FALLBACK_CAPTURE_TANGENT;
+  return {
+    placement: computePlacement({
+      captureTangent: tangent,
+      anchorDistance: anchor,
+      sizeScale,
+      zoom,
+      mode,
+    }),
+    captureTangent: tangent,
+    anchorDistance: anchor,
+    farCut: clip.cut,
+    centers: clip.centers,
+    sceneVisibleFraction: clip.visibleFraction,
+  };
 }

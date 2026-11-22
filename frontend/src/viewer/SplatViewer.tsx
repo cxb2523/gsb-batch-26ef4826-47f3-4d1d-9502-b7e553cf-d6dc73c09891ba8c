@@ -18,13 +18,14 @@ import {
 import type { StereoSettings, ViewerHandle } from '../types';
 import { computeOffAxisFrustum, computeStereoEye, effectiveBaseline, sanitizeEye } from './off-axis';
 import {
+  NEAR_ANCHOR_QUANTILE,
+  NEAR_ANCHOR_STRIDE,
   apexDistance,
-  computeTrueWindowPlacement,
-  computeWindowPlacement,
+  computePlacement,
   estimateDepthQuantile,
   estimateCaptureAspect,
-  estimateCaptureTangent,
   mapTrackedEye,
+  planScenePlacement,
 } from './window-placement';
 import {
   type OrbitState,
@@ -225,9 +226,8 @@ const DEFAULT_SUBJECT_DISTANCE = 3;
 // face is not deep: at half the apex distance the front of a face grew 2.19
 // times against 1.80 for the back of the head, which is seen as the forehead
 // and crown stretching away from the mouth. With the near edge on the glass the
-// same movement gives 2.00 against 1.80.
-const NEAR_ANCHOR_QUANTILE = 0.001;
-const NEAR_ANCHOR_STRIDE = 16;
+// same movement gives 2.00 against 1.80. The quantile and stride themselves
+// live in window-placement, where the placement chain that shares them is.
 
 /**
  * The median distance of the gaussians from the capture viewpoint.
@@ -341,6 +341,15 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
   captureAspectHintRef.current = captureAspectHint;
   const subjectDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
   const anchorDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
+  // Where the far field was cut when the scene loaded, in the scene's own
+  // units; null when the depth histogram offered no gap to cut at.
+  const farCutRef = useRef<number | null>(null);
+  // The transform the placement chain last put on the scene, so the far
+  // clip can be expressed as a distance from the eye.
+  const placedSceneRef = useRef<{
+    scale: number;
+    translation: { x: number; y: number; z: number };
+  } | null>(null);
   const splatEntityRef = useRef<pc.Entity | null>(null);
   const assetRef = useRef<pc.Asset | null>(null);
   const orbitRef = useRef<OrbitState>(createOrbitState());
@@ -375,36 +384,35 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
     const pose = headPoseRef.current;
     const tangent = captureTangentRef.current;
     if (!splat || !pose || !tangent) return;
-    const placement = pose.trueWindow
-      ? computeTrueWindowPlacement({
-        captureTangent: tangent,
-        anchorDistance: anchorDistanceRef.current,
-        // In a literal window pinch changes the miniature, never the aperture.
-        modelScale: (pose.sizeScale ?? 1) * (pose.zoom ?? 1),
-      })
-      : computeWindowPlacement({
-        captureTangent: tangent,
-        anchorDistance: anchorDistanceRef.current,
-        sizeScale: pose.sizeScale ?? 1,
-        zoom: pose.zoom ?? 1,
-      });
+    // One chain for both modes: photo mode lets zoom resize the virtual
+    // window, True Window keeps the aperture on the physical screen and lets
+    // the same controls rescale the miniature.
+    const placement = computePlacement({
+      captureTangent: tangent,
+      anchorDistance: anchorDistanceRef.current,
+      sizeScale: pose.sizeScale ?? 1,
+      zoom: pose.zoom ?? 1,
+      mode: pose.trueWindow ? 'trueWindow' : 'photo',
+    });
     windowHalfHeightRef.current = placement.windowHalfHeight;
 
+    const x = placement.translation.x + (pose.pan?.x ?? 0);
+    const y = placement.translation.y + (pose.pan?.y ?? 0);
+    // Away from the eye, so the nearest content leaves the glass and the
+    // whole miniature sits deeper behind it.
+    //
+    // Bounded short of the apex. Turning the miniature rotates it about the
+    // centre of the window, so what this offset really sets is the radius of
+    // that swing -- and past the apex the offset changes sign, which turns
+    // the swing inside out and can bring the scene through the glass toward
+    // the viewer. The deeper steps therefore saturate on a wide-angle scene,
+    // whose apex is close in.
+    const z = placement.translation.z - Math.min(pose.pushBack ?? 0, placement.translation.z * 0.9);
     splat.setLocalScale(placement.scale, placement.scale, placement.scale);
-    splat.setLocalPosition(
-      placement.translation.x + (pose.pan?.x ?? 0),
-      placement.translation.y + (pose.pan?.y ?? 0),
-      // Away from the eye, so the nearest content leaves the glass and the
-      // whole miniature sits deeper behind it.
-      //
-      // Bounded short of the apex. Turning the miniature rotates it about the
-      // centre of the window, so what this offset really sets is the radius of
-      // that swing -- and past the apex the offset changes sign, which turns
-      // the swing inside out and can bring the scene through the glass toward
-      // the viewer. The deeper steps therefore saturate on a wide-angle scene,
-      // whose apex is close in.
-      placement.translation.z - Math.min(pose.pushBack ?? 0, placement.translation.z * 0.9),
-    );
+    splat.setLocalPosition(x, y, z);
+    // Remembered for the far-field clip in applyHeadPoseToEyes, which needs
+    // to know how far the cut depth now lies from the eye.
+    placedSceneRef.current = { scale: placement.scale, translation: { x, y, z } };
   }, []);
 
   /**
@@ -488,6 +496,22 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
       ),
     );
 
+    // Where the scene stops. With no far-field cut this only has to clear the
+    // scene from wherever the eye now is. With one, the cut -- a radius in the
+    // scene's own units, found in the depth histogram's empty band -- becomes
+    // the far plane, so the background beyond the gap is genuinely not drawn
+    // rather than merely unmeasured. The bound is the eye-to-window distance
+    // plus the scene origin's distance from the window plus the cut radius:
+    // an upper bound that holds however the miniature has been turned, tipped
+    // or pushed back, with a margin for the size of the splats themselves.
+    const cut = farCutRef.current;
+    const placed = placedSceneRef.current;
+    const farClip = cut !== null && placed
+      ? Math.hypot(eye.x, eye.y, eye.z)
+        + Math.hypot(placed.translation.x, placed.translation.y, placed.translation.z)
+        + placed.scale * cut + 0.5
+      : Math.max(1000, eye.z * 4 + 1000);
+
     eyes.forEach((entity, index) => {
       const camera = entity.camera;
       if (!camera) return;
@@ -496,8 +520,7 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
       camera.rect = new pc.Vec4(0, 0, 1, 1);
       // The window is at the origin, so the eye sits in front of it at eye.z.
       entity.setLocalPosition(eye.x, eye.y, eye.z);
-      // Reach far enough to clear the scene from wherever the eye now is.
-      camera.farClip = Math.max(1000, eye.z * 4 + 1000);
+      camera.farClip = farClip;
       const frustum = computeOffAxisFrustum({
         eyeX: eye.x,
         eyeY: eye.y,
@@ -1023,18 +1046,27 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
     const centers = resource?.hasCenters ? resource.centers : undefined;
     const distance = splatDistanceQuantile(centers, 0.5) ?? DEFAULT_SUBJECT_DISTANCE;
     const nearest = nearSplatDistance(centers);
-    anchorDistanceRef.current = nearest ?? distance;
 
+    // The framing decision is one chain, shared by both window modes: clip
+    // the far field at the depth histogram's empty band, then measure the
+    // anchor and the capture tangent off what survives and place that. A
+    // scene with no gap in its histogram is placed whole, uncut.
     const hintedTangent = captureTangentHintRef.current;
-    captureTangentRef.current = typeof hintedTangent === 'number'
-      && Number.isFinite(hintedTangent) && hintedTangent > 0
-      ? hintedTangent
-      : estimateCaptureTangent(centers);
+    const plan = planScenePlacement({
+      centers,
+      captureTangent: typeof hintedTangent === 'number' ? hintedTangent : Number.NaN,
+      anchorDistance: nearest ?? distance,
+      mode: headPoseRef.current?.trueWindow ? 'trueWindow' : 'photo',
+    });
+    anchorDistanceRef.current = plan.anchorDistance;
+    farCutRef.current = plan.farCut;
+    captureTangentRef.current = plan.captureTangent;
+
     const hintedAspect = captureAspectHintRef.current;
     onSceneAspectRef.current?.(
       typeof hintedAspect === 'number' && Number.isFinite(hintedAspect) && hintedAspect > 0
         ? hintedAspect
-        : estimateCaptureAspect(centers),
+        : estimateCaptureAspect(plan.centers),
     );
     subjectDistanceRef.current = distance;
 
