@@ -16,7 +16,8 @@
 		"src/splashScreen.css"
 	],
 	"jsSrcA": [
-		"src/checkBrowser.js"
+		"src/checkBrowser.js",
+		"src/serviceWorkerLifecycle.js"
 	],
 	"jsSrcB": [
 		"src/run.js"
