@@ -38,6 +38,31 @@ if (interactiveDirty) { paintInteractive(); interactiveDirty = false }
 The load-bearing line is the **no** on `camera`: **pan and zoom never re-rasterize the scene.** They
 only change how the existing bitmap is presented. This invariant is ADR `R-RENDER-001`.
 
+### 2.1 The eraser preview is part of the cache, not a screen patch
+
+The whole-stroke eraser marks ink ids for removal on pointer-up, but shows them dimmed *during* the
+gesture. That preview must not be a screen-space patch painted after a blit: the cache still holds
+the not-yet-erased pixels, so the next pan/zoom blit (`present` / `extend` / `scaled` /
+`scaled-extend`) would paint them straight back — a ghost stroke. Instead the exclusion set
+(`previewExcludedIds`) is a property of the **offscreen cache**:
+
+- `onInteractionChange` derives the set from `interaction.draftEraser` **alone**, never from
+  `interaction.mode`. A pan/zoom that takes over the mode mid-erase keeps the draft, so keying on
+  mode would silently drop the exclusion and the full re-render would resurrect the stroke.
+- The set is baked into every cache rasterization: `renderFullCache` and `renderCacheStrip` pass it
+  as `paintSceneBody`'s `previewExcludedNodes`, so a strip-extend / scaled-extend never repaints an
+  erased stroke at the cache edge.
+- A stroke joining the set patches only its coalesced rects into the cache
+  (`applyEraserPreviewPatch`) — localized, no viewport repaint, and it deliberately does **not**
+  set `cacheStale` (the cheap tiers keep firing; their triggers are unchanged).
+- The interactive surface dims exactly `previewExcludedIds`, so the two layers share one source of
+  truth and can't drift into "erased but visible" / "not erased but hidden".
+- Ending the gesture (commit or cancel) clears the set and **stales the cache**, rebuilding it from
+  the committed document — no preview-period pixels survive.
+
+Net: `cacheStale` on the eraser path only ever flips at a gesture *boundary* (start rebuilds tiles
+via the normal tiers, end rebuilds), never per pointer-move, so ADR `R-RENDER-001` still holds.
+
 ## 3. The offscreen cache is bigger than the screen
 
 `renderFullCache` rasterizes the scene into an offscreen canvas sized **viewport +
@@ -104,6 +129,9 @@ When a `full` or `extend` raster does run, three mechanisms bound its cost:
 - **Edit** (add/move/restyle a node): `'change'` → `cacheStale` → one tier-3 full render, bounded by
   culling + the sorted-id cache.
 - **Selecting / hovering**: only the interactive surface repaints; the scene bitmap is never touched.
+- **Erasing** (whole-stroke): each newly-hit stroke patches its own rect into the cache (cheap tiers
+  keep firing — see §2.1); panning/zooming mid-erase reuses the already-ghost-free cache; commit or
+  cancel rebuilds the cache from the committed doc.
 
 ## 8. Why this beats per-element bitmap caches
 

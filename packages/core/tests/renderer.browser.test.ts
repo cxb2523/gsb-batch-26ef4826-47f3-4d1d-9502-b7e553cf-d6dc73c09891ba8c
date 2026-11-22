@@ -898,4 +898,339 @@ describe('Renderer (browser)', () => {
     renderer.dispose()
     cleanup(staticCanvas, interactiveCanvas)
   })
+
+  // ---- eraser preview ↔ scene-cache lifecycle -------------------------
+  // Regression suite for the "ghost stroke" gap: the eraser preview used to
+  // be a SCREEN-SPACE patch over a cache that still held the erased strokes,
+  // so a pan/zoom during the gesture blitted them back, and a commit that
+  // didn't invalidate the cache kept serving stale pixels. The exclusion is
+  // now a property of the offscreen cache.
+  //
+  // Screen position of a world point under camera (x, z) = (world − cam.x)·z.
+  const erasePreview = (
+    store: ReturnType<typeof createCanvasStore>,
+    worldX: number,
+    worldY: number,
+    ids: string[],
+  ) => {
+    store.setInteractionState({
+      mode: 'erasing-ink',
+      draftEraser: {
+        point: { x: worldX, y: worldY },
+        radius: 14,
+        erasedIds: ids.map(id => asNodeId(id)),
+      },
+    })
+  }
+
+  test('ghost-free: pan during erase keeps the cache-hit blit excluding the stroke', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-pan') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    addInk(store, 'ink-w', [
+      { x: 400, y: 300, pressure: 0.5 },
+      { x: 540, y: 300, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBeGreaterThan(0)
+
+    erasePreview(store, 170, 100, ['ink-a'])
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('present')
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+
+    // Pan 100px within the cache margin → tier-1 present blit. The blit reads
+    // the patched cache, so the erased stroke must stay hidden at its new
+    // screen position (170 − 100 = 70); the witness is untouched.
+    store.setCamera({ x: 100, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('present')
+    expect(alphaAt(staticCanvas, 70, 100)).toBe(0)
+    expect(alphaAt(staticCanvas, 370, 300)).toBeGreaterThan(0)
+    // The dimmed interactive preview tracks the same set at its new position.
+    expect(alphaAt(interactiveCanvas, 70, 100)).toBeGreaterThan(0)
+    // Patch stayed localized (one rect for the single erased stroke).
+    expect(renderer.getLastEraserPatchRects()).toHaveLength(1)
+
+    // Pan far enough to force the strip-extend tier (which repaints cache
+    // strips) — still no ghost when we come back.
+    store.setCamera({ x: 400, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('extend')
+    store.setCamera({ x: 100, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 70, 100)).toBe(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('ghost-free: a pan/zoom mode takeover mid-erase keeps the exclusion', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-mode-takeover') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    erasePreview(store, 170, 100, ['ink-a'])
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+
+    // The pan gesture writes `mode: 'panning'` while `draftEraser` persists
+    // (setInteractionState merges). Keying the exclusion on mode would drop
+    // it here and the full re-render would paint the stroke back.
+    store.setInteractionState({ mode: 'panning' })
+    store.setCamera({ x: 100, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('full')
+    expect(alphaAt(staticCanvas, 70, 100)).toBe(0)
+    expect(alphaAt(interactiveCanvas, 70, 100)).toBeGreaterThan(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('ghost-free: zoom during erase — both the full and scaled-blit tiers', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-zoom') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    erasePreview(store, 170, 100, ['ink-a'])
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+
+    // Zoom (no 'zooming' mode) → stale cache → full re-render, which must
+    // rebake with the exclusion. World (170,100) at z=1.2 → screen (204,120).
+    store.setCamera({ x: 0, y: 0, z: 1.2 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('full')
+    expect(alphaAt(staticCanvas, 204, 120)).toBe(0)
+    expect(alphaAt(interactiveCanvas, 204, 120)).toBeGreaterThan(0)
+
+    // Now a 'zooming' mode takeover: the scaled-blit tier serves the new
+    // viewport from the cache. World (170,100) at z=1.44 → screen (245,144).
+    store.setInteractionState({ mode: 'zooming' })
+    store.setCamera({ x: 0, y: 0, z: 1.2 * 1.2 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('scaled')
+    expect(alphaAt(staticCanvas, 245, 144)).toBe(0)
+    expect(alphaAt(interactiveCanvas, 245, 144)).toBeGreaterThan(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('commit rebuilds the cache: erased stroke gone, survivors intact, preview set empty', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-commit') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    addInk(store, 'ink-w', [
+      { x: 400, y: 300, pressure: 0.5 },
+      { x: 540, y: 300, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    erasePreview(store, 170, 100, ['ink-a'])
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+
+    // Commit: remove the stroke, then end the gesture (the tool does both).
+    store.batch(() => store.removeNode(asNodeId('ink-a')))
+    await waitFrame()
+    await waitFrame()
+    store.resetInteractionState()
+    await waitFrame()
+    await waitFrame()
+
+    // Cache rebuilt from the committed document — no stale preview pixels.
+    expect(renderer.getLastDrawPath()).toBe('full')
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+    expect(alphaAt(staticCanvas, 470, 300)).toBeGreaterThan(0)
+    // No residual preview state: empty instrumentation, no dim overlay.
+    expect(renderer.getLastEraserPatchRects()).toEqual([])
+    expect(alphaAt(interactiveCanvas, 470, 300)).toBe(0)
+
+    // A subsequent pan must not resurrect anything (cache already clean).
+    store.setCamera({ x: 100, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 70, 100)).toBe(0)
+    expect(alphaAt(staticCanvas, 370, 300)).toBeGreaterThan(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('cancel restores the stroke: preview exclusion cleared, cache rebuilt', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-cancel') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    erasePreview(store, 170, 100, ['ink-a'])
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+
+    // Cancel without committing (pointercancel) — the nodes are untouched.
+    store.resetInteractionState()
+    await waitFrame()
+    await waitFrame()
+
+    // Stroke is visible again on the static layer; the cache was rebuilt from
+    // the committed doc rather than serving preview-period pixels.
+    expect(renderer.getLastDrawPath()).toBe('full')
+    expect(alphaAt(staticCanvas, 170, 100)).toBeGreaterThan(0)
+    expect(renderer.getLastEraserPatchRects()).toEqual([])
+    // Interactive dim overlay gone.
+    expect(alphaAt(interactiveCanvas, 170, 100)).toBe(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('the patch stays localized: erasing during a pan does not repaint the viewport', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-localized') })
+    addInk(store, 'ink-a', [
+      { x: 40, y: 40, pressure: 0.5 },
+      { x: 160, y: 40, pressure: 0.5 },
+    ])
+    addInk(store, 'ink-b', [
+      { x: 620, y: 540, pressure: 0.5 },
+      { x: 740, y: 540, pressure: 0.5 },
+    ])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    erasePreview(store, 100, 40, ['ink-a', 'ink-b'])
+    await waitFrame()
+    await waitFrame()
+    // Two scattered strokes → two independent rects, well under 10% of the
+    // viewport — never the single union.
+    const rects = renderer.getLastEraserPatchRects()
+    expect(rects).toHaveLength(2)
+    const area = rects.reduce((sum, r) => sum + r.w * r.h, 0)
+    expect(area).toBeLessThan(0.1 * (800 * 600))
+    // Still the cheap present tier — the patch didn't stale the cache.
+    expect(renderer.getLastDrawPath()).toBe('present')
+
+    // A cache-hit pan still reports both rects (instrumentation follows the
+    // pending set across paints, not just the frame that first erased).
+    store.setCamera({ x: 20, y: 0 })
+    await waitFrame()
+    await waitFrame()
+    expect(renderer.getLastDrawPath()).toBe('present')
+    expect(renderer.getLastEraserPatchRects()).toHaveLength(2)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
+
+  test('a renderer started mid-erase adopts the pending exclusion', async () => {
+    const { staticCanvas, interactiveCanvas } = makeCanvases(800, 600)
+    const store = createCanvasStore({ clientId: asClientId('eraser-adopt') })
+    addInk(store, 'ink-a', [
+      { x: 100, y: 100, pressure: 0.5 },
+      { x: 240, y: 100, pressure: 0.5 },
+    ])
+    // Draft is already in the store before the renderer exists / starts
+    // (e.g. a strict-mode remount mid-gesture).
+    erasePreview(store, 170, 100, ['ink-a'])
+    const renderer = createRenderer({
+      store,
+      staticCanvas,
+      interactiveCanvas,
+      width: 800,
+      height: 600,
+      background: { color: 'transparent' },
+    })
+    renderer.start()
+    await waitFrame()
+    await waitFrame()
+    expect(alphaAt(staticCanvas, 170, 100)).toBe(0)
+    expect(alphaAt(interactiveCanvas, 170, 100)).toBeGreaterThan(0)
+
+    renderer.dispose()
+    cleanup(staticCanvas, interactiveCanvas)
+  })
 })

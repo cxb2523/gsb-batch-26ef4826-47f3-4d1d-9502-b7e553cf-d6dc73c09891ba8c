@@ -248,11 +248,21 @@ _Phase 1 (shipped):_
 _Phase 2 (shipped):_
 - `packages/core/src/spatial/aabb.ts` — **new** `mergeOverlappingRects` + `coalesceEraseRects` (merge
   + density cut-off).
-- `packages/core/src/render/renderer.ts` — `paintEraserPreviewPatch` repaints per-coalesced-rect (one
-  shared ink build budget via `resetInkBudget`); `getLastEraserPatchRects()` test accessor.
+- `packages/core/src/render/renderer.ts` — `applyEraserPreviewPatch` / `computeEraserPreviewRects`
+  repaint per-coalesced-rect (one shared ink build budget via `resetInkBudget`);
+  `getLastEraserPatchRects()` test accessor.
 - Tests: `spatial.test.ts` — merge (overlap/transitive/disjoint/mixed) + coalesce (scattered/dense/
   merge) cases; `renderer.browser.test.ts` — scattered→N localized rects, adjacent→1, off-screen
   skipped, both cleared-on-static + preview-on-interactive, witness untouched.
+
+_Phase 3 (shipped) — preview ↔ scene-cache lifecycle._ The Phase-2 patch was a **screen-space**
+overlay: the offscreen cache still held the erased strokes, so a pan/zoom during the gesture blitted
+them back (ghost), and a commit that didn't invalidate the cache kept serving stale pixels. The
+exclusion now lives in the cache: `previewExcludedIds` (derived from `interaction.draftEraser`, not
+`interaction.mode`) is baked into `renderFullCache` / `renderCacheStrip` and patched into the cached
+pixels per-rect; ending the gesture stales the cache so it rebuilds from the committed doc. See
+`rendering-scene-cache.md` §2.1. Tests: `renderer.browser.test.ts` — "ghost-free" pan / mode-takeover
+/ zoom cases, commit rebuild, cancel restore, and patch-stays-localized-during-pan.
 
 ## 7. Open questions
 

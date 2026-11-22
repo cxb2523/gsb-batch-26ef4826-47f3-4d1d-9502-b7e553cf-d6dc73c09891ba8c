@@ -207,9 +207,10 @@ export type Renderer = {
    */
   getLastDrawPath(): StaticDrawPath
   /**
-   * World rects the most recent eraser-preview patch cleared+repainted — one
-   * per coalesced group of pending erasures, `[]` when not erasing. Test
-   * instrumentation: lets browser tests assert scattered erasures stay
+   * World rects for the pending eraser preview — one per coalesced group of
+   * pending erasures, `[]` when not erasing. Recomputed on every static paint,
+   * so a cache-hit pan/zoom during the gesture still reports the same regions.
+   * Test instrumentation: lets browser tests assert scattered erasures stay
    * localized (N small rects) instead of collapsing to one viewport-sized rect.
    */
   getLastEraserPatchRects(): WorldRect[]
@@ -246,6 +247,27 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   // World rects the last eraser-preview patch actually cleared+repainted.
   // Test/debug instrumentation (see Renderer.getLastEraserPatchRects).
   let lastEraserPatchRects: WorldRect[] = []
+
+  /**
+   * Ink ids the eraser gesture has marked for removal but not yet committed.
+   * While non-null the SCENE CACHE itself is rasterized without them, so every
+   * cache-serving path (present / extend / scaled / scaled-extend) is
+   * ghost-free by construction — the preview is a property of the cached
+   * bitmap, not a screen-space patch that a later blit could undo.
+   *
+   * Derived from `interaction.draftEraser` alone (NOT `interaction.mode`): a
+   * pan/zoom that takes over the interaction mode mid-erase must not make the
+   * erased strokes reappear. Cleared when the gesture commits or cancels.
+   */
+  let previewExcludedIds: ReadonlySet<NodeId> | null = null
+  // True when the cache's erased-region pixels have not yet been patched to
+  // match `previewExcludedIds` (a new stroke joined the set). The patch runs
+  // lazily at the top of `paintStatic`, before any cache-tier blit, so N
+  // pointer moves in one frame still coalesce to one localized repaint.
+  let eraserPreviewDirty = false
+  // Key of the erased-id set last adopted. Initialized from the store so a
+  // renderer (re)created mid-gesture still excludes — see `start()`.
+  let eraserPreviewKey = ''
 
   // Offscreen scene cache (viewport + margin). Rendered by
   // `renderFullCache`, blitted to the on-screen static surface by
@@ -675,11 +697,14 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     applyCacheTransform(cache, camera.x, camera.y, camera.z)
     const marginWorld = SCENE_CACHE_MARGIN_PX / camera.z
     const viewport = inflateRect(worldViewport(staticSurface, camera), marginWorld)
-    paintSceneBody(cache, camera, viewport)
+    paintSceneBody(cache, camera, viewport, true, previewExcludedIds)
     cacheCamX = camera.x
     cacheCamY = camera.y
     cacheCamZ = camera.z
     cacheStale = false
+    // The whole cache was just rasterized with the preview exclusion baked
+    // in, so no localized patch is owed for the current erased set.
+    eraserPreviewDirty = false
   }
 
   /**
@@ -696,9 +721,11 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   }
 
   /**
-   * Repaints one device-space strip of the cache: clip + clear it, then
-   * render the scene clipped to that strip under the cache transform
-   * centered on (`centerX`, `centerY`).
+   * Repaints vacated device-space strips of the cache. `fullRender = false`
+   * (strip paint) so the draw count / overlay set aren't published, and
+   * `previewExcludedIds` so an eraser gesture in progress stays excluded —
+   * strips are *inside* the cache, so a repaint that ignored the exclusion
+   * would reintroduce an erased stroke at the cache edge.
    */
   const renderCacheStrip = (
     cache: CanvasSurface,
@@ -728,7 +755,7 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       w: pw / s,
       h: ph / s,
     }
-    paintSceneBody(cache, { x: centerX, y: centerY, z }, viewport, false)
+    paintSceneBody(cache, { x: centerX, y: centerY, z }, viewport, false, previewExcludedIds)
     ctx.restore()
   }
 
@@ -888,81 +915,126 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   }
 
   /**
-   * Repaints only the screen-space union of pending whole-stroke erasures.
-   * The offscreen scene cache remains complete and reusable; the live static
-   * surface gets a clipped scene pass with those ink ids omitted, while the
-   * interactive surface draws the same strokes at preview opacity.
+   * One erased-region patch, in both world and cache-device coordinates.
+   * `world` is the same device-aligned rect expressed back in world units so
+   * floor/ceil rounding never leaves a cleared-but-unpainted 1px ring.
    */
-  const paintEraserPreviewPatch = (camera: CameraState): void => {
-    lastEraserPatchRects = []
-    const interaction = store.getInteractionState()
-    if (interaction.mode !== 'erasing-ink' || !interaction.draftEraser) return
-    const excludedNodes = new Set(interaction.draftEraser.erasedIds)
-    if (excludedNodes.size === 0) return
+  type EraserPatchRect = {
+    world: WorldRect
+    px: number
+    py: number
+    pw: number
+    ph: number
+  }
 
-    const margin = 2 / Math.max(0.01, camera.z)
+  /**
+   * Coalesces the pending-erasure strokes into localized cache-device rects.
+   * Touching/overlapping strokes (a drag along a line) share a rect; scattered
+   * strokes stay SEPARATE — so erasing two strokes at opposite corners
+   * repaints one small rect each, not the whole span between them (the old
+   * single-union behavior). Dense erasures collapse back to one union rect
+   * (never worse than before) — see `coalesceEraseRects`. Rectangles entirely
+   * outside the cache contribute nothing.
+   *
+   * Expressed in the CACHE's frozen frame: these are cache pixels we rewrite,
+   * so `cacheCam*` (not the live camera) is the reference.
+   */
+  const computeEraserPreviewRects = (): EraserPatchRect[] => {
+    const excluded = previewExcludedIds
+    if (!excluded || excluded.size === 0) return []
+    const cache = ensureCacheSurface()
+    const s = cacheCamZ * cache.dpr
+    const margin = SCENE_CACHE_MARGIN_PX * cache.dpr
+    const marginWorld = 2 / Math.max(0.01, cacheCamZ)
+
     const bounds: WorldRect[] = []
-    for (const id of excludedNodes) {
+    for (const id of excluded) {
       const node = store.getNode(id)
-      if (node?.type === 'ink') bounds.push(inflateRect(nodeAABB(node), margin))
+      if (node?.type === 'ink') bounds.push(inflateRect(nodeAABB(node), marginWorld))
     }
-    if (bounds.length === 0) return
+    if (bounds.length === 0) return []
 
-    // Coalesce touching/overlapping strokes (a drag along a line) into shared
-    // rects, keep scattered strokes SEPARATE — so erasing two strokes at
-    // opposite corners repaints one small rect each, not the whole span
-    // between them (the old single-union behavior). Each rect below is a fully
-    // independent scene pass, so nodes in the gaps are never iterated or
-    // filled. Dense erasures collapse back to one union rect (never worse than
-    // before) — see `coalesceEraseRects`.
     const rects = coalesceEraseRects(bounds, ERASER_PATCH_UNION_FILL_RATIO)
+    // Cache extent in world units, so an off-cache stroke contributes nothing.
+    const cacheView: WorldRect = {
+      x: cacheCamX - margin / s,
+      y: cacheCamY - margin / s,
+      w: cache.canvas.width / s,
+      h: cache.canvas.height / s,
+    }
+    const out: EraserPatchRect[] = []
+    for (const rect of rects) {
+      const x = Math.max(rect.x, cacheView.x)
+      const y = Math.max(rect.y, cacheView.y)
+      const right = Math.min(rect.x + rect.w, cacheView.x + cacheView.w)
+      const bottom = Math.min(rect.y + rect.h, cacheView.y + cacheView.h)
+      if (right <= x || bottom <= y) continue
+      const px = Math.floor((x - cacheCamX) * s + margin)
+      const py = Math.floor((y - cacheCamY) * s + margin)
+      const pr = Math.ceil((right - cacheCamX) * s + margin)
+      const pb = Math.ceil((bottom - cacheCamY) * s + margin)
+      if (pr <= px || pb <= py) continue
+      out.push({
+        px,
+        py,
+        pw: pr - px,
+        ph: pb - py,
+        world: {
+          x: (px - margin) / s + cacheCamX,
+          y: (py - margin) / s + cacheCamY,
+          w: (pr - px) / s,
+          h: (pb - py) / s,
+        },
+      })
+    }
+    return out
+  }
 
-    const viewport = worldViewport(staticSurface, camera)
-    const ctx = staticSurface.ctx
-    const scale = camera.z * staticSurface.dpr
-    const painted: WorldRect[] = []
-    // One build budget for the whole patch — each pass below passes
+  /**
+   * Rewrites the erased strokes' pixels in the OFFSCREEN cache — background +
+   * scene clipped to each coalesced rect, those ids omitted.
+   *
+   * The exclusion is a property of the cache, not a screen-space patch: every
+   * cache-serving path (1:1 present, pan strip-extend, scaled blit,
+   * scaled-extend, full re-render) then reads back ghost-free pixels. A
+   * screen-space patch would be silently undone by the next blit that fetches
+   * the original cached pixels; patching the cache keeps the two in lockstep.
+   *
+   * Localized by construction — each rect is an independent scene pass clipped
+   * to the stroke's own bounds, so scattered erasures never degrade to a
+   * viewport repaint. Caller passes the rects computed for THIS frame; it only
+   * runs when a new stroke joined the set (`eraserPreviewDirty`).
+   */
+  const applyEraserPreviewPatch = (rects: EraserPatchRect[]): void => {
+    if (rects.length === 0) return
+    const cache = ensureCacheSurface()
+    const excluded = previewExcludedIds
+    if (!excluded) return
+    const ctx = cache.ctx
+    // One build budget for the whole patch — each pass passes
     // resetInkBudget=false so N rects can't multiply the ink-raster ceiling.
     beginInkFrame()
-
-    for (const rect of rects) {
-      // Clip to the viewport — a stroke scrolled off-screen contributes nothing.
-      const x = Math.max(rect.x, viewport.x)
-      const y = Math.max(rect.y, viewport.y)
-      const right = Math.min(rect.x + rect.w, viewport.x + viewport.w)
-      const bottom = Math.min(rect.y + rect.h, viewport.y + viewport.h)
-      if (right <= x || bottom <= y) continue
-
-      const px = Math.floor((x - camera.x) * scale)
-      const py = Math.floor((y - camera.y) * scale)
-      const pr = Math.ceil((right - camera.x) * scale)
-      const pb = Math.ceil((bottom - camera.y) * scale)
-      // Repaint the SAME device-aligned rect we clear, expressed back in world
-      // units, so floor/ceil rounding never leaves a cleared-but-unpainted 1px
-      // ring at the patch border.
-      const paintedRect = {
-        x: px / scale + camera.x,
-        y: py / scale + camera.y,
-        w: (pr - px) / scale,
-        h: (pb - py) / scale,
-      }
-      painted.push(paintedRect)
-
+    for (const { px, py, pw, ph, world } of rects) {
       ctx.save()
       ctx.setTransform(1, 0, 0, 1, 0, 0)
       ctx.beginPath()
-      ctx.rect(px, py, pr - px, pb - py)
+      ctx.rect(px, py, pw, ph)
       ctx.clip()
-      ctx.clearRect(px, py, pr - px, pb - py)
-      applyCameraTransform(staticSurface, camera)
+      ctx.clearRect(px, py, pw, ph)
+      applyCacheTransform(cache, cacheCamX, cacheCamY, cacheCamZ)
       // Every pass excludes the FULL erased set: a stroke may straddle two
       // rects, and un-erased neighbours inside a rect must stay visible.
-      // resetInkBudget=false — the single beginInkFrame() above owns it.
-      paintSceneBody(staticSurface, camera, paintedRect, false, excludedNodes, false)
+      paintSceneBody(
+        cache,
+        { x: cacheCamX, y: cacheCamY, z: cacheCamZ },
+        world,
+        false,
+        excluded,
+        false,
+      )
       ctx.restore()
     }
-
-    lastEraserPatchRects = painted
+    eraserPreviewDirty = false
   }
 
   /**
@@ -1044,17 +1116,26 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
    */
   const paintStatic = (): void => {
     const camera = store.getCamera()
+    // A newly-erased stroke's rect must be patched into the cache BEFORE any
+    // tier reads it — otherwise this frame would present the not-yet-erased
+    // pixel. The patch rewrites pixels in the cache's OWN frozen frame, so it
+    // is valid at any current zoom as long as the cache content is otherwise
+    // fresh; a stale cache is left to the full render below, which bakes the
+    // exclusion in (`renderFullCache`).
+    const eraserRects = computeEraserPreviewRects()
+    if (eraserPreviewDirty && !cacheStale) applyEraserPreviewPatch(eraserRects)
     if (!cacheStale && camera.z === cacheCamZ) {
       if (viewportFitsInCache(camera)) {
         presentStatic(camera)
-        paintEraserPreviewPatch(camera)
+        lastEraserPatchRects = eraserRects.map(r => r.world)
         lastDrawPath = 'present'
         return
       }
       if (canExtend(camera)) {
         extendCache(camera)
         presentStatic(camera)
-        paintEraserPreviewPatch(camera)
+        // extend re-freezes `cacheCam*`, so report against the new frame.
+        lastEraserPatchRects = computeEraserPreviewRects().map(r => r.world)
         lastDrawPath = 'extend'
         return
       }
@@ -1077,7 +1158,7 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
         cacheCoversViewport(cacheCam, view)
       ) {
         presentStaticScaled(camera)
-        paintEraserPreviewPatch(camera)
+        lastEraserPatchRects = eraserRects.map(r => r.world)
         lastDrawPath = 'scaled'
         return
       }
@@ -1086,7 +1167,8 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
         if (layout.valid) {
           extendCacheScaled(camera, layout)
           presentStatic(camera)
-          paintEraserPreviewPatch(camera)
+          // extendCacheScaled re-freezes `cacheCam*`; report against it.
+          lastEraserPatchRects = computeEraserPreviewRects().map(r => r.world)
           lastDrawPath = 'scaled-extend'
           return
         }
@@ -1094,7 +1176,10 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     }
     renderFullCache(camera)
     presentStatic(camera)
-    paintEraserPreviewPatch(camera)
+    // Recompute against the cache frame the full render just froze (it may
+    // have rebaked at a new zoom), so the instrumentation matches the cache
+    // the pixels actually came from.
+    lastEraserPatchRects = computeEraserPreviewRects().map(r => r.world)
     lastDrawPath = 'full'
   }
 
@@ -1486,13 +1571,21 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       const { segments, size, color, opacity, options } = interaction.draftInk
       for (const samples of segments) drawInkDraft(ctx, samples, size, color, opacity, options)
     }
-    if (interaction.mode === 'erasing-ink' && interaction.draftEraser) {
-      const { point, radius, erasedIds } = interaction.draftEraser
-      for (const id of erasedIds) {
+    // Eraser preview: dim EXACTLY the set the static layer (and therefore the
+    // scene cache) excludes — same source of truth, so the two layers can't
+    // disagree. Independent of `interaction.mode`: the preview must survive a
+    // pan/zoom that took over the mode mid-erase.
+    if (previewExcludedIds) {
+      for (const id of previewExcludedIds) {
         const node = store.getNode(id)
         if (node?.type !== 'ink') continue
         drawWithNodeTransform(ctx, node, () => drawInkNodeWithOpacity(ctx, node, 0.25))
       }
+    }
+    // Eraser cursor chip — shown for the whole eraser gesture, including
+    // before the first stroke is hit (draft exists, erased set still empty).
+    if (interaction.mode === 'erasing-ink' && interaction.draftEraser) {
+      const { point, radius } = interaction.draftEraser
       ctx.save()
       ctx.beginPath()
       ctx.arc(point.x, point.y, radius, 0, Math.PI * 2)
@@ -1590,9 +1683,43 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     interactiveDirty = true
     loop.requestFrame()
   }
-  let eraserPreviewKey = ''
   const onInteractionChange = (state: InteractionState): void => {
     interactiveDirty = true
+    // ---- eraser preview lifecycle -------------------------------------
+    // Keyed on `draftEraser` presence, NOT `interaction.mode`: a pan/zoom
+    // that takes over the mode mid-erase must keep the erased strokes
+    // excluded from every cache path (and dimmed on the interactive layer),
+    // otherwise a cache blit would paint them back. The set is authoritative
+    // for BOTH layers, so they can't drift into "erased but visible" /
+    // "not erased but hidden".
+    const draft = state.draftEraser
+    const hasDraft = draft !== null && draft.erasedIds.length > 0
+    if (hasDraft) {
+      const key = draft.erasedIds.join('\u0000')
+      if (key !== eraserPreviewKey || previewExcludedIds === null) {
+        eraserPreviewKey = key
+        previewExcludedIds = new Set(draft.erasedIds)
+        // Patch the cache's erased pixels in place; do NOT stale it — the
+        // localized rewrite keeps the cheap present/extend/scaled tiers
+        // (their trigger conditions are unchanged).
+        eraserPreviewDirty = true
+        staticDirty = true
+      }
+    } else if (previewExcludedIds !== null) {
+      // Gesture ended — commit (nodes removed → `'change'` already staled)
+      // or cancel (nothing removed, but the cache still has the exclusion
+      // baked in). Either way rebuild from the committed document so no
+      // preview-period state survives.
+      eraserPreviewKey = ''
+      previewExcludedIds = null
+      eraserPreviewDirty = false
+      lastEraserPatchRects = []
+      staticDirty = true
+      cacheStale = true
+    } else {
+      eraserPreviewKey = ''
+    }
+
     // Mode transitions that affect what the static surface paints:
     //   - dragging/resizing toggle the excluded set
     //   - rotating/panning/zooming flip motion-LOD on for layered
@@ -1600,12 +1727,6 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     // Any of these need a static repaint at the transition boundary
     // so the LOD changes (motion fast-path, rough auto-disable, text
     // bitmap downscale) take effect on the very next frame.
-    const nextEraserPreviewKey =
-      state.mode === 'erasing-ink' && state.draftEraser
-        ? state.draftEraser.erasedIds.join('\u0000')
-        : ''
-    const eraserPreviewChanged = nextEraserPreviewKey !== eraserPreviewKey
-    eraserPreviewKey = nextEraserPreviewKey
     if (
       state.mode === 'dragging' ||
       state.mode === 'resizing' ||
@@ -1617,10 +1738,10 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       // A mode transition changes the excluded set and/or motion-LOD,
       // so the cache content must be rebuilt. This also guarantees the
       // first frame of a pan does a full render — which is what swaps
-      // custom-node React overlays to their canvas fallback.
+      // custom-node React overlays to their canvas fallback. (A full
+      // render bakes `previewExcludedIds` in, so an erase in progress
+      // stays ghost-free through this path too.)
       cacheStale = true
-    } else if (state.mode === 'erasing-ink' && eraserPreviewChanged) {
-      staticDirty = true
     } else if (state.mode === 'zooming') {
       // Zoom is special: the scaled-blit tier (paintStatic tier 2.5)
       // can reuse whatever cache exists at the prior zoom. Invalidating
@@ -1654,6 +1775,18 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   return {
     start() {
       loop.start()
+      // Adopt any erase already in progress (a renderer created/remounted
+      // mid-gesture never saw the `interaction` event that set the draft).
+      // Seeding the id set here means the first full render excludes it.
+      const draft = store.getInteractionState().draftEraser
+      if (draft && draft.erasedIds.length > 0) {
+        previewExcludedIds = new Set(draft.erasedIds)
+        eraserPreviewKey = draft.erasedIds.join('\u0000')
+      } else {
+        previewExcludedIds = null
+        eraserPreviewKey = ''
+      }
+      eraserPreviewDirty = false
       staticDirty = true
       cacheStale = true
       interactiveDirty = isInteractive(store.getInteractionState())
