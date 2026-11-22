@@ -126,8 +126,8 @@ function onLoad(items: LoadItem[]) {
   loadItems.value = items
 }
 
-function onLoadersready(loaders: Fastloader[], dispatchs: unknown[]) {
-  statPanel.value?.onLoadersready(loaders, dispatchs)
+function onLoadersready(session: number, loaders: Fastloader[], dispatchs: unknown[]) {
+  statPanel.value?.onLoadersready(session, loaders, dispatchs)
 }
 
 function initPlayer() {

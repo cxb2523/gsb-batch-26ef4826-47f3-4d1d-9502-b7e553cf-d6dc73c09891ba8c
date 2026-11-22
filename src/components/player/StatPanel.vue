@@ -20,6 +20,14 @@ const stat = ref<Record<string, RtcPeerStat>>({})
 /** 本端节点标识(引擎回传的 rtc.id),非资源的 swarmId */
 const mid = ref('')
 
+/**
+ * 当前统计会话序号:与 VPlayer 每次重建的 gen 对应。
+ * 旧会话的 loader 回调(rtc.stat、http 与 rtc 系列事件)一律忽略,不得写入界面
+ */
+const session = ref(0)
+/** 本会话内已绑定监听的 loader,同一会话重复调用 onLoadersready 不重复绑定 */
+let boundLoaders = new Set<Fastloader>()
+
 const names = computed(() => {
   const [v, a] = props.loadItems
   let vtitle = ''
@@ -49,30 +57,43 @@ const LEGEND: { cls: string; key: string }[] = [
   { cls: 'http-start rtc-start rtc-done', key: 'stats.bothRtc' },
 ]
 
-function bindLoader(loader: Fastloader | undefined, card: InstanceType<typeof StatCard> | null) {
-  if (!loader) return
+function bindLoader(
+  loader: Fastloader | undefined,
+  sid: number,
+  card: () => InstanceType<typeof StatCard> | null,
+) {
+  if (!loader || boundLoaders.has(loader)) return
+  boundLoaders.add(loader)
+  /** 会话已切换后,旧 loader 的迟到回调全部作废 */
+  const alive = () => sid === session.value
   // 引擎轮询时回传 (stat, uid),open/close/error 触发时只回传 stat;
   // 后者不能把已取得的节点标识清空
   loader.listen('rtc.stat', (s, uid) => {
+    if (!alive()) return
     stat.value = (s as Record<string, RtcPeerStat>) ?? {}
     if (uid) mid.value = String(uid)
   })
   loader.listen('http.start', (item) => {
-    card?.statusupdate('http-start', item as SegmentItem)
+    if (!alive()) return
+    card()?.statusupdate('http-start', item as SegmentItem)
   })
   loader.listen('http.done', (res) => {
+    if (!alive()) return
     const r = res as SegmentItem & { err?: unknown }
-    card?.statusupdate(r.err ? 'http-error' : 'http-done', r)
+    card()?.statusupdate(r.err ? 'http-error' : 'http-done', r)
   })
   loader.listen('rtc.start', (item) => {
-    card?.statusupdate('rtc-start', item as SegmentItem)
+    if (!alive()) return
+    card()?.statusupdate('rtc-start', item as SegmentItem)
   })
   loader.listen('rtc.done', (res) => {
-    card?.statusupdate('rtc-done', res as SegmentItem)
+    if (!alive()) return
+    card()?.statusupdate('rtc-done', res as SegmentItem)
   })
   loader.listen('rtc.progress', (res) => {
+    if (!alive()) return
     const r = res as { i?: number; n?: number; part?: number }
-    card?.statusupdate('progress', { no: r.part ?? 0, i: r.i, n: r.n } as SegmentItem)
+    card()?.statusupdate('progress', { no: r.part ?? 0, i: r.i, n: r.n } as SegmentItem)
   })
 }
 
@@ -87,14 +108,28 @@ function toSegments(raw: unknown): Record<number, SegmentItem> {
   return out
 }
 
-/** 由播放页在 loadersready 事件后调用 */
-function onLoadersready(loaders: Fastloader[], dispatchs: unknown[]) {
-  const [vloader, aloader] = loaders
-  const [vd, ad] = dispatchs as [unknown, unknown]
+/**
+ * 由播放页在 loadersready 事件后调用。
+ * sid 为本次加载的会话序号:新会话先清空节点标识、节点统计、分块与卡片状态,
+ * 再绑定新 loader;过期会话(小于当前序号)整体忽略。
+ * loaders 为空或缺某一路时,对应卡片保持空态,不沿用旧数据
+ */
+function onLoadersready(sid: number, loaders: Fastloader[], dispatchs: unknown[]) {
+  if (sid < session.value) return
+  if (sid !== session.value) {
+    session.value = sid
+    boundLoaders = new Set()
+    mid.value = ''
+    stat.value = {}
+    vCard.value?.reset()
+    aCard.value?.reset()
+  }
+  const [vloader, aloader] = loaders ?? []
+  const [vd, ad] = (dispatchs ?? []) as [unknown, unknown]
   vdispatch.value = toSegments(vd)
   adispatch.value = toSegments(ad)
-  bindLoader(vloader, vCard.value)
-  bindLoader(aloader, aCard.value)
+  bindLoader(vloader, sid, () => vCard.value)
+  bindLoader(aloader, sid, () => aCard.value)
 }
 
 defineExpose({ onLoadersready })

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick, useTemplateRef } from 'vue'
+import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount, nextTick, useTemplateRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { FastloadPlayer, Fastloader, LoadItem, PlayerInfo } from '@/types'
 import { buildLoadItems, buildQualityList, isModern, useWebm } from './streams'
@@ -50,7 +50,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   (e: 'init'): void
   (e: 'load', items: LoadItem[]): void
-  (e: 'loadersready', loaders: Fastloader[], dispatchs: unknown[]): void
+  (e: 'loadersready', session: number, loaders: Fastloader[], dispatchs: unknown[]): void
   (e: 'list'): void
   (e: 'ended', info: PlayerInfo): void
 }>()
@@ -80,7 +80,8 @@ const menuRow =
   'flex h-10 w-full cursor-pointer items-center gap-3 px-3.5 text-left text-[13px] text-white/90 transition-colors hover:bg-white/10'
 
 const v = ref(false)
-const loader = ref<FastloadPlayer | null>(null)
+// 引擎实例用 shallowRef:避免被 reactive 代理,保证 ready 回调里的实例同一性比较有效
+const loader = shallowRef<FastloadPlayer | null>(null)
 const delay = ref<Delayer | null>(null)
 
 const paused = ref(true)
@@ -205,16 +206,20 @@ function init() {
       }
       // 引擎以 tracker 是否为空判断是否启用 P2P,故 nop2p 直接传空串
       const tracker = props.nop2p ? '' : signalURL()
-      loader.value = new fastload({
+      const inst = new fastload({
         thread: 2,
         tracker,
         // 仅在启用 P2P 时需要
         rtcConf: tracker ? { iceServers: ICE_SERVERS } : undefined,
       })
-      loader.value.listen('ready', (loaders, dispatchs) => {
-        emit('loadersready', loaders as Fastloader[], dispatchs as unknown[])
+      loader.value = inst
+      inst.listen('ready', (loaders, dispatchs) => {
+        // 旧引擎实例被销毁后仍可能派发到期的 ready:以 gen 作为统计会话序号,
+        // 只放行当前这次重建产生的事件
+        if (gen !== initGen || loader.value !== inst) return
+        emit('loadersready', gen, loaders as Fastloader[], dispatchs as unknown[])
       })
-      loader.value.listen('error', (err) => {
+      inst.listen('error', (err) => {
         // 界面只展示 message,完整堆栈留在控制台便于排查
         console.error(err)
         video.value.error = err

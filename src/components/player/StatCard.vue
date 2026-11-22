@@ -69,7 +69,13 @@ function statusupdate(t: string, res: SegmentItem & { i?: number; n?: number }) 
   }
 }
 
-defineExpose({ statusupdate })
+/** 清空分块状态与悬停信息:新统计会话开始时由 StatPanel 调用 */
+function reset() {
+  curr.value = null
+  status.value = {}
+}
+
+defineExpose({ statusupdate, reset })
 </script>
 
 <template>
