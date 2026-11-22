@@ -214,6 +214,18 @@ blade-pass tone, airflow by dynamic pressure, tyres, touchdown, the reed
 stall horn rising in pitch, flap motor, starter, rain. Muffled in the cabin,
 with Doppler in the fly-by view.
 
+Cockpit annunciators are synthesised on the same bus and each has its own
+voice: the stall reed horn, a fast high beeper for overspeed, a rough low buzz
+for oil pressure, a slow beep for vacuum, a triple chirp for volts, a two-tone
+chime for airframe ice and a quiet tick for the turn-coordinator flag. They
+are gathered from `systems.ind` and the flight model's stall and speed by
+`js/warnings.js`, which adds a short delay either side of every threshold so a
+needle trembling on a limit cannot make them chatter. The summary is posted to
+the worklet once a frame; it never reads the flight model itself. The
+annunciators sit with the pilot (clear in the cockpit, a hint from outside),
+are soft-limited so they never drown the engine, and clear on restart or an
+aircraft change. `node test/warnings.mjs` checks the hysteresis and the reset.
+
 ## Keys
 
 Arrows yoke · A D rudder · W S throttle (airbrakes in a glider) · F V flaps ·

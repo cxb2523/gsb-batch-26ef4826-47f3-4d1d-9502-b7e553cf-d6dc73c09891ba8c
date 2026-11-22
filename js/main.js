@@ -11,6 +11,7 @@ import { Air, fetchLive, presetWeather, describe } from './weather.js';
 import { buildAircraft, buildGroundShadow } from './aircraft.js';
 import { buildCockpit, EYE } from './cockpit.js';
 import { Sound } from './audio.js';
+import { Warnings } from './warnings.js';
 import { Input } from './input.js';
 import { Nav, Coupler, loadNavaids } from './nav.js';
 import { Systems, FAILURES } from './systems.js';
@@ -60,6 +61,7 @@ const air = new Air();
 const nav = new Nav();
 let fm = null, ap = null, systems = null, coupler = null;   // one set per aircraft type
 const sound = new Sound();
+const warnings = new Warnings();
 const input = new Input(canvas);
 
 const S = {
@@ -211,6 +213,8 @@ function setAircraft(id) {
   systems = new Systems(fm);
   coupler = new Coupler(nav, ap);
   if (window.sim) Object.assign(window.sim, { fm, ap, systems, coupler, aircraft, cockpit });
+  // a new type's systems start clean: nothing from the old aircraft may keep sounding
+  warnings.reset(); sound.warn(null);
   $('planeName').textContent = def.name; $('planeRole').textContent = def.power || def.role || '';
   place();
 }
@@ -295,6 +299,8 @@ function place() {
   }
   if (!def.engine) { fm.ctl.throttle = mode === 'final' ? 0.35 : 0; fm.ctl.spoiler = fm.ctl.throttle; }   // a glider's throttle keys are its airbrake lever
   systems.reset();
+  warnings.reset();
+  sound.warn(null);                     // R or a new airport: no horn survives the reset
   fm.kollsman = S.weather.qnh * 100;
   S.settled = false; S.placedAt = performance.now(); S.flyby = null; S.chaseHdg = dep.heading;
   S.lastTouch = fm.touchdowns;
@@ -321,6 +327,8 @@ function toMenu() {
   document.body.classList.remove('flying');
   $('hud').hidden = true; $('keysBtn').hidden = true; $('keys').hidden = true; $('faultsBtn').hidden = true; $('faults').hidden = true;
   sound.setLevel(0);
+  warnings.reset();
+  sound.warn(null);
   place();
 }
 
@@ -542,6 +550,14 @@ function frame(now) {
       humidity: THREE.MathUtils.clamp(1 - (S.weather.tempC - S.weather.dewC) / 18, 0.2, 1), lat: S.airport.lat, variation: nav.out.variation || 0,
     });
     for (const ev of systems.events.splice(0)) if (ev === 'seized') toast('Engine seized', '', 3);   // never leave the pilot staring at a broken state
+    // The cockpit's annunciators, gathered with hysteresis from what the panel shows
+    // (systems.ind) and from the flight model's own stall and speed. The sound module
+    // only ever sees this summary.
+    warnings.update(dt, {
+      stall: o.stallWarn, iasKt: o.ias / KT, vne: (S.def.limits && S.def.limits.vne) || 0,
+      lowOil: systems.ind.lowOil, lowVac: systems.ind.lowVac, lowVolts: systems.ind.lowVolts,
+      tcFlag: systems.ind.tcFlag, ice: systems.ind.ice,
+    });
     if (fm.crashed && !wasCrashed) { ap.on = false; toast(fm.crashed, 'R to restart', 1e6); sound.touch(1); }
     if (fm.touchdowns !== S.lastTouch) {
       S.lastTouch = fm.touchdowns;
@@ -630,9 +646,10 @@ function frame(now) {
     sound.setLevel(S.paused ? 0 : 0.9);
     sound.update({
       rpm: o.rpm, load: c.throttle, firing: o.firing ? 1 : 0, speed: o.tas, interior: S.view === 'cockpit' ? 1 : 0,
-      roll: o.onGround ? o.wheelSpeed : 0, stall: S.view === 'cockpit' ? o.stallWarn : 0, flap: o.flapMoving ? 1 : 0,
+      roll: o.onGround ? o.wheelSpeed : 0, flap: o.flapMoving ? 1 : 0,
       rain: wet * (S.view === 'cockpit' ? 1 : 0.4), starter: c.starter ? 1 : 0, doppler, distance, turb: Math.min(1, air.sigma / 3), scrape: Math.min(1, o.scrape / 10),
     });
+    sound.warn(warnings.summary());
   }
 
   S.fade += ((S.settled || now - S.placedAt > 9000 ? 1 : 0.0) - S.fade) * Math.min(1, dt * 2.5);
@@ -700,4 +717,4 @@ function grab(caption = '', sub = '', title = false) {
   }
   return shot.toDataURL('image/jpeg', 0.94);
 }
-window.sim = { advance, bench, grab, applyTime, RECORD, toast, aircraft, cockpit, sound, fm, ap, systems, coupler, nav, setAircraft, AIRCRAFT, FAILURES, S, air, cam, input, clouds, pipeline, renderer, place, startFlight, setAirport, setWeather };
+window.sim = { advance, bench, grab, applyTime, RECORD, toast, aircraft, cockpit, sound, warnings, fm, ap, systems, coupler, nav, setAircraft, AIRCRAFT, FAILURES, S, air, cam, input, clouds, pipeline, renderer, place, startFlight, setAirport, setWeather };
