@@ -28,7 +28,6 @@ export async function prepareExport(args: ExportRequest): Promise<PreparedExport
   const { opts, base, frames, areas } = args;
   const sprite = documentContext(args.raw);
   const ratioX = opts.applyPixelRatio ? sprite.pixelRatioX : 1, ratioY = opts.applyPixelRatio ? sprite.pixelRatioY : 1;
-  const scaleX = opts.scale * ratioX, scaleY = opts.scale * ratioY;
   /** Bounds of the used pixels of the frames inside their areas (canvas coordinates) */
   function contentBounds(opts: ExportOptions, frames: number[]): Rect | null {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -81,11 +80,13 @@ export async function prepareExport(args: ExportRequest): Promise<PreparedExport
   if (opts.kind === 'sheet' && opts.sheet) {
     const so: SheetOptions = { ...opts.sheet!, frames: frames.filter(f => !!areas[f]), layer: opts.layer, scale: opts.scale, area: f => areas[f] ?? null };
     if (opts.trim && so.trim === 'none') so.trim = 'sprite';
-    const sheet = buildSheet(so, { sprite, prefs: args.grid });
+    // The builder renders at the output resolution: scale and pixel ratio are baked once,
+    // so the data file's rectangles are derived from the same geometry as the texture.
+    const sheet = buildSheet(so, { sprite, prefs: args.grid, ratioX, ratioY });
     const image = `${base}-sheet.png`;
-    const out = [{ name: image, blob: await png(scaled(sheet.canvas, scaleX, scaleY)) }];
+    const out = [{ name: image, blob: await png(sheet.canvas) }];
     if (opts.json && opts.json !== 'none')
-      out.push({ name: `${base}-sheet.json`, blob: new Blob([sheetData(sheet, base, image, opts.json, sprite, ratioX, ratioY)], { type: 'application/json' }) });
+      out.push({ name: `${base}-sheet.json`, blob: new Blob([sheetData(sheet, base, image, opts.json, sprite)], { type: 'application/json' }) });
     return out;
   }
 

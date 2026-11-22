@@ -130,16 +130,27 @@ class SoftwareCanvasRenderingContext2D {
     return new SoftwareImageData(new Uint8ClampedArray(out.buffer), w, h);
   }
 
-  drawImage(source: SoftwareCanvas, dx: number, dy: number) {
+  drawImage(source: SoftwareCanvas, ...args: number[]) {
+    // Supports the 3-, 5- and 9-argument forms with nearest-neighbour sampling.
+    // The source is copied first so drawing a canvas onto itself (extrusion) is stable.
     const pixels = source.data.slice();
-    for (let y = 0; y < source.height; y++) {
-      const dy2 = y + dy;
-      if (dy2 < 0 || dy2 >= this.canvas.height) continue;
-      for (let x = 0; x < source.width; x++) {
-        const dx2 = x + dx;
-        if (dx2 < 0 || dx2 >= this.canvas.width) continue;
-        const at = dy2 * this.canvas.width + dx2;
-        this.canvas.data[at] = composite(this.canvas.data[at], pixels[y * source.width + x], this.globalCompositeOperation, this.globalAlpha);
+    const [sx, sy, sw, sh, dx, dy, dw, dh] = args.length === 2
+      ? [0, 0, source.width, source.height, args[0], args[1], source.width, source.height]
+      : args.length === 4
+        ? [0, 0, source.width, source.height, ...args]
+        : args;
+    const ow = Math.max(1, Math.round(dw)), oh = Math.max(1, Math.round(dh));
+    const ox = Math.round(dx), oy = Math.round(dy);
+    for (let y = 0; y < oh; y++) {
+      const ty = oy + y;
+      if (ty < 0 || ty >= this.canvas.height) continue;
+      const sy2 = sy + Math.min(sh - 1, Math.max(0, Math.floor(y * sh / oh)));
+      for (let x = 0; x < ow; x++) {
+        const tx = ox + x;
+        if (tx < 0 || tx >= this.canvas.width) continue;
+        const sx2 = sx + Math.min(sw - 1, Math.max(0, Math.floor(x * sw / ow)));
+        const at = ty * this.canvas.width + tx;
+        this.canvas.data[at] = composite(this.canvas.data[at], pixels[sy2 * source.width + sx2], this.globalCompositeOperation, this.globalAlpha);
       }
     }
   }

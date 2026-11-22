@@ -4,7 +4,7 @@ import { ColorInput as ColorField } from "~/ui/ColorInput";
 import { Color } from "~/core/Color";
 import { COMMANDS, commandLabel } from "~/core/Commands";
 import { addDocuments, asepriteLosses, exportFile, exportFrames, pickFile, saveProject, sheetOptions, type ExportOptions, type ProjectFormat } from "~/core/Files";
-import { buildSheet, defaultTemplate, type SheetType, type TrimMode } from "~/core/SpriteSheet";
+import { buildSheet, defaultTemplate, sheetSize, type SheetType, type TrimMode } from "~/core/SpriteSheet";
 import { BLEND_MODES, cleanInfo, Sprite, tagsByName, type BlendMode, type TagDirection } from "~/core/Sprite";
 import { DEFAULT_PREFS, UI_FONTS, state, type Prefs } from "~/core/State";
 import { prettyCombo } from "~/core/Hotkeys";
@@ -375,20 +375,26 @@ const SheetPreview: FC<{ opts: ExportOptions; }> = ({ opts }) => {
   const key = JSON.stringify(opts);
   useEffect(() => {
     const timer = setTimeout(() => {
-      const sheet = buildSheet(sheetOptions(opts, exportFrames(opts.tag)), { sprite: state.sprite, prefs: state.prefs });
+      // Preview at 1× (cheap for large sheets); the exported builder bakes scale and
+      // pixel ratio, and every rectangle shares its geometry. Power-of-two padding is
+      // applied to the scaled size below, as the export does.
+      const sheet = buildSheet({ ...sheetOptions(opts, exportFrames(opts.tag)), scale: 1, powerOfTwo: false }, { sprite: state.sprite, prefs: state.prefs });
       const can = ref.current;
       if (!can) return;
-      // Fit into the box with whole-number zoom when it fits
       const rx = opts.applyPixelRatio ? state.sprite.pixelRatioX : 1, ry = opts.applyPixelRatio ? state.sprite.pixelRatioY : 1;
-      const box = 380, k = Math.min(8, box / Math.max(sheet.width * rx, sheet.height * ry));
+      const sx = opts.scale * rx, sy = opts.scale * ry;
+      // Fit into the box with whole-number zoom when it fits
+      const box = 380, k = Math.min(8, box / Math.max(sheet.width * sx, sheet.height * sy));
       const z = k >= 1 ? Math.floor(k) : k;
-      can.width = Math.max(1, Math.round(sheet.width * z * rx));
-      can.height = Math.max(1, Math.round(sheet.height * z * ry));
+      can.width = Math.max(1, Math.round(sheet.width * z * sx));
+      can.height = Math.max(1, Math.round(sheet.height * z * sy));
       const ctx = can.getContext('2d')!;
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(sheet.canvas, 0, 0, can.width, can.height);
       const unique = new Set(sheet.samples.map(s => s.slot)).size;
-      const text = `${sheet.width * opts.scale * rx}×${sheet.height * opts.scale * ry}px · ${sheet.samples.length} ${t('common.framesLower')}${unique < sheet.samples.length ? ` · ${unique} ${t('dialog.sheetPreview.uniqueImages')}` : ''}`;
+      // Exact exported size: the same rounding helper the builder uses for its output canvas
+      const final = sheetSize(sheet.width, sheet.height, sx, sy, !!opts.sheet?.powerOfTwo);
+      const text = `${final.w}×${final.h}px · ${sheet.samples.length} ${t('common.framesLower')}${unique < sheet.samples.length ? ` · ${unique} ${t('dialog.sheetPreview.uniqueImages')}` : ''}`;
       setInfo(text);
       // File size of the PNG that will be written (at 1×; scaling adds little to PNG size)
       sheet.canvas.convertToBlob({ type: 'image/png' }).then(b => setInfo(`${text} · ~${b.size < 1024 ? `${b.size} B` : `${(b.size / 1024).toFixed(1)} KB`}`), () => { });

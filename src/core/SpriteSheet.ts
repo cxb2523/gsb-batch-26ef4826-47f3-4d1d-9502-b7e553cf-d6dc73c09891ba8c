@@ -44,9 +44,22 @@ type Sample = {
   /** Position of the frame inside its tag (or the export) */
   index: number;
   data: Uint32Array;
+  /** Top-left of the exported area in sprite coordinates (0,0 for the whole canvas) */
+  origin: { x: number; y: number; };
+  /** Trimmed source rectangle inside the (area-sized) sample, in sample pixels */
   src: Rect;
+  /** Size of the untrimmed source frame (the exported area, or the whole sprite) */
+  source: { w: number; h: number };
   /** Placement shared by identical samples */
   slot: Slot;
+  /** Frame rectangle in the output texture (excludes inner padding and extruded edges) */
+  rect: Rect;
+  /** Trimmed region in output pixels, relative to the untrimmed source frame */
+  spriteSource: Rect;
+  /** Untrimmed source frame size in output pixels */
+  sourceSize: { w: number; h: number; };
+  /** Extruded band around the frame, in output pixels (zeros when not extruding) */
+  extrude: { left: number; top: number; right: number; bottom: number; };
 };
 
 type Slot = { w: number; h: number; x: number; y: number; band: string; };
@@ -78,6 +91,24 @@ function hash(data: Uint32Array, r: Rect, w: number) {
 
 const pow2 = (n: number) => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
 
+/** Output pixel of a logical edge; every rectangle in the data file uses this rule. */
+const edge = (n: number, k: number) => Math.round(n * k);
+
+/** Output texture size from the logical layout size; power-of-two is applied last. */
+export function sheetSize(width: number, height: number, kx: number, ky: number, powerOfTwo: boolean) {
+  const w = Math.max(1, edge(width, kx)), h = Math.max(1, edge(height, ky));
+  return { w: powerOfTwo ? pow2(w) : w, h: powerOfTwo ? pow2(h) : h };
+}
+
+/** Rectangle clipped to the source frame; at least one pixel is kept. */
+function clampRect(r: Rect, area: { w: number; h: number; }): Rect {
+  const x = Math.max(0, Math.min(r.x, area.w - 1));
+  const y = Math.max(0, Math.min(r.y, area.h - 1));
+  const x1 = Math.max(x + 1, Math.min(area.w, r.x + r.w));
+  const y1 = Math.max(y + 1, Math.min(area.h, r.y + r.h));
+  return { x, y, w: x1 - x, h: y1 - y };
+}
+
 /** Smallest-area shelf packing over a few candidate widths (tallest first) */
 function pack(slots: Slot[], spacing: number, border: number) {
   const order = slots.slice().sort((a, b) => b.h - a.h || b.w - a.w);
@@ -106,9 +137,15 @@ function pack(slots: Slot[], spacing: number, border: number) {
 export type SheetContext = {
   sprite: Pick<SpriteContext, 'width' | 'height' | 'layers' | 'frames' | 'tags' | 'slices' | 'render' | 'visibleDeep'>;
   prefs: { gridX: number; gridY: number; gridW: number; gridH: number };
+  /** Pixel aspect ratio baked into the texture; defaults to square pixels */
+  ratioX?: number;
+  ratioY?: number;
 };
 
-export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
+export function buildSheet(o: SheetOptions, { sprite, prefs, ratioX = 1, ratioY = 1 }: SheetContext) {
+  // The texture is laid out in sprite pixels, then rendered at the output scale: every
+  // rectangle in the data file uses the same rounded-edge mapping as the canvas.
+  const kx = o.scale * ratioX, ky = o.scale * ratioY;
   const areas = o.area ? o.frames.map(f => o.area!(f)).filter((r): r is Rect => !!r) : [];
   const W = o.area ? Math.max(1, ...areas.map(r => r.w)) : sprite.width;
   const H = o.area ? Math.max(1, ...areas.map(r => r.h)) : sprite.height;
@@ -120,7 +157,7 @@ export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
   const tagged = o.splitTags && sprite.tags.length
     ? sprite.tags.map(t => ({ tag: t as Tag | null, frames: o.frames.filter(f => f >= t.from && f <= t.to) })).filter(g => g.frames.length)
     : [{ tag: null as Tag | null, frames: o.frames }];
-  const samples: Omit<Sample, 'slot'>[] = [];
+  const samples: Omit<Sample, 'slot' | 'rect' | 'spriteSource' | 'sourceSize' | 'extrude'>[] = [];
   for (const { tag, frames } of tagged)
     for (const layer of layers)
       frames.forEach((frame, index) => {
@@ -128,17 +165,23 @@ export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
         const crop = new OffscreenCanvas(W, H);
         crop.getContext('2d')!.drawImage(sprite.render(frame, layer ?? undefined), r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
         const data = new Uint32Array(crop.getContext('2d')!.getImageData(0, 0, W, H).data.buffer);
-        samples.push({ frame, layer, tag, index, data, src: { x: 0, y: 0, w: W, h: H } });
+        // The untrimmed source is the exported area; sampled content starts at its top-left
+        const source = { w: Math.max(1, r.w), h: Math.max(1, r.h) };
+        samples.push({ frame, layer, tag, index, data, origin: { x: r.x, y: r.y }, src: { x: 0, y: 0, w: source.w, h: source.h }, source });
       });
 
   // 2. Trim
-  const snap = (r: Rect): Rect => {
-    if (!o.trimByGrid) return r;
-    const { gridX: gx, gridY: gy, gridW: gw, gridH: gh } = prefs;
-    const x0 = Math.floor((r.x - gx) / gw) * gw + gx, y0 = Math.floor((r.y - gy) / gh) * gh + gy;
-    const x1 = Math.ceil((r.x + r.w - gx) / gw) * gw + gx, y1 = Math.ceil((r.y + r.h - gy) / gh) * gh + gy;
-    const x = Math.max(0, x0), y = Math.max(0, y0);
-    return { x, y, w: Math.min(W, x1) - x, h: Math.min(H, y1) - y };
+  // Grid alignment uses sprite coordinates, so the area offset (slice / selection) is added
+  // before snapping and removed afterwards; the box never leaves the source frame.
+  const snap = (r: Rect, s: Omit<Sample, 'slot' | 'rect' | 'spriteSource' | 'sourceSize' | 'extrude'>): Rect => {
+    if (!o.trimByGrid) return clampRect(r, s.source);
+    const gw = Math.max(1, prefs.gridW), gh = Math.max(1, prefs.gridH);
+    const offsetX = s.origin.x - prefs.gridX, offsetY = s.origin.y - prefs.gridY;
+    const x0 = Math.floor((r.x + offsetX) / gw) * gw - offsetX;
+    const y0 = Math.floor((r.y + offsetY) / gh) * gh - offsetY;
+    const x1 = Math.ceil((r.x + r.w + offsetX) / gw) * gw - offsetX;
+    const y1 = Math.ceil((r.y + r.h + offsetY) / gh) * gh - offsetY;
+    return clampRect({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, s.source);
   };
   const bounds = samples.map(s => opaqueBounds({ w: W, h: H, data: s.data }));
   let kept = samples.map((s, i) => ({ s, b: bounds[i] }));
@@ -147,11 +190,11 @@ export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
     // One box for every frame: same-sized frames, content aligned
     let u: Rect | null = null;
     for (const { b } of kept) if (b) u = u ? { x: Math.min(u.x, b.x), y: Math.min(u.y, b.y), w: Math.max(u.x + u.w, b.x + b.w) - Math.min(u.x, b.x), h: Math.max(u.y + u.h, b.y + b.h) - Math.min(u.y, b.y) } : b;
-    const r = snap(u ?? { x: 0, y: 0, w: 1, h: 1 });
-    kept.forEach(k => { k.s.src = r; });
+    // An entirely empty sheet keeps a single-pixel placeholder instead of an empty texture
+    kept.forEach(({ s }) => { s.src = u ? snap(u, s) : { x: 0, y: 0, w: 1, h: 1 }; });
   } else if (o.trim === 'cels') {
     // An empty frame keeps a 1×1 entry so its duration and position in the tag survive
-    kept.forEach(k => { k.s.src = k.b ? snap(k.b) : { x: 0, y: 0, w: 1, h: 1 }; });
+    kept.forEach(({ s, b }) => { s.src = b ? snap(b, s) : { x: 0, y: 0, w: 1, h: 1 }; });
   }
 
   // 3. Unique images share one slot
@@ -169,11 +212,11 @@ export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
       slots.set(key, slot);
       unique++;
     }
-    all.push({ ...s, slot });
+    all.push({ ...s, slot, rect: { x: 0, y: 0, w: 0, h: 0 }, spriteSource: { x: 0, y: 0, w: 0, h: 0 }, sourceSize: { w: 1, h: 1 }, extrude: { left: 0, top: 0, right: 0, bottom: 0 } });
   }
   const list = [...slots.values()];
 
-  // 4. Layout
+  // 4. Layout (sprite pixels)
   let width = 0, height = 0;
   if (!list.length) { width = height = 1; } else if (o.type === 'packed') {
     ({ width, height } = pack(list, o.spacing, o.border));
@@ -198,34 +241,61 @@ export function buildSheet(o: SheetOptions, { sprite, prefs }: SheetContext) {
     width += o.border;
     height += o.border;
   }
-  if (o.powerOfTwo) { width = pow2(width); height = pow2(height); }
 
-  // 5. Render (each unique image once)
-  const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext('2d')!;
-  const drawn = new Set<Slot>();
+  // 5. Output geometry: one rounded-edge mapping for the canvas and every rectangle
+  const size = sheetSize(width, height, kx, ky, o.powerOfTwo);
   for (const s of all) {
-    if (drawn.has(s.slot)) continue;
-    drawn.add(s.slot);
+    const left = s.slot.x + pad, top = s.slot.y + pad;
+    // One canonical output size per rectangle: `round(size × scale)`. Frame, spriteSourceSize,
+    // sourceSize and meta.size all use it, so they agree at any scale / pixel ratio.
+    const w = Math.max(1, edge(s.src.w, kx)), h = Math.max(1, edge(s.src.h, ky));
+    const sw = Math.max(1, edge(s.source.w, kx)), sh = Math.max(1, edge(s.source.h, ky));
+    const fx = edge(left, kx), fy = edge(top, ky);
+    s.rect = { x: fx, y: fy, w, h };
+    // The frame and the trimmed region describe the same pixels; keep the offset inside the source
+    s.spriteSource = { x: Math.min(edge(s.src.x, kx), Math.max(0, sw - w)), y: Math.min(edge(s.src.y, ky), Math.max(0, sh - h)), w, h };
+    s.sourceSize = { w: sw, h: sh };
+    // One sprite pixel of edge repeats outward; rounding can push it just past the texture edge,
+    // so the canvas grows below. Inner padding stays empty: extrusion only widens the margins.
+    s.extrude = o.extrude
+      ? { left: fx - edge(left - 1, kx), top: fy - edge(top - 1, ky), right: edge(left + s.src.w + 1, kx) - fx - w, bottom: edge(top + s.src.h + 1, ky) - fy - h }
+      : { left: 0, top: 0, right: 0, bottom: 0 };
+    size.w = Math.max(size.w, fx + w + s.extrude.right); size.h = Math.max(size.h, fy + h + s.extrude.bottom);
+  }
+  if (size.w > 32768 || size.h > 32768 || size.w * size.h > 64 * 1024 * 1024) throw new Error('Export dimensions exceed the image size limit');
+
+  // 6. Render (each unique image once) at output resolution
+  const canvas = new OffscreenCanvas(size.w, size.h);
+  const ctx = canvas.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  // Each unique image is drawn once, at the size of its frame rectangle, so the data file's
+  // `frame` describes exactly the pixels that end up in the texture (trimmed/extruded excluded).
+  const drawn = new Map<Slot, Sample>();
+  for (const s of all) if (!drawn.has(s.slot)) drawn.set(s.slot, s);
+  for (const s of drawn.values()) {
     const img = new ImageData(new Uint8ClampedArray(s.data.slice().buffer), W, H);
     const tmp = new OffscreenCanvas(W, H);
     tmp.getContext('2d')!.putImageData(img, 0, 0);
-    const x = s.slot.x + pad, y = s.slot.y + pad, { w, h } = s.src;
-    ctx.drawImage(tmp, s.src.x, s.src.y, w, h, x, y, w, h);
+    const { x, y, w, h } = s.rect;
+    ctx.drawImage(tmp, s.src.x, s.src.y, s.src.w, s.src.h, x, y, w, h);
     if (o.extrude) {
-      // Copy the outermost rows/columns (and corners) one pixel outward
+      // Repeat the outermost rows/columns (and corners) outward across the reserved padding.
+      // The frame rectangle stays exactly the rendered image, so extruded pixels never count.
+      const { left: l, top: t, right: r, bottom: b } = s.extrude;
       const e = (sx: number, sy: number, sw: number, sh: number, dx: number, dy: number) => ctx.drawImage(canvas, sx, sy, sw, sh, dx, dy, sw, sh);
-      e(x, y, w, 1, x, y - 1); e(x, y + h - 1, w, 1, x, y + h);
-      e(x - 0, y - 1, 1, h + 2, x - 1, y - 1); e(x + w - 1, y - 1, 1, h + 2, x + w, y - 1);
+      if (t > 0) e(x, y, w, 1, x, y - t);
+      if (b > 0) e(x, y + h - 1, w, 1, x, y + h);
+      if (l > 0) e(x, y - t, 1, h + t + b, x - l, y - t);
+      if (r > 0) e(x + w - 1, y - t, 1, h + t + b, x + w, y - t);
     }
   }
 
-  return { canvas, width, height, samples: all, pad, extrude: o.extrude ? 1 : 0, options: o };
+  return { canvas, width: size.w, height: size.h, samples: all, pad, extrude: o.extrude ? 1 : 0, scaleX: kx, scaleY: ky, ratioX, ratioY, options: o };
 }
 
 /** The data file (hash or array flavour) describing every frame of a built sheet */
-export function sheetData(sheet: Sheet, title: string, image: string, flavour: 'hash' | 'array', sprite: SheetContext['sprite'], ratioX = 1, ratioY = 1) {
-  const o = sheet.options, k = o.scale, kx = k * ratioX, ky = k * ratioY, ex = sheet.extrude;
+export function sheetData(sheet: Sheet, title: string, image: string, flavour: 'hash' | 'array', sprite: SheetContext['sprite']) {
+  const o = sheet.options, k = o.scale, kx = sheet.scaleX, ky = sheet.scaleY;
   const entries = sheet.samples.map((s, i) => {
     const vars: Record<string, string> = {
       title, extension: 'png', layer: s.layer !== null ? sprite.layers[s.layer].name : '',
@@ -235,19 +305,19 @@ export function sheetData(sheet: Sheet, title: string, image: string, flavour: '
       layerdata: s.layer !== null ? sprite.layers[s.layer].userData?.text ?? '' : '', tagdata: s.tag?.userData?.text ?? '',
     };
     const name = fillTemplate(o.template || defaultTemplate(o), vars, i, s.index);
-    // The frame rectangle leaves the extruded pixels out
-    const frame = { x: (s.slot.x + ex) * kx, y: (s.slot.y + ex) * ky, w: (s.slot.w - 2 * ex) * kx, h: (s.slot.h - 2 * ex) * ky };
     return {
       filename: name,
-      frame,
+      // The frame rectangle is the rendered image only: inner padding and extruded pixels stay outside it
+      frame: { ...s.rect },
       rotated: false,
-      trimmed: s.src.x !== 0 || s.src.y !== 0 || s.src.w !== sprite.width || s.src.h !== sprite.height,
-      spriteSourceSize: { x: s.src.x * kx, y: s.src.y * ky, w: s.src.w * kx, h: s.src.h * ky },
-      sourceSize: { w: sprite.width * kx, h: sprite.height * ky },
+      trimmed: s.spriteSource.x !== 0 || s.spriteSource.y !== 0 || s.spriteSource.w !== s.sourceSize.w || s.spriteSource.h !== s.sourceSize.h,
+      spriteSourceSize: { ...s.spriteSource },
+      sourceSize: { ...s.sourceSize },
       duration: sprite.frames[s.frame].duration,
     };
   });
   const frames = flavour === 'hash' ? Object.fromEntries(entries.map(({ filename, ...rest }) => [filename, rest])) : entries;
+  const key = (v: number) => Math.round(v);
   return JSON.stringify({
     frames,
     meta: {
@@ -255,15 +325,16 @@ export function sheetData(sheet: Sheet, title: string, image: string, flavour: '
       version: '0.1',
       image,
       format: 'RGBA8888',
-      size: { w: sheet.width * kx, h: sheet.height * ky },
+      size: { w: sheet.width, h: sheet.height },
       scale: String(k),
-      ...(ratioX !== 1 || ratioY !== 1 ? { scaleX: kx, scaleY: ky } : {}),
+      ...(sheet.ratioX !== 1 || sheet.ratioY !== 1 ? { scaleX: kx, scaleY: ky } : {}),
       frameTags: sprite.tags.map(t => ({ name: t.name, from: t.from, to: t.to, direction: t.direction, color: t.color, ...(t.repeat ? { repeat: String(t.repeat) } : {}), ...(t.userData?.text ? { data: t.userData.text } : {}) })),
       slices: sprite.slices.map(sl => ({
         name: sl.name, color: sl.color, ...(sl.userData?.text ? { data: sl.userData.text } : {}),
-        keys: sl.keys.map(key => ({
-          frame: key.frame, bounds: { x: key.x * kx, y: key.y * ky, w: key.w * kx, h: key.h * ky },
-          ...(key.center ? { center: { x: key.center.x * kx, y: key.center.y * ky, w: key.center.w * kx, h: key.center.h * ky } } : {}), ...(key.pivot ? { pivot: { x: key.pivot.x * kx, y: key.pivot.y * ky } } : {}),
+        keys: sl.keys.map(slice => ({
+          frame: slice.frame, bounds: { x: key(slice.x * kx), y: key(slice.y * ky), w: key((slice.x + slice.w) * kx) - key(slice.x * kx), h: key((slice.y + slice.h) * ky) - key(slice.y * ky) },
+          ...(slice.center ? { center: { x: key(slice.center.x * kx), y: key(slice.center.y * ky), w: key((slice.center.x + slice.center.w) * kx) - key(slice.center.x * kx), h: key((slice.center.y + slice.center.h) * ky) - key(slice.center.y * ky) } } : {}),
+          ...(slice.pivot ? { pivot: { x: key(slice.pivot.x * kx), y: key(slice.pivot.y * ky) } } : {}),
         })),
       })),
       layers: sprite.layers.map((l, i) => {
