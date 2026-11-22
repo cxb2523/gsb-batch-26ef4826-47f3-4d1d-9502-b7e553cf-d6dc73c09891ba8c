@@ -14,6 +14,44 @@
 // ========================================
 const elements = {};
 
+// ========================================
+// UI 代次（epoch）：让所有挂起的 UI 延时回调都能识别自己属于哪一局
+// ========================================
+// 每次 resetUI()（初始化 / “再来一局”）都会递增 uiEpoch。所有经 uiSetTimeout
+// 注册的回调在触发时先比对创建时捕获的代次：代次不一致说明玩家已经重开，
+// 回调一律作废，绝不允许旧对局遗留的动画/弹窗定时器操作新对局的 DOM
+// （例如旧 hideBankerOffer 的 250ms 定时器把新对局刚弹出的报价窗隐藏）。
+let uiEpoch = 0;
+const uiTimers = new Set();
+
+/**
+ * 注册受 UI 代次保护的定时器。
+ * @param {Function} callback 回调（仅在所属对局仍有效时执行）
+ * @param {number} delay 毫秒
+ * @returns {number} 定时器 id
+ */
+function uiSetTimeout(callback, delay) {
+    const epoch = uiEpoch;
+    const id = setTimeout(() => {
+        uiTimers.delete(id);
+        // 对局已重开：旧回调作废，不触碰任何 DOM
+        if (epoch !== uiEpoch) return;
+        callback();
+    }, delay);
+    uiTimers.add(id);
+    return id;
+}
+
+/** 当前 UI 代次（调试/验收用） */
+function getUiEpoch() {
+    return uiEpoch;
+}
+
+/** 当前仍挂起的受管定时器数量（调试/验收用） */
+function getPendingUiTimerCount() {
+    return uiTimers.size;
+}
+
 // 缓存常用 DOM 元素
 function cacheElements() {
     elements.themeToggle = document.getElementById('theme-toggle');
@@ -122,8 +160,8 @@ function highlightMoneyValue(value) {
     const item = document.querySelector(selector);
     if (item) {
         item.classList.add('money-item--animating');
-        // 动画结束后移除高亮类，添加已开启类
-        setTimeout(() => {
+        // 动画结束后移除高亮类，添加已开启类（受 UI 代次保护，重开后旧回调作废）
+        uiSetTimeout(() => {
             item.classList.remove('money-item--animating');
             item.classList.add('money-item--opened');
         }, 1200);
@@ -208,8 +246,8 @@ function animateCaseOpen(caseNumber, value) {
             valueEl.className = `case__value case--${getValueClass(value)}`;
         }
 
-        // 动画结束后更新类
-        setTimeout(() => {
+        // 动画结束后更新类（受 UI 代次保护，重开后旧回调作废）
+        uiSetTimeout(() => {
             caseEl.classList.remove('case--flipping');
             caseEl.classList.add('case--opened', `case--${getValueClass(value)}`);
             caseEl.removeAttribute('role');
@@ -336,8 +374,8 @@ async function animatePlayerCaseSelection(caseNumber, value) {
 
             if (flying.parentNode) flying.parentNode.removeChild(flying);
 
-            // 清理临时类，恢复基础发光/落位动画
-            setTimeout(() => {
+            // 清理临时类，恢复基础发光/落位动画（受 UI 代次保护，重开后旧回调作废）
+            uiSetTimeout(() => {
                 elements.playerCaseBox.classList.remove('player-case__box--arrived');
                 elements.casesGrid.classList.remove('is-settling');
             }, 550);
@@ -345,7 +383,7 @@ async function animatePlayerCaseSelection(caseNumber, value) {
             resolve();
         };
         flying.addEventListener('transitionend', finish);
-        setTimeout(finish, 800); // 兜底，避免 transitionend 未触发
+        uiSetTimeout(finish, 800); // 兜底，避免 transitionend 未触发
     });
 }
 
@@ -361,7 +399,7 @@ function animateBannerOut() {
         b.classList.remove('instruction-banner--leaving');
     };
     b.addEventListener('animationend', onEnd);
-    setTimeout(onEnd, 600); // 兜底
+    uiSetTimeout(onEnd, 600); // 兜底
 }
 
 /**
@@ -425,7 +463,8 @@ async function showBankerOffer(offer, isBait = false) {
         phoneIcon.classList.add('banker-modal__phone--ringing');
         const ringDuration = (typeof TIMING !== 'undefined' && TIMING.bankerRingDuration != null)
             ? TIMING.bankerRingDuration : 900;
-        setTimeout(() => phoneIcon.classList.remove('banker-modal__phone--ringing'), ringDuration);
+        // 铃声动画纯装饰；受 UI 代次保护，重开后不再操作旧弹窗元素
+        uiSetTimeout(() => phoneIcon.classList.remove('banker-modal__phone--ringing'), ringDuration);
     }
 
     // 播放铃声音效（可选）。showBankerOffer 经由 setTimeout 触发、已脱离用户手势，
@@ -460,7 +499,8 @@ function hideBankerOffer(keepBackdrop) {
         elements.modalBackdrop.classList.remove('modal-backdrop-enter');
     }
 
-    setTimeout(() => {
+    // 受 UI 代次保护：若 250ms 过渡期内玩家重开，旧定时器不得隐藏新对局的弹窗/遮罩
+    uiSetTimeout(() => {
         elements.bankerModal.hidden = true;
         elements.bankerModalContent.classList.remove('modal-exit');
         if (!keepBackdrop) {
@@ -500,7 +540,8 @@ function hideSwitchCase() {
     elements.modalBackdrop.classList.add('modal-backdrop-exit');
     elements.modalBackdrop.classList.remove('modal-backdrop-enter');
 
-    setTimeout(() => {
+    // 受 UI 代次保护：过渡期内重开则旧定时器作废
+    uiSetTimeout(() => {
         elements.switchModal.hidden = true;
         elements.switchModalContent.classList.remove('modal-exit');
         elements.modalBackdrop.hidden = true;
@@ -580,8 +621,8 @@ function showResult() {
     // showResult 本身在 setTimeout 中调用（脱离手势），但音频上下文此前已 running，playSound 会先 await resume
     playSound(summary.beatExpected ? 'win' : 'lose');
 
-    // 触发揭示动画
-    setTimeout(() => {
+    // 触发揭示动画（受 UI 代次保护：重开后旧结算窗的揭示回调作废）
+    uiSetTimeout(() => {
         elements.resultSummary.classList.add('result-modal__summary--reveal');
         elements.resultDetails.classList.add('result-modal__details--reveal');
         elements.btnRestart.classList.add('btn--restart--reveal');
@@ -607,7 +648,8 @@ function hideResult() {
     elements.modalBackdrop.classList.add('modal-backdrop-exit');
     elements.modalBackdrop.classList.remove('modal-backdrop-enter');
 
-    setTimeout(() => {
+    // 受 UI 代次保护：过渡期内重开则旧定时器作废
+    uiSetTimeout(() => {
         elements.resultModal.hidden = true;
         elements.resultModalContent.classList.remove('modal-exit');
         elements.modalBackdrop.hidden = true;
@@ -664,8 +706,8 @@ function animatePlayerCaseOpen(value) {
         // 触发翻转动画
         box.classList.add('case--flipping');
 
-        // 动画结束后定格为已开启状态
-        setTimeout(() => {
+        // 动画结束后定格为已开启状态（受 UI 代次保护：重开后旧翻转动画回调作废）
+        uiSetTimeout(() => {
             box.classList.remove('case--flipping');
             box.classList.add('case--opened', `case--${valueClass}`);
             resolve();
@@ -677,6 +719,11 @@ function animatePlayerCaseOpen(value) {
  * 重置 UI 到初始状态
  */
 function resetUI() {
+    // 新对局开始：递增 UI 代次，使上一局所有挂起的 uiSetTimeout 回调立即失效，
+    // 任何尚未触发的旧动画/弹窗定时器都不会再操作新对局的 DOM
+    uiEpoch++;
+    uiTimers.clear();
+
     // 重新渲染金额面板
     renderMoneyPanels();
 
@@ -699,6 +746,13 @@ function resetUI() {
     elements.bankerModal.hidden = true;
     elements.switchModal.hidden = true;
     elements.resultModal.hidden = true;
+
+    // 复位所有弹窗决策按钮的可用态：disabled 不会随 hidden 自动清除，
+    // 必须在此显式启用，否则上一局结束时禁用的按钮会残留到新一局
+    setButtonDisabled('btn-deal', false);
+    setButtonDisabled('btn-no-deal', false);
+    setButtonDisabled('btn-keep', false);
+    setButtonDisabled('btn-switch', false);
 
     // 隐藏背景遮罩
     elements.modalBackdrop.hidden = true;
@@ -767,6 +821,52 @@ document.addEventListener('click', initAudioOnUserInteraction);
 document.addEventListener('keydown', initAudioOnUserInteraction);
 document.addEventListener('touchstart', initAudioOnUserInteraction);
 
+// AudioContext.resume() 的进行中标记：避免多个音效同时发起 resume
+let audioResumePending = null;
+
+/**
+ * 尝试恢复 AudioContext，但绝不无限等待。
+ * 某些环境（无手势的 headless 浏览器、被系统挂起的音频设备）下 resume() 的 Promise
+ * 可能永远 pending；若直接 await 会把调用方的整条游戏流程（银行家报价、结算……）卡死。
+ * 因此给 resume 加超时兜底：超时即视为本次不可播放，游戏逻辑照常推进。
+ * @param {AudioContext} ctx
+ * @returns {Promise<boolean>} 上下文是否已 running
+ */
+function ensureAudioRunning(ctx) {
+    if (ctx.state === 'running') return Promise.resolve(true);
+    if (audioResumePending) return audioResumePending;
+
+    let settled = false;
+    audioResumePending = new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            audioResumePending = null;
+            console.warn('[audio] AudioContext.resume() 超时，跳过本次音效');
+            resolve(false);
+        }, 300);
+
+        ctx.resume().then(
+            () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                audioResumePending = null;
+                resolve(ctx.state === 'running');
+            },
+            (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                audioResumePending = null;
+                console.warn('[audio] AudioContext.resume() 失败:', err && err.message);
+                resolve(false);
+            }
+        );
+    });
+    return audioResumePending;
+}
+
 /**
  * 简单音效播放（使用 Web Audio API 生成基础音调）
  * @param {string} type - 'ring' | 'open' | 'deal' | 'win' | 'lose'
@@ -774,19 +874,19 @@ document.addEventListener('touchstart', initAudioOnUserInteraction);
  * 修复说明（对应分析报告根因 1/3）：
  *  - 浏览器自动播放策略要求 AudioContext 必须在 running 状态才发声。resume() 是异步的，
  *    旧代码在 suspended 时调用 resume() 后立刻按"冻结的 currentTime"同步调度振荡器，
- *    事件会被浏览器静默丢弃。这里改为 `await ctx.resume()` 之后再调度。
+ *    事件会被浏览器静默丢弃。这里改为确认 resume 成功后再调度。
+ *  - resume() 本身可能永不 resolve（headless / 无音频设备环境），由 ensureAudioRunning
+ *    加超时兜底，保证音效问题绝不会阻塞游戏主流程。
  *  - 旧代码的 try/catch 完全吞掉异常，失败后无任何痕迹。这里改为打印 console.warn，
  *    并在上下文仍不可用/类型未知时显式返回，避免静默失败、便于排查。
  */
 async function playSound(type) {
     try {
         const ctx = getAudioContext();
-        // 关键修复：resume() 异步，必须先 await 再调度，否则 suspended 下会被冻结时钟丢弃事件
-        if (ctx.state === 'suspended') {
-            await ctx.resume();
-        }
+        // 带超时保护的 resume：失败/超时都不会卡住后续游戏流程
+        const running = await ensureAudioRunning(ctx);
         // 若恢复后仍未 running（例如被系统/浏览器策略禁止），放弃本次播放但给出警告
-        if (ctx.state !== 'running') {
+        if (!running || ctx.state !== 'running') {
             console.warn('[audio] AudioContext 未能进入 running 状态，跳过音效:', type);
             return;
         }
@@ -910,7 +1010,8 @@ function hideDevOptions() {
         elements.modalBackdrop.classList.add('modal-backdrop-exit');
         elements.modalBackdrop.classList.remove('modal-backdrop-enter');
     }
-    setTimeout(function () {
+    // 受 UI 代次保护：重开后旧开发者弹窗的离场定时器不再操作 DOM
+    uiSetTimeout(function () {
         elements.devModal.hidden = true;
         elements.devModalContent.classList.remove('modal-exit');
         if (!_anyOtherModalOpen()) {
@@ -1240,9 +1341,13 @@ function bindEvents(handlers) {
         }
 
         // ESC 关闭弹窗
+        // 必须与对应按钮的可用态保持一致：弹窗离场动画（250ms）期间 hidden 仍为 false，
+        // 若只判断 hidden，Esc 会在“决策已提交、弹窗正在关闭”的过渡窗内重入处理函数，
+        // 绕过决策锁导致重复结算/重复计数。disabled 与控制器的 decisionLock 同步，
+        // 因此这里直接复用按钮的 disabled 作为唯一准入门。
         if (e.key === 'Escape') {
-            if (!elements.bankerModal.hidden) handlers.onNoDeal();
-            if (!elements.switchModal.hidden) handlers.onKeep();
+            if (!elements.bankerModal.hidden && !elements.btnNoDeal.disabled) handlers.onNoDeal();
+            if (!elements.switchModal.hidden && !elements.btnKeep.disabled) handlers.onKeep();
         }
         // D 键 = Deal
         if (e.key === 'd' || e.key === 'D') {
@@ -1337,7 +1442,8 @@ function setOfferDisplay(offer) {
     if (!elements.bankerOfferAmount) return;
     elements.bankerOfferAmount.textContent = formatCurrency(offer);
     elements.bankerOfferAmount.classList.add('banker-modal__amount--animating');
-    setTimeout(() => {
+    // 受 UI 代次保护：重开后不再操作旧报价元素
+    uiSetTimeout(() => {
         if (elements.bankerOfferAmount) elements.bankerOfferAmount.classList.remove('banker-modal__amount--animating');
     }, 600);
 }
@@ -1384,5 +1490,8 @@ const UI = {
     handleTitleClick,
     devRevealAllCases,
     devRevealRemainingCases,
-    devRevealPlayerCase
+    devRevealPlayerCase,
+    // 调试/验收用：UI 代次与挂起的受管定时器计数
+    getUiEpoch,
+    getPendingUiTimerCount
 };

@@ -44,13 +44,13 @@ function calculateBankerOffer() {
 
     // 应用随机波动 ±5%~±12%
     const volatility = randomInRange(BANKER_CONFIG.volatility.min, BANKER_CONFIG.volatility.max);
-    const volatilityDirection = Math.random() < 0.5 ? -1 : 1;
+    const volatilityDirection = GameRng.random() < 0.5 ? -1 : 1;
     offer *= (1 + volatilityDirection * volatility);
 
     // 诱饵报价检查：连续拒绝多次后，有概率给出高于预期的报价
     if (state.consecutiveRejects >= BANKER_CONFIG.baitTriggerRejects) {
         const baitChance = 0.3; // 30% 概率触发诱饵
-        if (Math.random() < baitChance) {
+        if (GameRng.random() < baitChance) {
             const baitBonus = randomInRange(BANKER_CONFIG.baitBonus.min, BANKER_CONFIG.baitBonus.max);
             offer *= (1 + baitBonus);
             isBait = true;
@@ -121,7 +121,7 @@ function calculateBankerOffer() {
  * @returns {number}
  */
 function triangularRandom(min, max, mode) {
-    const u = Math.random();
+    const u = GameRng.random();
     const f = (mode - min) / (max - min);
 
     if (u < f) {
@@ -138,7 +138,7 @@ function triangularRandom(min, max, mode) {
  * @returns {number}
  */
 function randomInRange(min, max) {
-    return min + Math.random() * (max - min);
+    return min + GameRng.random() * (max - min);
 }
 
 /**
@@ -174,7 +174,7 @@ async function generateBankerOfferWithDrama() {
     const maxThink = (typeof TIMING !== 'undefined' && TIMING.bankerThinkMax != null)
         ? TIMING.bankerThinkMax : 700;
 
-    const thinkTime = minThink + Math.random() * Math.max(0, maxThink - minThink);
+    const thinkTime = minThink + GameRng.random() * Math.max(0, maxThink - minThink);
     await new Promise(resolve => setTimeout(resolve, thinkTime));
 
     return calculateBankerOffer();
@@ -193,7 +193,7 @@ function getOfferCommentary(offer, expectedValue, isBait = false) {
     // 评论文案取自 i18n 字典（银行家评论为字符串数组），随语言切换自动适配
     const pick = (key) => {
         const pool = t(key);
-        return pool[Math.floor(Math.random() * pool.length)];
+        return pool[Math.floor(GameRng.random() * pool.length)];
     };
 
     // 修复: 直接使用传入的 isBait 参数，避免依赖模块级变量 _lastBaitApplied 导致竞态风险

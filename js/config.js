@@ -74,7 +74,22 @@ const TIMING = {
     bankerThinkMax: 700,
 
     // 报价弹窗出现后电话铃声动画播放时长（不阻塞按钮，纯装饰）
-    bankerRingDuration: 900
+    bankerRingDuration: 900,
+
+    // 弹窗（银行家/交换/结算）离场动画时长，与 CSS modalExit/fadeOut 的 0.25s 保持一致
+    modalExitDuration: 250,
+
+    // 拒绝报价后 -> 交换弹窗出现的间隔（覆盖银行家弹窗离场窗）
+    switchEnterDelay: 500,
+
+    // 还价提交后展示银行家回应 -> 自动走完 DEAL/NO DEAL 流程的间隔
+    haggleSettleDelay: 900,
+
+    // 决策后揭晓玩家箱子 -> 弹出结算窗的间隔
+    resultRevealDelay: 600,
+
+    // 交换确认后两个箱子的交换动画时长
+    switchAnimationDuration: 600
 };
 
 // ========================================
@@ -143,6 +158,49 @@ function getValueClass(value) {
 }
 
 /**
+ * 全局随机数入口（RNG seam）。
+ * 游戏内所有随机行为（洗牌、报价波动、诱饵判定、还价结果等）统一经 GameRng.random()
+ * 取随机数，而不是直接调用 Math.random()。默认实现仍委托给 Math.random()，行为不变；
+ * 调试/验收时可通过 window.DealOrNoDeal.rng.setSeeded(seed) 注入确定性随机序列，
+ * 使整局（含箱子分配）可复现，或用 setCustom(fn) 临时接管。
+ */
+const GameRng = {
+    // 当前生效的随机数函数，返回 [0, 1)。默认即 Math.random。
+    _fn: Math.random,
+
+    /** 取一个 [0, 1) 的随机数 */
+    random() {
+        return this._fn();
+    },
+
+    /** 恢复为原生 Math.random */
+    reset() {
+        this._fn = Math.random;
+    },
+
+    /** 自定义随机数函数（须返回 [0, 1)），便于测试逐次指定返回值 */
+    setCustom(fn) {
+        this._fn = typeof fn === 'function' ? fn : Math.random;
+    },
+
+    /**
+     * 注入确定性伪随机序列（mulberry32）。
+     * 同一 seed 下，箱子分配与银行家报价完全可复现，便于验收回放。
+     * @param {number} seed
+     */
+    setSeeded(seed) {
+        let a = seed >>> 0;
+        this._fn = function () {
+            a |= 0;
+            a = (a + 0x6D2B79F5) | 0;
+            let t = Math.imul(a ^ (a >>> 15), 1 | a);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+};
+
+/**
  * 打乱数组（Fisher-Yates算法）
  * @param {Array} array - 要打乱的数组
  * @returns {Array} 打乱后的新数组
@@ -150,7 +208,7 @@ function getValueClass(value) {
 function shuffleArray(array) {
     const result = [...array];
     for (let i = result.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
+        const j = Math.floor(GameRng.random() * (i + 1));
         [result[i], result[j]] = [result[j], result[i]];
     }
     return result;

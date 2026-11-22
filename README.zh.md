@@ -532,6 +532,35 @@ window.DealOrNoDeal.UI             // 渲染 / 动画辅助
 打开浏览器控制台即可查看 `StateManager.getState()`、手动构造报价，或以编程方式
 逐步推进游戏。
 
+### 异步交接与确定性辅助
+
+“开箱完成 → 银行家来电 → 接受/拒绝/还价 → 交换或结算”整条链路由**对局代次
+（generation）**与 **UI 代次（epoch）**双重保护：每个挂起定时器都会捕获自己所属的
+代次，重开时一律作废，旧回调不可能落到新对局上。调试对象同时暴露了这些观测点：
+
+```js
+const D = window.DealOrNoDeal;
+
+// 可控随机（箱子洗牌、报价计算、还价结果）
+D.rng.setSeeded(42);        // 注入确定性伪随机序列，同一 seed 下整局完全可复现
+D.rng.setCustom(fn);        // 用自定义 () => [0,1) 接管随机源
+D.rng.reset();              // 恢复原生 Math.random
+
+// 可控定时：把链路上的所有等待压缩到极短，便于快速验收
+D.timing.fast(10);          // 思考/铃声/弹窗过渡/还价结算/结算揭晓统一 -> 10ms
+D.timing.restore();         // 恢复 config.js 中的原始时长
+D.timing.set({ haggleSettleDelay: 500 }); // 逐项覆盖
+
+// 异步交接观测点
+D.getGeneration();          // 每次（重）开局 +1，旧回调据此判定自己是否已失效
+D.getUiEpoch();             // 每次 UI.resetUI() +1
+D.getPendingTimerCount();   // 仍挂起的受管定时器数量（流程稳定后应为 0）
+```
+
+重开会作废所有飞行中的回调；决策锁只在弹窗真正可交互时释放，绝不会在弹窗过渡窗内
+放开；交换弹窗显示、玩家箱金额与最终结算全部读取同一份状态，不会出现“界面已交换而
+结算仍用旧值”。
+
 ## 许可证
 
 本项目基于 [MIT 许可证](LICENSE) 开源。

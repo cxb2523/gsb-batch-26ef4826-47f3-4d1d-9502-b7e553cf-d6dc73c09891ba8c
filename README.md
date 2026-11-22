@@ -596,6 +596,37 @@ window.DealOrNoDeal.UI             // rendering/animation helpers
 Open the browser console to inspect `StateManager.getState()`, force offers, or
 step through the game programmatically.
 
+### Async handoff & determinism helpers
+
+The offer → deal/no-deal/haggle → swap/settlement chain is guarded by a
+**game generation** and a **UI epoch**: every pending timer captures the
+generation/epoch it belongs to and is invalidated on restart, so stale callbacks
+can never land on a new game. The debug object exposes these for verification:
+
+```js
+const D = window.DealOrNoDeal;
+
+// Controllable randomness (case shuffle, offer math, haggle outcome)
+D.rng.setSeeded(42);        // deterministic mulberry32 stream — whole game reproducible
+D.rng.setCustom(fn);        // take over the RNG with your own () => [0,1)
+D.rng.reset();              // back to Math.random
+
+// Controllable timing — collapse every wait on the chain for fast verification
+D.timing.fast(10);          // think/ring/transition/haggle/result delays all -> 10ms
+D.timing.restore();         // restore the values from config.js
+D.timing.set({ haggleSettleDelay: 500 }); // override individual keys
+
+// Handoff observation points
+D.getGeneration();          // increments on every (re)start; stale callbacks compare against it
+D.getUiEpoch();             // increments on every UI.resetUI()
+D.getPendingTimerCount();   // managed timers still pending (0 once a flow settles)
+```
+
+A restart invalidates all in-flight callbacks, the decision lock is released
+only when a modal is truly interactive (never inside a transition window), and
+the swap display / player-case value / final settlement all read from the same
+state object.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
