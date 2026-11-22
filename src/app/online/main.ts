@@ -28,6 +28,7 @@ import { Peer } from '../../net/Peer';
 import { Outbox, decodePacket, encodeHash, encodeSay, INPUT, HASH, SAY } from '../../net/packet';
 import { Relay } from '../../hal/net/Relay';
 import { SoundOutput } from '../../hal/audio/SoundOutput';
+import { playSoundCalls } from '../../engine/sound/port';
 import { startHero } from '../landing/hero';
 import { startClock } from './clock';
 import type { NetTransport } from '../../net/transport';
@@ -284,7 +285,7 @@ function runLeg(wire: NetTransport, files: RaceFiles, deal: Deal, mine: number, 
     extra: built.extra, viewport: VP,
   });
   renderer.race = r;
-  if (sound) r.sound = sound;
+  if (sound) { r.sound = sound; sound.beginRace(); sound.resume(); }   // a clean driver for this leg
   if (own) { own.jumpTo(built.ds, CARS[mine]!); renderer.view = own; renderer.hudCar = CARS[mine]!; }
   const peer = new Peer(r, deal.humans, deal.smoothness);
   let frame: Uint8Array | undefined;
@@ -407,12 +408,7 @@ function runLeg(wire: NetTransport, files: RaceFiles, deal: Deal, mine: number, 
       if (packet) wire.send(packet);
       if (sound) {
         // The ah=5, ah=8 and ah=0a calls the race made, exactly as the single player page drains them.
-        for (const { fn, arg } of r.sounds) {
-          if (fn === 8) { sound.play(arg, true); continue; }
-          if (fn === 0x0A && sound.isPlaying(arg)) continue;
-          sound.play(arg);
-        }
-        r.sounds.length = 0;
+        playSoundCalls(sound, r.sounds);
         sound.pump();
       }
       if (corruptAt > 0 && !corrupted && peer.step >= corruptAt) {
@@ -450,9 +446,9 @@ function runLeg(wire: NetTransport, files: RaceFiles, deal: Deal, mine: number, 
         say('');
       }
 
-      if (gone) { say('everybody else left'); ended = true; sound?.stopAll(); finish(undefined); return; }
+      if (gone) { say('everybody else left'); ended = true; sound?.endRace(); finish(undefined); return; }
       if (peer.over) {
-        sound?.stopAll();
+        sound?.endRace();                                // ah=6, its queues emptied so none of it reaches the table
         present();
         ended = true;
         finish({ places: CARS.map(bx => built.ds.r16(bx + 0x12EF)) });

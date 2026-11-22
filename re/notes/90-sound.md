@@ -204,8 +204,43 @@ Wired into game.html: the songs at the title, SELECT GAME, the character select,
 results board and the verdict, and the silence fn 11aa and fn 3104 ask for around a race.
 
 The race is wired too. Its 24 ah=5 / ah=0a calls were already recorded by `Race.sounds` (a queue of
-`{fn, arg}`), which game.html now drains into the driver after every step: fn 5 plays, fn 0a plays only if
-that sound is not already on a channel.
+`{fn, arg}`), which game.html drains into the driver after every step through `playSoundCalls`: fn 5 plays,
+fn 8 plays on the second queue, fn 0a plays only if that sound is not already on a channel, and **fn 6 / fn 7
+are handed to the driver's own deferred stop** rather than acted on at the call site.
+
+### The life of one race (port only)
+
+The original driver never stops running and the game trusts it to; the port cannot, because a browser leaves
+the audio clock running across a pause and the driver keeps its channel records from one screen to the next.
+Three facts shape the lifecycle:
+
+- **ah=6 and ah=7 are deferred.** Fn 0804 / 0841 set a flag that fn 021a honours at the start of the next
+  tick. So a pause, which reads the key halfway through a logic step, has to say *what it wants* now and let
+  the tick do it: clearing slots or queues at the call site would be overwritten by the record the race loop
+  writes in the same step.
+- **An engine note is one held note, re-bent.** Fn 0294 never keys an engine record off between notes (sound
+  numbers 0x40 and up), so a pause that only reset a clock would keep the pitch the car had when Space went
+  down. The note has to be *released*, and on resume the game's fn 7b46 writes the current speed, which
+  starts the record again from scratch — exactly as if the race had just begun.
+- **The menu music starts in the same frame the race's ah=6 is issued.** Letting that stop wait for its tick
+  is right, but the sounds the race had already queued would then be picked up behind the song.
+
+`SoundDriver` therefore has four port-only calls, and ah=9 changes its answer as soon as ah=6 / ah=7 are asked
+for (the chip, the channels and the queues still wait for the tick, as the driver has them). Without that,
+`title()` — which is ah=7, ah=6 and then `song(1)` — would skip its own request, because [125b] still said
+song 1 was playing, and the tick's stop would leave the title silent.
+
+| call | when | what it does |
+|---|---|---|
+| `suspend()` | fn 35f0, the pause key | asks for a full stop (both queues, every channel) at the next tick, then holds every clock until `resume()`; the chip is silent and no sequence advances |
+| `resume()` | `Race.endPause()` | starts the sequencer again; nothing is un-paused, the engine starts again from the pitch the game writes next |
+| `beginRace()` | `startRace` (fn 11aa) | lets go of both queues and every channel **now**, not on a tick: the last race's engine record and queued effects must not take the new race's channels |
+| `endRace()` | fn 3104 | ah=6, with both queues emptied at once so nothing of the race reaches the menu song started in the same frame |
+
+`test/engine/soundLifecycle.test.ts` covers all of it against a synthetic driver image (the real one is not
+in the repository): the deferred stop, the silent hold and the re-pitched engine, a clean handover between two
+races, a screen stopping and re-asking for the same song, the old song's channels released when a screen asks
+for another, and the race wiring that calls `suspend`/`resume` around the pause.
 
 ## Levels
 

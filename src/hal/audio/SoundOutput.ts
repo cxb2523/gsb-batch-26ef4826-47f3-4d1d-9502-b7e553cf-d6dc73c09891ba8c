@@ -76,4 +76,8 @@ export class SoundOutput implements SoundPort {
   stopAll(): void { this.driver.stopAll(); }
   stopVoices(): void { this.driver.stopVoices(); }
   engine(car: number, pitch: number, running: boolean): void { this.driver.engine(car, pitch, running); }
+  suspend(): void { this.driver.suspend(); }
+  resume(): void { this.driver.resume(); }
+  beginRace(): void { this.driver.beginRace(); }
+  endRace(): void { this.driver.endRace(); }
 }

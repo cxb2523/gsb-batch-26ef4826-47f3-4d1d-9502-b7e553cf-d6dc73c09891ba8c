@@ -73,6 +73,8 @@ export class SoundDriver {
   private readonly music = new Uint8Array(QUEUE_LEN);       // ah=8
   private stopEverything = false;                           // ah=6, done on the next tick
   private stopChannels = false;                             // ah=7
+  private suspended = false;                                // the sequencer is held (see suspend())
+  private suspendPending = false;                           // ... from the next tick boundary
   private musicRate = 0; private musicAccum = 0;            // 16.16 sequencer ticks per game tick
   private effectRate = 0; private effectAccum = 0;                                      // [125b]: the sound ah=9 reports on
 
@@ -108,6 +110,7 @@ export class SoundDriver {
     this.musicRate = this.dword(MUSIC_RATE); this.musicAccum = this.word(MUSIC_ACCUM);
     this.effectRate = this.dword(EFFECT_RATE_AT); this.effectAccum = this.word(EFFECT_ACCUM);
     this.stopEverything = false; this.stopChannels = false;
+    this.suspended = false; this.suspendPending = false;
   }
 
   /** The same region as `loadState` reads, with the TypeScript-side state written back into it. */
@@ -171,6 +174,7 @@ export class SoundDriver {
 
   /** fn 06c8 (ah=5) and fn 06c3 (ah=8): put a sound number in one of the two eight-slot queues. */
   play(sound: number, music = false): boolean {
+    if (this.suspended) return false;                       // held: nothing may be picked up behind the pause
     const queue = music ? this.music : this.effects;
     if (sound >= 0x40 && queue.includes(sound)) return true;   // one engine note per car at a time
     const free = queue.indexOf(0);
@@ -192,19 +196,77 @@ export class SoundDriver {
     return this.slots.some(s => s.state !== 0 && s.sound === sound);
   }
 
-  /** fn 0804 (ah=6) and fn 0841 (ah=7): both take effect on the next tick, as in the driver. */
-  stopAll(): void { this.stopEverything = true; }
-  stopVoices(): void { this.stopChannels = true; }
+  /** How many of the sixteen channel records are in use. Diagnostics for the lifecycle tests. */
+  get playingVoices(): number { return this.slots.filter(s => s.state !== 0).length; }
+
+  /** True while the sequencer is held between suspend() and resume(). */
+  get paused(): boolean { return this.suspended || this.suspendPending; }
+
+  /**
+   * fn 0804 (ah=6) and fn 0841 (ah=7): both take effect on the next tick, as in the driver.
+   *
+   * What ah=9 reports changes at once, though. Every screen that changes song does ah=7, ah=6 and then asks
+   * for its song through ah=9 (`FrontEnd.song`), and the title asks for song 1 again. If the stale number
+   * were still there, `title()` would skip its request and the tick's stop would leave the title silent.
+   * Which song is *playing* is therefore cleared here; the chip, the channels and the two request queues are
+   * left to the tick, exactly as the driver leaves them.
+   */
+  stopAll(): void { this.stopEverything = true; this.data[CURRENT_SONG] = 0; }
+  stopVoices(): void { this.stopChannels = true; this.data[CURRENT_SONG] = 0; }
+
+  /**
+   * A game pause is not an ah=6. Ah=6 silences the chip but leaves the sequencer ticking, which is fine
+   * between two screens and wrong for a pause: a released note would still run down its countdown, and the
+   * engine record would go on bending the pitch the car had when Space was pressed. `suspend` asks for the
+   * same full stop at the next tick boundary (the pause key is read halfway through a logic step) and then
+   * holds every clock, so the chip stays silent and nothing moves until `resume`.
+   */
+  suspend(): void { this.suspendPending = true; }
+
+  /** Release the sequencer again. Everything starts from the queues and the records as they are now. */
+  resume(): void { this.suspended = false; this.suspendPending = false; }
+
+  /**
+   * Between two races: both request queues and every channel are let go at once rather than at the next
+   * tick, because no tick is pending yet and a sound left over from the last race must not find a channel
+   * when the new one queues its first engine note. A pending song request goes too: it belonged to the
+   * screen that has just been left.
+   */
+  beginRace(): void { this.suspended = false; this.suspendPending = false; this.reset(true); }
+
+  /**
+   * Out of a race: ah=6, which the tick after this honours, exactly as the driver does. The queues are
+   * emptied here rather than on the tick so that nothing the race queued after its last step can leak into
+   * the menu music started in the same frame; the chip itself goes quiet on the next tick.
+   */
+  endRace(): void {
+    this.effects.fill(0); this.music.fill(0);
+    this.data[REQUESTED_SONG] = 0;
+    this.suspended = false; this.suspendPending = false;
+    this.stopEverything = true;
+  }
+
+  /** Everything off at once, both queues included. fn 080d's silence list through fn 019d. */
+  private reset(clearRequest: boolean): void {
+    this.effects.fill(0); this.music.fill(0);
+    this.silence();                                          // keys every slot off and shuts the operators up
+    for (const s of this.slots) { s.state = 0; s.sound = 0; }
+    this.data[CURRENT_SONG] = 0;
+    if (clearRequest) this.data[REQUESTED_SONG] = 0;
+    this.stopEverything = false; this.stopChannels = false;
+  }
 
   /** fn 021a: one tick of the sequencer, called at 70.086 Hz by the game's int 8 handler. */
   tick(): void {
-    if (this.stopEverything) {
-      this.effects.fill(0);
-      this.silence();
-      for (const s of this.slots) { s.state = 0; s.sound = 0; }
-      this.stopEverything = false; this.data[CURRENT_SONG] = 0;
+    if (this.suspended) return;                              // held: no queue, no clock, no advance
+    // a pause asked for between two ticks is taken at the boundary, like ah=6 itself
+    if (this.suspendPending) {
+      this.suspendPending = false; this.suspended = true; this.reset(false);
+      return;
     }
-    if (this.stopChannels) {                                 // fn 084a: only the song's own tracks
+    if (this.stopEverything) {
+      this.reset(false);                                     // ah=6 clears both queues and every channel
+    } else if (this.stopChannels) {                          // fn 084a: only the song's own tracks
       const tracks = this.word(TRACK_COUNT);
       for (let i = 0; i < Math.min(tracks, CHANNELS); i++) {
         const s = this.slots[i]!;

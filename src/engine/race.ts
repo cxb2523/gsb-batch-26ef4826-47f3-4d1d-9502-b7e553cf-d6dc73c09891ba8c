@@ -1486,6 +1486,9 @@ export class Race {
   private fn35f0(): void {
     const d = this.d;
     this.snd(6, 0);                                          // 35f0: ah=8 with a stale al, then ah=6
+    // The original leaves the driver's clock running through a pause; in the port the pause holds it, so a
+    // note does not run down its countdown behind the banner and the engine does not keep its old pitch.
+    this.sound?.suspend?.();
     this.cheatSpot();
     d.w16(0x2633, 1);
     this.fn7af8();
@@ -1528,7 +1531,13 @@ export class Race {
   /** F12 on the pause screen: fn 35bf dumps the back buffer to a numbered file. The page decides how. */
   screenDump = false;
 
-  private endPause(): void { this.d.w16(0x2633, 0); this.pauseStage = 0; }
+  private endPause(): void {
+    this.d.w16(0x2633, 0); this.pauseStage = 0;
+    // Back to the race: the sequencer runs again, and the next render pass writes the pitch each car has
+    // *now*, so the engines pick up from the current speed rather than from the note held when Space went
+    // down. Nothing is resumed as playing: every slot was released when the pause began.
+    this.sound?.resume?.();
+  }
 
   /** 35fe: the CHEATS.BIN record the player's car is standing on, if any. */
   private cheatSpot(): void {

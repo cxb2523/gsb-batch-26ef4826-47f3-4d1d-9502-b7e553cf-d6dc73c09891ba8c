@@ -15,6 +15,7 @@ import { DataSegment } from '../../engine/memory';
 import { Keyboard } from '../../engine/keyboard';
 import { FrontEnd, newArena, loadFrontEndBanks } from '../../engine/frontend';
 import { SoundOutput } from '../../hal/audio/SoundOutput';
+import { playSoundCalls } from '../../engine/sound/port';
 import { frontEnd, chooseOpponents, championshipBoard, verdict, elimination, champion, preRaceCard,
   timerTick, pollInput, applyOptionsInputs, type Request, type Task } from '../../engine/menus';
 import { Championship } from '../../engine/sequence';
@@ -334,7 +335,12 @@ async function main(): Promise<void> {
       inputs: [ds.r16(0x2658), ds.r16(0x265A), ds.r16(0x265C), ds.r16(0x265E)],
       characters: [ds.r16(0x2668), ds.r16(0x266A), ds.r16(0x266C), ds.r16(0x266E)], viewport: VIEWPORT,
     }, ds);
-    sound?.stopVoices();                               // fn 11aa: the song stops for the race
+    // fn 11aa asks ah=7 before a race, which stops the card's song tracks. The port goes one step further:
+    // beginRace() lets go of both request queues and every channel at once, so a sound or an engine note
+    // still hanging from the last race cannot take the channel the new one needs. (ah=7 would also be
+    // deferred to the next tick, and would then key off the engine note started in the meantime.)
+    sound?.beginRace();
+    sound?.resume?.();                                 // a pause must never outlive the race it was in
     palette = paletteToRgba(decodePalette(assets.palette));
     race = new Race(ds, VIEWPORT);
     race.devices = devices;
@@ -415,6 +421,9 @@ async function main(): Promise<void> {
   function stepRaceFrame(now: number): 'running' | 'over' | 'error' {
     acc += Math.min(0.1, (now - last) / 1000); last = now;
     if (race!.paused) {                                  // the tick counters keep running while paused
+      // The pause queued its ah=6; drain it as every other frame does. The driver is ticking from the audio
+      // clock all the while, so this lands on the boundary the driver chose, not now.
+      if (sound) playSoundCalls(sound, race!.sounds);
       while (acc >= TICK) {
         acc -= TICK;
         ticks++;
@@ -434,10 +443,17 @@ async function main(): Promise<void> {
           const blink = Math.floor(ticks);
           ds.w8(0x26D0, blink & 0x1F); ds.w8(0x26CF, (blink >> 5) & 1);
           race!.stepPhysics(ds.r8(0x107D), ds.r8(0x107C));
-          if (race!.paused) { pausedFrame(); return 'running'; }   // fn 35f0: the page drives the pause
+          if (race!.paused) {                                // fn 35f0: the page drives the pause
+            if (sound) playSoundCalls(sound, race!.sounds);  // the pause's ah=6, for the driver's next tick
+            pausedFrame();
+            return 'running';
+          }
           if (race!.over) {
             race = undefined; renderer = undefined;
-            sound?.stopAll();                          // fn 3104: silence at the end of a race
+            // fn 3104: ah=6, and the menu music starts in the same frame. The driver honours the stop on
+            // its next tick, so endRace() also drops both queues now rather than let the race's last few
+            // sounds find a channel behind the song.
+            sound?.endRace();
             ds.w8(0x107E, 0);
             palette = frontPalette;
             present(fe.vram);
@@ -445,14 +461,7 @@ async function main(): Promise<void> {
           }
           if (race!.rendersThisStep) frame = renderer!.render(() => race!.renderSideEffects());
           race!.stepPost(); steps++;
-          if (sound) {                                 // the ah=5, ah=8 and ah=0a calls the race made
-            for (const { fn, arg } of race!.sounds) {
-              if (fn === 8) { sound.play(arg, true); continue; }
-              if (fn === 0x0A && sound.isPlaying(arg)) continue;
-              sound.play(arg);
-            }
-          }
-          race!.sounds.length = 0;
+          if (sound) playSoundCalls(sound, race!.sounds);   // the ah=5, ah=8 and ah=0a calls the race made
         }
       }
     } catch (e) {
