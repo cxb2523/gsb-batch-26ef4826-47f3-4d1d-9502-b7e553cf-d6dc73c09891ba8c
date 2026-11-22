@@ -445,3 +445,89 @@ test('MCP: spectral tools are listed and noise_reduction learns + applies in one
   assert.ok(pj.track.length <= 120 && pj.track.length >= 100);
   assert.ok(pj.summary.voicedFraction > 0.6);
 });
+
+// ── noise print lifecycle across the derivation chain ──────────────────
+const importAsset = async (name) => {
+  const res = await fetch(`${BASE}/api/projects/${pid}/assets?name=${name}`, { method: 'POST', body: fs.readFileSync(path.join(dir, 'noisy.wav')), headers: { 'Content-Type': 'audio/wav' } });
+  assert.equal(res.status, 201);
+  return (await res.json()).id;
+};
+const printsDir = () => path.join(dir, 'data', 'projects', pid, 'noiseprints');
+const printFiles = () => fs.readdirSync(printsDir());
+
+let chainA, chainB, chainC;
+test('API: a derived asset reuses the source noise print (storedOn points at the real file)', async () => {
+  chainA = await importAsset('chain-a');
+  const np = await j('POST', `/api/projects/${pid}/assets/${chainA}/noiseprint`, { start: 0, end: 0.9 });
+  assert.equal(np.status, 201, JSON.stringify(np.data));
+  const r1 = await j('POST', `/api/projects/${pid}/assets/${chainA}/denoise-print`, { reductionDb: 15, replaceInClips: false });
+  assert.equal(r1.status, 201, JSON.stringify(r1.data));
+  chainB = r1.data.asset.id;
+  // The denoised asset inherits the print of its source; storedOn says where it really lives.
+  const gb = await j('GET', `/api/projects/${pid}/assets/${chainB}/noiseprint`);
+  assert.equal(gb.status, 200);
+  assert.equal(gb.data.noisePrint.assetId, chainB);
+  assert.equal(gb.data.noisePrint.storedOn, chainA);
+  // Denoising the derived asset again (no start/end) reuses the same print.
+  const r2 = await j('POST', `/api/projects/${pid}/assets/${chainB}/denoise-print`, { replaceInClips: false });
+  assert.equal(r2.status, 201, JSON.stringify(r2.data));
+  chainC = r2.data.asset.id;
+  assert.equal(r2.data.noisePrint.storedOn, chainA);
+  const gc = await j('GET', `/api/projects/${pid}/assets/${chainC}/noiseprint`);
+  assert.equal(gc.data.noisePrint.storedOn, chainA);
+  // Still only one print file on disk: the source's. No copies were made.
+  const own = [chainA, chainB, chainC].map((a) => `${a}.json`);
+  assert.deepEqual(printFiles().filter((f) => own.includes(f)), [`${chainA}.json`]);
+});
+
+test('API: DELETE noiseprint clears the whole inheritance chain, then denoise is 409', async () => {
+  const other = await importAsset('other');
+  const np = await j('POST', `/api/projects/${pid}/assets/${other}/noiseprint`, { start: 0, end: 0.9 });
+  assert.equal(np.status, 201, JSON.stringify(np.data));
+  // Deleting on the grandchild also clears the print stored on the source it inherits from.
+  const del = await j('DELETE', `/api/projects/${pid}/assets/${chainC}/noiseprint`);
+  assert.equal(del.status, 204);
+  for (const a of [chainA, chainB, chainC]) {
+    const g = await j('GET', `/api/projects/${pid}/assets/${a}/noiseprint`);
+    assert.equal(g.data.noisePrint, null, `print should be gone on ${a}`);
+    const d = await j('POST', `/api/projects/${pid}/assets/${a}/denoise-print`, {});
+    assert.equal(d.status, 409, `denoise on ${a} should report no print`);
+    assert.equal(d.data.error.code, 'no_noiseprint');
+  }
+  assert.ok(!fs.existsSync(path.join(printsDir(), `${chainA}.json`)));
+  // An asset outside the chain keeps its print.
+  const g = await j('GET', `/api/projects/${pid}/assets/${other}/noiseprint`);
+  assert.equal(g.data.noisePrint.storedOn, other);
+  assert.ok(fs.existsSync(path.join(printsDir(), `${other}.json`)));
+});
+
+test('API: a failed asset in a denoise batch leaves no print file and no cross-asset reuse', async () => {
+  const m1 = await importAsset('batch-1');
+  const m2 = await importAsset('batch-2');
+  // Batch asset 1: learn + denoise in one call, print stored on itself.
+  const ok1 = await j('POST', `/api/projects/${pid}/assets/${m1}/denoise-print`, { start: 0, end: 0.9, replaceInClips: false });
+  assert.equal(ok1.status, 201, JSON.stringify(ok1.data));
+  // Batch asset 2 fails (bad learn range): no print file, no half-written temp file.
+  const bad = await j('POST', `/api/projects/${pid}/assets/${m2}/denoise-print`, { start: 3, end: 1, replaceInClips: false });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(printFiles().filter((f) => f.includes(m2) || f.endsWith('.tmp')), []);
+  // The failed asset does not fall back to the previous batch asset's print.
+  const d = await j('POST', `/api/projects/${pid}/assets/${m2}/denoise-print`, {});
+  assert.equal(d.status, 409);
+  assert.equal(d.data.error.code, 'no_noiseprint');
+  // When it does learn, it gets its own print, not asset 1's.
+  const ok2 = await j('POST', `/api/projects/${pid}/assets/${m2}/denoise-print`, { start: 0, end: 0.9, replaceInClips: false });
+  assert.equal(ok2.status, 201, JSON.stringify(ok2.data));
+  const g2 = await j('GET', `/api/projects/${pid}/assets/${m2}/noiseprint`);
+  assert.equal(g2.data.noisePrint.storedOn, m2);
+  // A corrupt or half-written print file counts as "no print", never as one to denoise with.
+  const broken = await importAsset('batch-broken');
+  fs.writeFileSync(path.join(printsDir(), `${broken}.json`), `{"assetId":"${broken}","channels":[[`);
+  const gb = await j('GET', `/api/projects/${pid}/assets/${broken}/noiseprint`);
+  assert.equal(gb.status, 200);
+  assert.equal(gb.data.noisePrint, null);
+  const db = await j('POST', `/api/projects/${pid}/assets/${broken}/denoise-print`, {});
+  assert.equal(db.status, 409);
+  assert.equal(db.data.error.code, 'no_noiseprint');
+  fs.rmSync(path.join(printsDir(), `${broken}.json`), { force: true });
+});

@@ -894,6 +894,9 @@ export class SpectralView {
           const r = await (await request('POST', `/api/projects/${this.app.pid}/assets/${aid}/denoise-print`, body)).json();
           const m = r.measured?.noisePrintRangeDbfs;
           if (m) toast(`Noise in the print range: ${m.before} → ${m.after} dBFS`, { kind: 'ok' });
+          // The result asset inherits the print through its derivation chain;
+          // refresh the status line (live sync also re-reads it when the clip swaps).
+          this.loadPrint();
         });
       } }],
     });

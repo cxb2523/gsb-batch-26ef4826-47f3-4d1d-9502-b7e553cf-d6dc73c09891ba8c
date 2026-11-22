@@ -89,16 +89,43 @@ export async function register({ api, json, wrap, store, mcpTools, actorOf }) {
   const printDir = (pid) => path.join(store.projectDir(pid), 'noiseprints');
   const printFile = (pid, aid) => path.join(printDir(pid), `${aid}.json`);
 
-  // Noise print stored on the asset or (following derivedFrom) on the asset it was made from.
-  async function loadPrint(pid, aid) {
+  // Asset ids from `aid` up the derivedFrom chain (aid first): exactly the
+  // assets whose noise prints `aid` can inherit.
+  function printChain(pid, aid) {
     const assets = store.get(pid).assets;
+    const ids = [];
     let a = assets.find((x) => x.id === aid);
     for (let hops = 0; a && hops < 64; hops++) {
-      const txt = await fs.readFile(printFile(pid, a.id), 'utf8').catch(() => null);
-      if (txt) return { profile: JSON.parse(txt), storedOn: a.id };
+      ids.push(a.id);
       a = a.derivedFrom && assets.find((x) => x.id === a.derivedFrom);
     }
+    return ids;
+  }
+
+  // Noise print stored on the asset or (following derivedFrom) on the asset it was made from.
+  async function loadPrint(pid, aid) {
+    for (const id of printChain(pid, aid)) {
+      const txt = await fs.readFile(printFile(pid, id), 'utf8').catch(() => null);
+      if (!txt) continue;
+      // A corrupt or half-written file (e.g. left by an interrupted batch) counts
+      // as no print here, never as a print to denoise with.
+      try { return { profile: JSON.parse(txt), storedOn: id }; } catch { /* keep looking up the chain */ }
+    }
     return null;
+  }
+
+  // Atomic write: a reader (or the next asset in a batch) only ever sees the
+  // previous complete print or the new complete print, never a half-written one.
+  async function writePrint(pid, aid, profile) {
+    await fs.mkdir(printDir(pid), { recursive: true });
+    const tmp = path.join(printDir(pid), `.${aid}.${newId('tmp')}.tmp`);
+    try {
+      await fs.writeFile(tmp, JSON.stringify(profile));
+      await fs.rename(tmp, printFile(pid, aid));
+    } catch (err) {
+      await fs.rm(tmp, { force: true });
+      throw err;
+    }
   }
 
   async function registerAsset(pid, wavFile, { name, actor, derivedFrom, process }) {
@@ -231,8 +258,7 @@ export async function register({ api, json, wrap, store, mcpTools, actorOf }) {
     if (!(end > body.start)) throw new OpError(`end must be greater than start (asset is ${asset.duration} s long)`, 'invalid_args', 400);
     const profile = await runJob({ op: 'learn', src: store.assetPath(pid, aid), start: body.start, end });
     profile.assetId = aid; profile.createdAt = new Date().toISOString(); profile.createdBy = actor;
-    await fs.mkdir(printDir(pid), { recursive: true });
-    await fs.writeFile(printFile(pid, aid), JSON.stringify(profile));
+    await writePrint(pid, aid, profile);
     return { noisePrint: { assetId: aid, storedOn: aid, createdAt: profile.createdAt, createdBy: actor, ...describeProfile(profile) } };
   }
 
@@ -293,7 +319,11 @@ export async function register({ api, json, wrap, store, mcpTools, actorOf }) {
   }));
   api.delete('/projects/:id/assets/:aid/noiseprint', wrap(async (req, res) => {
     findAsset(req.params.id, req.params.aid);
-    await fs.rm(printFile(req.params.id, req.params.aid), { force: true });
+    // Clear every print this asset could inherit — its own and the ones stored
+    // up its derivedFrom chain — so a later GET finds nothing and a denoise
+    // without start/end fails with no_noiseprint instead of hitting a stale
+    // print. Prints of assets outside the chain are untouched.
+    for (const id of printChain(req.params.id, req.params.aid)) await fs.rm(printFile(req.params.id, id), { force: true });
     res.status(204).end();
   }));
   api.post('/projects/:id/assets/:aid/denoise-print', json, wrap(async (req, res) => {
