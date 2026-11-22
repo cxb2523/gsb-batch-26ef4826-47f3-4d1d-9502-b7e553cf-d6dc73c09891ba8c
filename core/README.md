@@ -515,9 +515,21 @@ Browser playback uses `WebAudioConnection` to subscribe to the shared `AudioPlay
 same server-volume-adjusted Opus packets as Discord Voice. The WebSocket gateway is application-provided; ZiPlayer does not create
 or host it.
 
-`WebAudioConnection` watches the shared `AudioPlayer`: when the audio source changes abruptly (skip, stop, seek, resource reload)
-it discards its per-socket backlog and sends a `playback:flush` control message, so listeners never hear leftover frames of the
-previous track. A track that ends by itself is left to play out. You can also call `webConnection.flush()` manually.
+`WebAudioConnection` watches the shared `AudioPlayer` and models every abrupt source change (skip, stop, seek, resource reload) as
+an explicit **session-generation switch** via `flush()`:
+
+1. the pending packet and every per-socket backlog of the old generation are dropped; each frame is tagged with its generation, so
+   a frame of the old resource that arrives late is refused on send and a frame of the new resource can never be discarded by the
+   old generation;
+2. sequence and the microsecond media timestamp are re-aligned to 0, so the first frame of the new resource starts a gap-free run
+   and listeners detect no holes;
+3. a `playback:flush` control message (carrying the new `generation`) tells browsers to drop their buffered audio and re-arm their
+   sequence expectation.
+
+Per-socket queues stay independent: a slow listener keeps applying `maxBufferedBytes`, `maxQueuedPackets` and its `dropPolicy`,
+and drop statistics accumulate across the switch. A track that ends by itself (the resource stream reached EOF) is left to play
+out and never flushes; after `destroy()` no frame or flush is sent anymore. You can also call `webConnection.flush(reason)`
+manually.
 
 Install the browser receiver separately:
 

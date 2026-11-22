@@ -36,6 +36,7 @@ export interface WebAudioConnectionStats {
 	droppedPackets: number;
 	droppedBytes: number;
 	sequence: number;
+	generation: number;
 	activeSockets: number;
 	speaking: boolean;
 	status: VoiceConnectionStatus;
@@ -173,11 +174,27 @@ export class WebAudioConnection extends EventEmitter {
 
 	private readonly sockets = new Set<WebSocketLike>();
 	private readonly socketCleanups = new Map<WebSocketLike, () => void>();
-	private readonly socketQueues = new Map<WebSocketLike, Array<{ frame: Buffer; sequence: number; size: number }>>();
+	/**
+	 * Per-socket backlog. Every entry carries the session generation it was produced in so that,
+	 * after a flush, stale entries can never be sent even if a drain loop races the generation switch.
+	 */
+	private readonly socketQueues = new Map<
+		WebSocketLike,
+		Array<{ frame: Buffer; sequence: number; size: number; generation: number }>
+	>();
 
 	private pendingPacket: Buffer | null = null;
+	/** Generation of {@link pendingPacket}; a pending packet of an older generation is discarded on flush. */
+	private pendingGeneration = 0;
 	private sequence = 0;
 	private mediaTimestampUs = 0n;
+	/**
+	 * Session generation. Starts at 0 and is bumped on every {@link flush}. All frames produced after a
+	 * flush carry the new generation; any frame carrying an older generation is dropped instead of sent,
+	 * so old-resource frames can never enter the new generation and new-resource frames can never be
+	 * discarded by an older one.
+	 */
+	private generation = 0;
 	private speaking = false;
 	private destroyed = false;
 	private manuallyDisconnected = false;
@@ -208,6 +225,11 @@ export class WebAudioConnection extends EventEmitter {
 
 	public get isSpeaking(): boolean {
 		return this.speaking;
+	}
+
+	/** Current session generation; bumped on every flush (and reset for a fresh subscription). */
+	public get currentGeneration(): number {
+		return this.generation;
 	}
 
 	public isAvailableForPacing(): boolean {
@@ -359,25 +381,48 @@ export class WebAudioConnection extends EventEmitter {
 	}
 
 	/**
-	 * Resets sequence and media timestamp counters to 0 (e.g. for a new track or session generation).
+	 * Starts a fresh session: resets sequence and media timestamp counters to 0 and invalidates every
+	 * frame of the previous session (pending packet and per-socket backlog). Called on a new
+	 * subscription; abrupt in-session source changes go through {@link flush} instead.
 	 */
 	public reset(): void {
+		this.generation = (this.generation + 1) >>> 0;
 		this.sequence = 0;
 		this.mediaTimestampUs = 0n;
 		this.pendingPacket = null;
+		this.pendingGeneration = this.generation;
+		for (const queue of this.socketQueues.values()) queue.length = 0;
 	}
 
 	/**
-	 * Drops every audio frame that is queued but not yet delivered (pending packet and per-socket
-	 * backlog) and tells listeners to discard what they already buffered. Call it whenever the audio
-	 * source changes abruptly (skip, stop, seek, resource reload) so stale frames of the previous
-	 * track are never heard before the new one. Sequence/timestamps keep counting, so there is no gap.
+	 * Performs an explicit session-generation switch for an abrupt source change (skip, stop, seek,
+	 * resource reload):
+	 * - the pending packet and every per-socket backlog of the old generation are dropped and can never
+	 *   be sent afterwards (each frame is tagged with its generation and stale frames are refused on send);
+	 * - sequence and the microsecond media timestamp are re-aligned to 0, so the first frame of the new
+	 *   resource starts a gap-free run (sequence 0, timestamp 0) and listeners detect no holes;
+	 * - a `playback:flush` control message carrying the new generation tells listeners to discard what
+	 *   they already buffered.
+	 * Frames of the old resource that arrive afterwards keep the old generation and are refused; frames
+	 * of the new resource carry the new generation and are never discarded by the old one. A natural
+	 * play-out to EOF does not call this, so the tail of a finished track is never cut.
 	 */
 	public flush(reason = "manual"): void {
 		if (this.destroyed) return;
+		this.generation = (this.generation + 1) >>> 0;
+		this.sequence = 0;
+		this.mediaTimestampUs = 0n;
 		this.pendingPacket = null;
+		this.pendingGeneration = this.generation;
 		for (const queue of this.socketQueues.values()) queue.length = 0;
-		const message = JSON.stringify({ v: 1, type: "playback:flush", sessionId: this.sessionId, reason });
+		const generation = this.generation;
+		const message = JSON.stringify({
+			v: 1,
+			type: "playback:flush",
+			sessionId: this.sessionId,
+			reason,
+			generation,
+		});
 		for (const socket of [...this.sockets]) {
 			if (socket.readyState !== 1 /* OPEN */) continue;
 			try {
@@ -387,13 +432,25 @@ export class WebAudioConnection extends EventEmitter {
 				this.detachSocket(socket);
 			}
 		}
-		this.emit("flush", reason);
+		this.emit("flush", reason, generation);
 	}
 
-	/** Flushes on every abrupt source change observed on the subscribed AudioPlayer. */
+	/**
+	 * Flushes on every abrupt source change observed on the subscribed AudioPlayer.
+	 *
+	 * A transition out of a non-Idle state always carries audio that must be fenced off:
+	 * - non-Idle -> Idle with a stream that did not reach EOF is an abrupt cut (stop/skip/destroyed
+	 *   stream) and flushes; a stream that reached EOF is a natural end and must NOT flush, so the
+	 *   last frames of the finished track still play out;
+	 * - non-Idle -> a *different* resource (skip/seek rebuild) flushes before any frame of the new
+	 *   resource can be prepared.
+	 * Transitions out of Idle need no flush: either nothing ever played, the previous track ended
+	 * naturally (its tail is preserved), or an abrupt stop already flushed on its way to Idle.
+	 */
 	private watchPlayer(player: AudioPlayer): void {
 		this.unwatchPlayer();
 		const listener = (oldState: AudioPlayerState, newState: AudioPlayerState) => {
+			if (this.destroyed) return;
 			// Coming from Idle there is no previous audio to discard: either nothing played, the track
 			// ended by itself (its tail must still be heard) or an abrupt stop already flushed below.
 			if (oldState.status === AudioPlayerStatus.Idle) return;
@@ -446,10 +503,13 @@ export class WebAudioConnection extends EventEmitter {
 
 	/**
 	 * Called by AudioPlayer._stepPrepare() roughly every 20ms with the raw Opus packet Buffer.
+	 * The packet is tagged with the session generation currently active so a flush happening between
+	 * prepare and dispatch makes it stale: it is then discarded instead of entering the new generation.
 	 */
 	public prepareAudioPacket(packet: Buffer): void {
-		if (this.state.status !== VoiceConnectionStatus.Ready) return;
+		if (this.destroyed || this.state.status !== VoiceConnectionStatus.Ready) return;
 		this.pendingPacket = packet;
+		this.pendingGeneration = this.generation;
 	}
 
 	/**
@@ -457,6 +517,7 @@ export class WebAudioConnection extends EventEmitter {
 	 * Completely non-blocking: never awaits or blocks AudioPlayer's 20ms scheduler cycle.
 	 */
 	public dispatchAudio(): void {
+		if (this.destroyed) return;
 		if (this.state.status !== VoiceConnectionStatus.Ready) {
 			this.pendingPacket = null;
 			return;
@@ -464,6 +525,13 @@ export class WebAudioConnection extends EventEmitter {
 		const packet = this.pendingPacket;
 		if (!packet) return;
 		this.pendingPacket = null;
+
+		// A flush between prepare and dispatch switched generations: this packet belongs to the old
+		// resource and must never enter the new generation.
+		if (this.pendingGeneration !== this.generation) {
+			this.debugLogger?.("[WebAudioConnection] Discarded prepared packet of a flushed session generation");
+			return;
+		}
 
 		if (packet.length === 0 || !validateOpusPacketFraming(packet) || !validateOpusPacketDuration(packet, 20)) {
 			this.debugLogger?.(`[WebAudioConnection] Dropped invalid or non-20ms Opus packet (length: ${packet.length})`);
@@ -478,6 +546,10 @@ export class WebAudioConnection extends EventEmitter {
 		const durationUs = BigInt(Math.round(durationMs * 1000));
 		this.mediaTimestampUs += durationUs;
 
+		// Frames produced in this dispatch all belong to one generation. A flush cannot interleave with
+		// this synchronous loop, but every queued entry is tagged anyway so stale entries are refused on
+		// later drain cycles even if a flush emptied the queue out from under a slow socket.
+		const currentGeneration = this.generation;
 		let encodedFrame: Buffer | null = null;
 
 		// Dispatch to all attached sockets
@@ -492,9 +564,15 @@ export class WebAudioConnection extends EventEmitter {
 
 			const queue = this.socketQueues.get(socket) ?? [];
 
-			// First, drain any previously queued packets if socket buffer has capacity
+			// First, drain any previously queued packets if socket buffer has capacity. Entries from an
+			// older generation are stale and removed without being sent (a flush already purged the
+			// backlog; this is a belt-and-braces refusal against any ordering surprise).
 			while (queue.length > 0) {
 				const next = queue[0];
+				if (next.generation !== currentGeneration) {
+					queue.shift();
+					continue;
+				}
 				const buffered = socket.bufferedAmount ?? 0;
 				if (buffered + next.frame.length > this.maxBufferedBytes) {
 					break;
@@ -526,7 +604,8 @@ export class WebAudioConnection extends EventEmitter {
 					this.detachSocket(socket);
 				}
 			} else {
-				// Socket is congested or has queued frames
+				// Socket is congested or has queued frames. Backlog handling is fully independent per
+				// socket: each queue grows, drops and drains on its own against the shared limits.
 				if (queue.length >= this.maxQueuedPackets) {
 					if (this.dropPolicy === "drop-oldest" && queue.length > 0) {
 						const dropped = queue.shift()!;
@@ -541,8 +620,8 @@ export class WebAudioConnection extends EventEmitter {
 							droppedBytes: this.droppedBytes,
 							reason: "maxQueuedPackets exceeded (drop-oldest)",
 						});
-						this.emit("drop", { socket, sequence: dropped.sequence, bytes: dropped.size });
-						queue.push({ frame: encodedFrame, sequence: seq, size: packet.length });
+						this.emit("drop", { socket, sequence: dropped.sequence, bytes: dropped.size, generation: dropped.generation });
+						queue.push({ frame: encodedFrame, sequence: seq, size: packet.length, generation: currentGeneration });
 					} else if (this.dropPolicy === "disconnect") {
 						this.droppedPackets++;
 						this.droppedBytes += packet.length;
@@ -552,7 +631,7 @@ export class WebAudioConnection extends EventEmitter {
 							droppedBytes: this.droppedBytes,
 							reason: "backpressure limit exceeded (disconnect)",
 						});
-						this.emit("drop", { socket, sequence: seq, bytes: packet.length });
+						this.emit("drop", { socket, sequence: seq, bytes: packet.length, generation: currentGeneration });
 						try {
 							socket.close(1013, "Listener is too slow");
 						} catch {}
@@ -570,10 +649,10 @@ export class WebAudioConnection extends EventEmitter {
 							droppedBytes: this.droppedBytes,
 							reason: "maxBufferedBytes or maxQueuedPackets exceeded (drop-newest)",
 						});
-						this.emit("drop", { socket, sequence: seq, bytes: packet.length });
+						this.emit("drop", { socket, sequence: seq, bytes: packet.length, generation: currentGeneration });
 					}
 				} else {
-					queue.push({ frame: encodedFrame, sequence: seq, size: packet.length });
+					queue.push({ frame: encodedFrame, sequence: seq, size: packet.length, generation: currentGeneration });
 				}
 			}
 		}
@@ -583,6 +662,7 @@ export class WebAudioConnection extends EventEmitter {
 			size: packet.length,
 			timestampMs: Number(timestampUs / 1000n),
 			timestampUs,
+			generation: currentGeneration,
 		});
 	}
 
@@ -627,6 +707,7 @@ export class WebAudioConnection extends EventEmitter {
 		this.socketCleanups.clear();
 		this.socketQueues.clear();
 		this.pendingPacket = null;
+		this.pendingGeneration = this.generation;
 		this.removeAllListeners();
 	}
 
@@ -637,6 +718,7 @@ export class WebAudioConnection extends EventEmitter {
 			droppedPackets: this.droppedPackets,
 			droppedBytes: this.droppedBytes,
 			sequence: this.sequence,
+			generation: this.generation,
 			activeSockets: this.sockets.size,
 			speaking: this.speaking,
 			status: this.state.status,

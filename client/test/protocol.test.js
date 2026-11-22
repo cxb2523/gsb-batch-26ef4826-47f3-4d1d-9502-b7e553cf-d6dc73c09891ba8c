@@ -844,3 +844,93 @@ test("WebAudioClient playback:flush drops buffered audio without leaving the pla
 		else globalThis.AudioWorkletNode = originalAudioWorkletNode;
 	}
 });
+
+// Builds a Wire Format v1 binary Opus frame with the given sequence and microsecond timestamp.
+function buildOpusFrame(sequence, timestampUs, marker = 0) {
+	const frame = new ArrayBuffer(20);
+	const view = new DataView(frame);
+	view.setUint8(0, 0x5a); // Magic 'ZI'
+	view.setUint8(1, 0x49);
+	view.setUint8(2, 1); // protocol version
+	view.setUint8(3, 1); // Opus flag
+	view.setUint32(4, sequence, false); // big-endian sequence
+	view.setBigUint64(8, BigInt(timestampUs), false); // big-endian microsecond timestamp
+	new Uint8Array(frame).set([0xf8, 0xff, 0xfe, marker], 16);
+	return frame;
+}
+
+test("WebAudioClient playback:flush re-arms sequence expectation so the restarted run reports no gap", async () => {
+	const originalAudioWorkletNode = globalThis.AudioWorkletNode;
+	class FakeAudioWorkletNode {
+		port = { postMessage() {} };
+		connect() {}
+		disconnect() {}
+	}
+	globalThis.AudioWorkletNode = FakeAudioWorkletNode;
+	class MockOpusDecoder {
+		async initialize() {}
+		decode() {
+			return { samples: new Float32Array(960 * 2), peak: 0.5 };
+		}
+		reset() {}
+		free() {}
+	}
+	const client = new WebAudioClient({
+		audioContextFactory: () => ({
+			sampleRate: 48_000,
+			state: "running",
+			destination: {},
+			audioWorklet: { async addModule() {} },
+			async resume() {},
+			async close() {
+				this.state = "closed";
+			},
+		}),
+		opusDecoderFactory: () => new MockOpusDecoder(),
+	});
+	const gaps = [];
+	client.addEventListener("sequencegap", ({ detail }) => gaps.push(detail));
+	try {
+		await client.createAudioOutput();
+		client.receiveControlMessage(
+			JSON.stringify({
+				v: 1,
+				type: "audio:config",
+				sessionId: "gap-session",
+				protocolVersion: 1,
+				codec: "opus",
+				sampleRateHz: 48_000,
+				channels: 2,
+			}),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		// First generation: 0, 1, 2 — no gaps.
+		client.receiveOpusFrame(buildOpusFrame(0, 0));
+		client.receiveOpusFrame(buildOpusFrame(1, 20_000));
+		client.receiveOpusFrame(buildOpusFrame(2, 40_000));
+		assert.equal(gaps.length, 0, "a continuous sequence must not report gaps");
+
+		// The publisher flushes (skip/seek generation switch) and restarts the run at sequence 0.
+		client.receiveControlMessage(
+			JSON.stringify({ v: 1, type: "playback:flush", sessionId: "gap-session", reason: "resource-changed", generation: 2 }),
+		);
+
+		// Without the re-arm, sequence 0 after expecting 3 would be reported as a gap. The flush must
+		// make the first frame of the new generation the accepted gap-free start.
+		client.receiveOpusFrame(buildOpusFrame(0, 0));
+		assert.equal(gaps.length, 0, "the first re-aligned frame after flush must not be a sequence gap");
+		client.receiveOpusFrame(buildOpusFrame(1, 20_000));
+		client.receiveOpusFrame(buildOpusFrame(2, 40_000));
+		assert.equal(gaps.length, 0, "the new generation runs continuously from the re-aligned value");
+
+		// A genuine hole inside the new generation is still detected.
+		client.receiveOpusFrame(buildOpusFrame(5, 100_000));
+		assert.equal(gaps.length, 1, "real sequence holes after the flush must still be reported");
+		assert.deepEqual(gaps[0], { expectedSequence: 3, receivedSequence: 5 });
+	} finally {
+		await client.disconnect();
+		if (originalAudioWorkletNode === undefined) delete globalThis.AudioWorkletNode;
+		else globalThis.AudioWorkletNode = originalAudioWorkletNode;
+	}
+});

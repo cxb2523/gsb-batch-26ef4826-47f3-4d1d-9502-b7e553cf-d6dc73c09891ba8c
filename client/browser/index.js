@@ -834,8 +834,11 @@ export class WebAudioClient extends EventTarget {
 				this.setState("playing");
 				break;
 			case "playback:flush":
-				// Abrupt source change (skip/seek/stop): drop buffered audio of the old source without
-				// leaving the "playing" state, so stale frames never play before the new track.
+				// Abrupt source change (skip/seek/stop): the publisher switched session generation. It
+				// drops every in-flight frame of the old generation and restarts the sequence/timestamp
+				// run of the new resource at 0, so re-arm the sequence expectation: the first frame of
+				// the new generation is accepted as the gap-free start instead of a sequence hole.
+				this.expectedSequence = null;
 				this.pendingOpusFrames = [];
 				this.opusDecoder?.reset();
 				this.workletNode?.port.postMessage({ type: "flush" });
