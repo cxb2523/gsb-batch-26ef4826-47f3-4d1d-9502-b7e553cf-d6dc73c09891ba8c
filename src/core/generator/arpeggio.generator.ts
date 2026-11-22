@@ -12,8 +12,13 @@ import { getTrainedMarkovTable, makeTonicRelativeEncoder } from './trained-marko
 import { patternIndex, type ArpeggioPattern } from './arp-pattern'
 import { arpOctavePool } from './arp-octave'
 import { cycleArpInversion, getArpInversionAnchors, getArpInversionBarOffset } from './arp-inversion'
-import { calculateArpVelocity, maskArpBarSteps } from './arp-rhythm'
-import { findActiveArpChord, getArpChordVoicingPitches, getArpVoicingPassingPitches } from './arp-voicing'
+import { calculateArpVelocity, maskArpSegments } from './arp-rhythm'
+import {
+  arpHarmonySegmentKey,
+  findActiveArpChord,
+  getArpChordVoicingPitches,
+  getArpVoicingPassingPitches
+} from './arp-voicing'
 import { DEFAULT_GENERATOR_PARAMS } from '../../config/defaults'
 import type { WorkRange } from './work-range'
 
@@ -108,7 +113,7 @@ function harmonyAt(step: number, options: ArpeggioGeneratorOptions): Harmony {
   const wantsVoicing = options.pitchSource === 'chord-voicing'
   return {
     chord: active,
-    identity: active ? active.id : `synthetic:${bar}`,
+    identity: arpHarmonySegmentKey(options.chords, step, bar),
     chromas,
     rootChroma: namedRoot !== undefined && chromas.has(namedRoot) ? namedRoot : chromas.values().next().value,
     // Why: In voicing mode a missing or invalid voicing falls back to the synthetic pitch-class
@@ -149,19 +154,39 @@ function noteId(seed: number, index: number): string {
 }
 
 /**
- * Bar-local steps the generator iteration actually visits, starting at its first step inside the
- * bar. Why: a work range may start off the global rate grid (e.g. any dotted-rate range that does
- * not begin on a multiple of 3), and rest masking must judge exactly the steps that will play —
- * a grid-derived mask would be phase-shifted against them and could silence whole bars.
+ * Splits a bar's visited steps at chord changes and masks each harmonic segment separately.
+ *
+ * Why: density masking used to run once per fixed bar and anchor only bar-local step 0. A chord
+ * entering mid-bar therefore had its first visited step treated as an ordinary weak beat, which
+ * could be dropped — the new harmony arrived with no root. Masking per segment keeps the first
+ * visited step of every segment (including mid-bar chord entries) sounding, while still thinning
+ * the remaining steps by metric priority.
+ *
+ * Steps are derived from the visited phase (never the global rate grid) so a work range that does
+ * not start on the rate grid is masked against the exact positions that will play.
  */
-function visitedBarSteps(firstStep: number, bar: number, end: number, rateSteps: number): number[] {
+function planBarMask(
+  firstStep: number,
+  bar: number,
+  end: number,
+  rateSteps: number,
+  density: number,
+  seed: number,
+  chords: readonly ChordEvent[] | undefined
+): Set<number> | null {
+  if (density >= 100) return null
   const barStart = bar * STEPS_PER_BAR
-  const limit = Math.min(end, barStart + STEPS_PER_BAR)
-  const steps: number[] = []
-  for (let step = firstStep; step < limit; step += rateSteps) {
-    steps.push(step - barStart)
+  const segments: number[][] = []
+  let segmentKey: string | null = null
+  for (let step = firstStep; step < Math.min(end, barStart + STEPS_PER_BAR); step += rateSteps) {
+    const key = arpHarmonySegmentKey(chords, step, bar)
+    if (key !== segmentKey) {
+      segmentKey = key
+      segments.push([])
+    }
+    segments[segments.length - 1].push(step - barStart)
   }
-  return steps
+  return maskArpSegments(segments, density, seed, bar)
 }
 
 function pickModelIndex(
@@ -235,10 +260,7 @@ export function generateArpeggio(options: ArpeggioGeneratorOptions): AppNote[] {
     const bar = Math.floor(step / STEPS_PER_BAR)
     if (bar !== currentBar) {
       currentBar = bar
-      barActiveSteps =
-        effectiveDensity >= 100
-          ? null
-          : maskArpBarSteps(visitedBarSteps(step, bar, end, rateSteps), effectiveDensity, options.seed, bar)
+      barActiveSteps = planBarMask(step, bar, end, rateSteps, effectiveDensity, options.seed, options.chords)
     }
     if (barActiveSteps && !barActiveSteps.has(stepInBar)) {
       continue

@@ -45,6 +45,19 @@ export function findActiveArpChord(chords: readonly ChordEvent[] | undefined, st
 }
 
 /**
+ * Identity of the harmonic segment sounding at a step.
+ *
+ * Why: chord changes are not tied to bar lines — a chord may enter mid-bar. Density masking and
+ * melodic state resets must therefore group steps by the active chord (or by the synthetic
+ * per-bar triad fallback), never assume one harmony per fixed bar. The bar component keeps the
+ * synthetic fallback distinct across bars while adjacent identical chords stay the same segment.
+ */
+export function arpHarmonySegmentKey(chords: readonly ChordEvent[] | undefined, step: number, bar: number): string {
+  const active = findActiveArpChord(chords, step)
+  return active ? `chord:${active.id}` : `synthetic:${bar}`
+}
+
+/**
  * True when the mode asks for the absolute Chord Studio voicing and a user chord with usable
  * pitches is active. Used by the UI to warn about the synthetic pitch-class fallback.
  */
