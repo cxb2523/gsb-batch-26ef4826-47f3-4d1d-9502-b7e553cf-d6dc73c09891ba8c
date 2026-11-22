@@ -1,12 +1,13 @@
 // Every built-in sample listed in builtinSamples.ts must exist on disk, and every
 // bundled WAV must be listed (an unlisted file is dead weight in the app).
 import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
 
-const root = new URL('../src/renderer/public/samples/', import.meta.url).pathname
+const root = fileURLToPath(new URL('../src/renderer/public/samples/', import.meta.url))
 const listed = new Set([...readFileSync(new URL('../src/renderer/src/studio/builtinSamples.ts', import.meta.url), 'utf8').matchAll(/'builtin:([^'<>]+\.wav)'/gi)].map((m) => m[1]))
 const walk = (dir) => readdirSync(dir).flatMap((name) => (statSync(join(dir, name)).isDirectory() ? walk(join(dir, name)) : [join(dir, name)]))
-const onDisk = new Set(walk(root).filter((f) => /\.wav$/i.test(f)).map((f) => relative(root, f)))
+const onDisk = new Set(walk(root).filter((f) => /\.wav$/i.test(f)).map((f) => relative(root, f).split('\\').join('/')))
 const missing = [...listed].filter((f) => !onDisk.has(f))
 const unlisted = [...onDisk].filter((f) => !listed.has(f))
 for (const pack of ['tr808', 'uzu']) {

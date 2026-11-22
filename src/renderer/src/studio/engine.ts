@@ -389,8 +389,28 @@ export class StudioEngine implements StudioEngineApi {
 
   setKit(kit: DrumKit): void {
     this.kit = structuredClone(kit)
+    // Cache eviction is driven by the sample registry's reference counts
+    // (syncReferences), which also cover selections still decoding — pruning
+    // here against only the kit would race an in-flight load.
     this.resolveDrumBuffers()
     this.applyDrumBus()
+  }
+
+  /**
+   * Prune the sample cache against an authoritative retained set supplied by
+   * the sample registry (every path with a live reference: a kit pad or a
+   * selection still decoding), unioned with what the current kit points at.
+   */
+  pruneDrumSamples(retained: ReadonlySet<string>): void {
+    if (this.drumSamples.size === 0) return
+    const referenced = new Set<string>(retained)
+    for (const id of DRUM_VOICES) {
+      const path = this.kit.voices[id]?.sample?.path
+      if (path) referenced.add(path)
+    }
+    for (const path of [...this.drumSamples.keys()]) {
+      if (!referenced.has(path)) this.drumSamples.delete(path)
+    }
   }
 
   private resolveDrumBuffers(ids: readonly DrumVoiceId[] = DRUM_VOICES): void {
@@ -420,8 +440,20 @@ export class StudioEngine implements StudioEngineApi {
   }
 
   setDrumSample(path: string, buffer: AudioBuffer | null): void {
-    if (buffer === null) this.drumSamples.delete(path)
-    else this.drumSamples.set(path, { source: buffer, prepared: this.ctx ? this.prepareDrumSample(buffer) : null })
+    if (buffer === null) {
+      this.drumSamples.delete(path)
+    } else {
+      // Re-registering the same buffer (a path shared by several pads) must not
+      // rebuild the prepared buffer and reset the pads already playing it.
+      const existing = this.drumSamples.get(path)
+      if (existing?.source !== buffer) {
+        this.drumSamples.set(path, { source: buffer, prepared: this.ctx ? this.prepareDrumSample(buffer) : null })
+      }
+    }
+    // Reference reconciliation is owned by the sample registry: it prunes via
+    // pruneDrumSamples on every kit sync and when in-flight claims settle.
+    // Pruning here against only the current kit would race a sample arriving a
+    // beat before its pad's kit commit lands.
     const affected = DRUM_VOICES.filter((id) => this.kit.voices[id]?.sample?.path === path)
     for (const id of affected) this.drumBufferSignatures.delete(id)
     this.resolveDrumBuffers(affected)

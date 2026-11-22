@@ -14,6 +14,15 @@ import { BUILTIN_PREFIX, builtinLabel } from './builtinSamples'
 import { writeDrumRows } from './drumtext'
 import { GROOVES } from './grooves'
 import { DRUM_KITS, SYNTH_PRESETS, cloneKit, clonePatch, newPattern, uid } from './presets'
+import {
+  initSampleRegistry,
+  invalidatePad,
+  loadPadSample,
+  preloadSample,
+  releasePadClaim,
+  syncReferences,
+  type SampleLoadOutcome
+} from './sampleRegistry'
 import { SONG_KEYS, pickSong, type SongData } from './song'
 import { dropSong, getSong, listSongs, putSong, renameSaved } from './songs'
 import { SONG_TEMPLATES, type TemplateId } from './templates'
@@ -92,7 +101,7 @@ function syncCycle(): void {
 function syncSong(): void {
   const s = get()
   for (const t of s.tracks) if (t.patch) studio.setPatch(t.id, t.patch)
-  studio.setKit(s.kit)
+  pushKit(s.kit)
   loadKitSamples(s.kit)
   studio.setBpm(s.bpm)
   studio.setSwing(s.swing)
@@ -957,52 +966,45 @@ export const factoryPatches = SYNTH_PRESETS
 
 // ---------- Drum kit design ----------
 
+/** Sample paths referenced by a kit, one entry per pad that uses them. */
+function kitSamplePaths(kit: DrumKit): string[] {
+  return DRUM_VOICES.flatMap((id) => {
+    const sample = kit.voices[id].sample
+    return sample ? [sample.path] : []
+  })
+}
+
+/**
+ * Push a kit into the engine and reconcile the sample cache: anything the new
+ * kit no longer references (and nothing still decoding) is released.
+ */
+function pushKit(kit: DrumKit): void {
+  studio.setKit(kit)
+  syncReferences(kitSamplePaths(kit))
+}
+
 export function updateDrumVoice(id: DrumVoiceId, patch: Partial<DrumVoice>): void {
   const kit = cloneKit(get().kit)
   kit.voices[id] = { ...kit.voices[id], ...patch }
-  studio.setKit(kit)
+  pushKit(kit)
   set({ kit })
 }
 
 /** PUNCH / CRUNCH / ROOM: processing on the whole kit. */
 export function updateKitBus(patch: Partial<Pick<DrumKit, 'punch' | 'crunch' | 'room'>>): void {
   const kit = { ...cloneKit(get().kit), ...patch }
-  studio.setKit(kit)
+  pushKit(kit)
   set({ kit })
 }
 
 export function loadKit(kit: DrumKit): void {
   const next = cloneKit(kit)
-  studio.setKit(next)
+  pushKit(next)
   set({ kit: next })
   loadKitSamples(next)
 }
 
 // ---------- Drum samples ----------
-
-/** Paths whose audio the engine already holds, and decodes in flight (so a path is only read once). */
-const decodedSamples = new Set<string>()
-const pendingSamples = new Map<string, Promise<boolean>>()
-
-function ensureSample(path: string): Promise<boolean> {
-  if (decodedSamples.has(path)) return Promise.resolve(true)
-  const pending =
-    pendingSamples.get(path) ??
-    (async () => {
-      try {
-        const buffer = await engine.decode(await readSampleFile(path))
-        studio.setDrumSample(path, buffer)
-        decodedSamples.add(path)
-        return true
-      } catch {
-        return false
-      } finally {
-        pendingSamples.delete(path)
-      }
-    })()
-  pendingSamples.set(path, pending)
-  return pending
-}
 
 /**
  * Bytes of a sample. User samples are absolute paths read through the preload;
@@ -1019,12 +1021,16 @@ async function readSampleFile(path: string): Promise<ArrayBuffer> {
   return response.arrayBuffer()
 }
 
+initSampleRegistry({
+  decodePath: async (path) => engine.decode(await readSampleFile(path))
+})
+
 /** Decode every sample a kit uses. Pads whose file is missing keep playing their built-in sound. */
 function loadKitSamples(kit: DrumKit): void {
   const used = DRUM_VOICES.map((id) => kit.voices[id].sample).filter((sample) => sample !== null)
   if (!used.length) return
-  void Promise.all(used.map(async (sample) => ((await ensureSample(sample.path)) ? null : sample.name))).then((missing) => {
-    const names = missing.filter((name) => name !== null)
+  void Promise.all(used.map(async (sample) => ((await preloadSample(sample.path)) ? null : sample.name))).then((missing) => {
+    const names = missing.filter((name): name is string => name !== null)
     if (names.length) showToast(`Couldn't find ${names.join(', ')} — ${names.length === 1 ? 'that pad plays its' : 'those pads play their'} built-in sound`)
   })
 }
@@ -1034,6 +1040,11 @@ const AUDIO_FILE = /\.(wav|aiff?|mp3|flac|ogg|m4a|aac)$/i
 /**
  * Put a sound on a drum pad (it replaces the synthesized sound until cleared):
  * a user file by absolute path, or a bundled one by its 'builtin:' path.
+ *
+ * The pad keeps playing its built-in sound while the file decodes. The store
+ * (and therefore the saved song) only points at the sample once the decode
+ * succeeds, so an invalid or missing file leaves the pad exactly as it was.
+ * Rapid re-selection is safe: only the latest choice can commit or toast.
  */
 export async function loadDrumSample(id: DrumVoiceId, path: string): Promise<void> {
   const name = builtinLabel(path) ?? path.split(/[\\/]/).pop() ?? 'sample'
@@ -1041,7 +1052,9 @@ export async function loadDrumSample(id: DrumVoiceId, path: string): Promise<voi
     showToast(`${name} isn't an audio file — drop a WAV, AIFF, MP3, FLAC, OGG or M4A`)
     return
   }
-  if (!(await ensureSample(path))) {
+  const outcome: SampleLoadOutcome = await loadPadSample(id, path)
+  if (!outcome.ok) {
+    releasePadClaim(path)
     showToast(`Couldn't load ${name}`)
     return
   }
@@ -1050,7 +1063,10 @@ export async function loadDrumSample(id: DrumVoiceId, path: string): Promise<voi
   // otherwise cut it off or muffle it. They are kept with the sample and come back when it is removed.
   const synth = voice.sample?.synth ?? { tune: voice.tune, decay: voice.decay, tone: voice.tone, drive: voice.drive }
   const neutral = voice.sample ? {} : { tune: 0, decay: 1, tone: 0.5, drive: 0 }
+  // pushKit recounts references with this pad now committed to the kit; the
+  // in-flight claim is then released, transferring ownership to the kit.
   updateDrumVoice(id, { ...neutral, sample: { path, name, synth } })
+  releasePadClaim(path)
   set({ selectedDrum: id })
   void engine.ctx.resume()
   studio.triggerDrum(id, 0.9)
@@ -1062,8 +1078,13 @@ export async function pickDrumSample(id: DrumVoiceId): Promise<void> {
   if (path) await loadDrumSample(id, path)
 }
 
-/** Back to the pad's built-in synthesized sound. */
+/**
+ * Back to the pad's built-in synthesized sound. The in-flight selection (if
+ * any) is cancelled so it can no longer commit or report a failure, and the
+ * synth parameters saved with the removed sample are restored.
+ */
 export function clearDrumSample(id: DrumVoiceId): void {
+  invalidatePad(id)
   updateDrumVoice(id, { ...get().kit.voices[id].sample?.synth, sample: null })
 }
 
