@@ -40,6 +40,9 @@ jest.mock('../src/database', () => {
     },
     addPlayerToGame() {},
     removePlayerFromGame() {},
+    deleteGame(id) {
+      store.delete(id);
+    },
     listOpenGames() {
       return [];
     },
@@ -76,6 +79,142 @@ afterEach(() => {
   // retains entries across tests, but each test uses a fresh UUID so there
   // is no cross-test interference.
   database._store.clear();
+  gameManager.events.removeAllListeners();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Lifecycle events
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// game-manager can't import socket-handler (cycle), so it announces lifecycle
+// transitions on gameManager.events and the socket layer subscribes.  These
+// tests pin the contract: which event, with which gameId, and when NOT to fire.
+
+describe('lifecycle events', () => {
+  /**
+   * Create, join and start a two-player tic-tac-toe game.  Tic-tac-toe is used
+   * because it can be driven to 'finished' with a handful of deterministic
+   * moves, and its state filter is the identity function.
+   */
+  async function createTicTacToe() {
+    const { gameId } = gameManager.createGame('TTT', HOST.id, 'tic-tac-toe');
+    await gameManager.addPlayerToLobby(gameId, HOST);
+    await gameManager.addPlayerToLobby(gameId, P2);
+    const start = gameManager.startGame(gameId, HOST.id);
+    if (start.error) throw new Error(`startGame failed: ${start.error}`);
+    return gameId;
+  }
+
+  /** Play a fixed winning line for HOST: (0,0) (0,1) (0,2), P2 interleaves. */
+  async function playToHostWin(gameId) {
+    const moves = [
+      [HOST.id, 0, 0],
+      [P2.id, 1, 0],
+      [HOST.id, 0, 1],
+      [P2.id, 1, 1],
+      [HOST.id, 0, 2],
+    ];
+    let last;
+    for (const [userId, row, col] of moves) {
+      last = await gameManager.applyAction(gameId, userId, 'markCell', { row, col });
+      if (last.error) throw new Error(`markCell failed: ${last.error}`);
+    }
+    return last;
+  }
+
+  test('a move that finishes the game emits game:finished with the gameId', async () => {
+    const gameId = await createTicTacToe();
+    const seen = [];
+    gameManager.events.on('game:finished', (id) => seen.push(id));
+
+    await playToHostWin(gameId);
+
+    expect(gameManager.peekGame(gameId).status).toBe('finished');
+    expect(seen).toEqual([gameId]);
+  });
+
+  test('ordinary in-progress moves do not emit game:finished', async () => {
+    const gameId = await createTicTacToe();
+    const seen = [];
+    gameManager.events.on('game:finished', (id) => seen.push(id));
+
+    await gameManager.applyAction(gameId, HOST.id, 'markCell', { row: 0, col: 0 });
+    await gameManager.applyAction(gameId, P2.id, 'markCell', { row: 1, col: 0 });
+
+    expect(seen).toEqual([]);
+  });
+
+  test('game:finished fires once even if later actions are attempted', async () => {
+    const gameId = await createTicTacToe();
+    const seen = [];
+    gameManager.events.on('game:finished', (id) => seen.push(id));
+
+    await playToHostWin(gameId);
+    // The game is finished — further actions are rejected, not processed.
+    await gameManager.applyAction(gameId, P2.id, 'markCell', { row: 2, col: 2 });
+
+    expect(seen).toEqual([gameId]);
+  });
+
+  test('deleteGame emits game:removed with the gameId', async () => {
+    const { gameId } = gameManager.createGame('Delete Me', HOST.id, 'tic-tac-toe');
+    const seen = [];
+    gameManager.events.on('game:removed', (id) => seen.push(id));
+
+    const result = await gameManager.deleteGame(gameId, HOST.id);
+
+    expect(result).toEqual({ success: true });
+    expect(seen).toEqual([gameId]);
+  });
+
+  test('deleteGame by a non-host emits nothing (and deletes nothing)', async () => {
+    const { gameId } = gameManager.createGame('Not Yours', HOST.id, 'tic-tac-toe');
+    const seen = [];
+    gameManager.events.on('game:removed', (id) => seen.push(id));
+
+    const result = await gameManager.deleteGame(gameId, P2.id);
+
+    expect(result.error).toMatch(/only the host/i);
+    expect(seen).toEqual([]);
+    expect(gameManager.peekGame(gameId)).not.toBeNull();
+  });
+
+  test('evictGame emits game:removed', () => {
+    const { gameId } = gameManager.createGame('Evict Me', HOST.id, 'tic-tac-toe');
+    const seen = [];
+    gameManager.events.on('game:removed', (id) => seen.push(id));
+
+    gameManager.evictGame(gameId);
+
+    expect(seen).toEqual([gameId]);
+    // Evicted from memory but still in the DB — it can be loaded back.
+    expect(database.getGameById(gameId)).not.toBeNull();
+  });
+
+  test('loading a game from the database emits game:loaded', () => {
+    const { gameId } = gameManager.createGame('Reload Me', HOST.id, 'tic-tac-toe');
+    gameManager.evictGame(gameId); // drop the in-memory copy
+
+    const seen = [];
+    gameManager.events.on('game:loaded', (id) => seen.push(id));
+
+    const loaded = gameManager.loadGame(gameId);
+
+    expect(loaded).not.toBeNull();
+    expect(loaded.id).toBe(gameId);
+    expect(seen).toEqual([gameId]);
+  });
+
+  test('loading an already-active game does not emit game:loaded (no-op)', () => {
+    const { gameId } = gameManager.createGame('Still Here', HOST.id, 'tic-tac-toe');
+    const seen = [];
+    gameManager.events.on('game:loaded', (id) => seen.push(id));
+
+    // Already in activeGames — loadGame returns the cached copy early.
+    gameManager.loadGame(gameId);
+
+    expect(seen).toEqual([]);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

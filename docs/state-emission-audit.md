@@ -438,3 +438,51 @@ req.user.sub, gameRegistry)` and applies the player-side filter to
 everyone. (A REST endpoint *does* exist at
 `GET /api/games/:id/spectators` but it returns only the spectator list,
 not game state.)
+
+## Addendum: spectator seat lifecycle
+
+The bypass above is only safe while `gameSpectators` reflects reality. A
+seat must exist exactly as long as a connected socket is actually watching
+the game. Because seats live in memory and are keyed by user, their
+correctness depends on how connections and game lifecycles are handled.
+
+**Seats are user-keyed, room membership is socket-keyed.** A user may own
+several live sockets (a reconnect creates the new one before the old one
+closes; a second tab is a second socket). Room membership is tracked per
+socket (`socketGameMap`); seat ownership and the player `connected` flag
+are tracked per user. The disconnect handler therefore first asks "does
+this user still own a live socket?" and only performs the full teardown —
+clearing seats, marking the player disconnected — when the answer is no.
+A stale socket's disconnect can never evict a user who has already
+reconnected, and cannot clear a `connected: true` flag set by the new
+socket.
+
+**One view per user.** Joining another room (`join_game`, `spectate`,
+`lobby:join`) releases any seat the user holds elsewhere, and
+`unspectate`/`leave_game` release the current seat explicitly. This also
+sweeps up a seat left behind in the reconnect window: the new socket's
+join retires seats in other games, and a disconnect whose room no longer
+contains any of the user's sockets drops the seat it represented.
+
+**Seats die with the game.** `game-manager` cannot import the socket
+handler (cycle), so it emits lifecycle events the handler subscribes to:
+`game:finished` on a `playing → finished` transition, `game:removed` on
+`deleteGame`/`evictGame`, and `game:loaded` when a game is reloaded from
+the database. Each clears the game's seats, so lobby counts
+(`spectator_count`) drop to zero and a reloaded game never resurrects old
+seats.
+
+**The final broadcast keeps the bypass.** Seats are cleared synchronously
+inside `applyAction`, before the ending `game:update` goes out. The socket
+handler snapshots the seated userIds before dispatching the action and
+passes that snapshot to `filteredFor`, so the spectators who were watching
+still receive the unfiltered ending state — with no `validActions` or
+`actionDescriptors` — even though their seats are already gone from the
+lobby. The player path is unchanged, so the player/spectator visibility
+asymmetry documented above is preserved.
+
+**Regression tests:** `server/test/integration/spectator-lifecycle.test.js`
+covers the reconnect race (new socket before old), cross-room seat release,
+cleanup on delete/finish, reload without resurrection, the multi-tab
+edge case, and that a spectator still cannot execute `game:action`.
+`server/test/game-manager.test.js` pins the lifecycle-event contract.

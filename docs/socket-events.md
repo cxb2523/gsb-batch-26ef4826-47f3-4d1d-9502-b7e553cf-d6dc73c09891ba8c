@@ -9,8 +9,10 @@
 | Event | Payload | Description |
 |-------|---------|-------------|
 | `join_game` | `gameId` | Join the Socket.io room for a game; server replies with full state |
-| `leave_game` | — | Leave current game room |
+| `leave_game` | — | Leave current game room (also releases a spectator seat) |
 | `lobby:join` | `gameId` | Join a waiting-room lobby (adds player to the roster) |
+| `spectate` | `gameId` | Watch an in-progress game read-only. Rejects players of the same game; watching a different game releases the previous seat |
+| `unspectate` | — | Leave the spectator seat and the room |
 | `game:start` | — | Host starts the game |
 | `game:action` | `{ action, ...payload }` | **Universal action event** — all player moves use this single event |
 | `game:save` | — | Save (pause) the current game |

@@ -22,7 +22,7 @@ Authorization: Bearer <jwt-token>
 
 | Method | Path | Auth | Body | Response |
 |--------|------|:----:|------|----------|
-| GET | `/api/games` | ✓ | — | `{ games[] }` — open & in-progress |
+| GET | `/api/games` | ✓ | — | `{ games[] }` — open & in-progress; each entry carries `spectator_count` |
 | GET | `/api/games/saved` | ✓ | — | `{ games[] }` — paused games for current user |
 | GET | `/api/games/mine` | ✓ | — | `{ games[] }` — active games the user is in |
 | GET | `/api/games/types` | ✓ | — | `{ types[] }` — registered game types + metadata |
@@ -31,6 +31,7 @@ Authorization: Bearer <jwt-token>
 | GET | `/api/games/config/default` | ✓ | — | `{ config }` — alias for Monopoly default config |
 | POST | `/api/games` | ✓ | `{ name, gameType?, configOverrides? }` | `{ gameId, state }` |
 | GET | `/api/games/:id` | ✓ | — | `{ state }` |
+| GET | `/api/games/:id/spectators` | ✓ | — | `{ spectators: [{ userId, username, joinedAt }] }` — live seats (runtime-only) |
 | POST | `/api/games/:id/join` | ✓ | — | `{ state }` |
 | POST | `/api/games/:id/start` | ✓ (host) | — | `{ state }` |
 | POST | `/api/games/:id/save` | ✓ (host) | — | `{ success }` |

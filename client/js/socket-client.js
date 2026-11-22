@@ -65,10 +65,24 @@ const SocketClient = (() => {
 
     // Auto-rejoin the game room after a network hiccup reconnects the socket.
     // The server will send game:state which re-syncs all UI.
+    //
+    // A spectator must re-seat explicitly: join_game only restores the seat if
+    // the server still has it (the old socket's disconnect may have already
+    // dropped it).  spectate re-registers idempotently and also works when the
+    // game is paused, so try it first for spectators and fall back to
+    // join_game if the game can no longer be watched (finished/deleted).
     socket.on('reconnect', () => {
       console.log('[socket] reconnected, rejoining game room');
       const gameId = GameState.getGameId();
-      if (gameId) {
+      if (!gameId) return;
+      if (GameState.isSpectator()) {
+        socket.emit('spectate', gameId, (res) => {
+          if (!res?.error) return;
+          socket.emit('join_game', gameId, (joinRes) => {
+            if (joinRes?.error) console.error('[socket] auto-rejoin failed:', joinRes.error);
+          });
+        });
+      } else {
         socket.emit('join_game', gameId, (res) => {
           if (res?.error) console.error('[socket] auto-rejoin failed:', res.error);
         });

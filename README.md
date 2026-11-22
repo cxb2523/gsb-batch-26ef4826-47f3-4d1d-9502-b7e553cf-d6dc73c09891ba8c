@@ -219,10 +219,13 @@ Anyone logged in can watch any in-progress game without playing.
 - The action panel is hidden; the "You're spectating" banner persists at the top of the play area.
 - Players are notified when a spectator joins (log entry). Leaves are silent.
 - A spectator can leave any time via the **✕ Leave** button (replacing the host's Save/Quit). Leaving has no effect on the game.
+- Seats are tied to the connection lifecycle: a spectator who reconnects (new socket before the old one closes) remains the *same* spectator; switching to another game releases the old seat; and when a game ends or is deleted its seats are cleared, so the lobby's "👁 N watching" count returns to zero. Reloading a saved game does not restore old seats.
 
 Spectators cannot take actions. The server enforces this (any `game:action` from a spectator is rejected with a `game:error`); the client gates click handlers as a UX layer so spectator clicks don't appear to do anything.
 
 A user who is already a player in a game cannot also spectate it — the Spectate button is suppressed in that case, and the server rejects an explicit attempt with "You are already a player in this game".
+
+The lobby's `GET /api/games` response includes a `spectator_count` on each game, and `GET /api/games/:id/spectators` returns the live seat list (`[{ userId, username, joinedAt }]`).
 
 ---
 

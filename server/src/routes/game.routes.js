@@ -59,7 +59,14 @@ router.use(auth.requireAuth);
 
 router.get('/', (req, res) => {
   try {
-    res.json({ games: gameManager.listOpenGames() });
+    // Attach the live spectator count from the socket layer's runtime map so
+    // lobby cards can render "N watching" without a per-game round-trip.  The
+    // count is authoritative: seats are cleared when a game ends or is deleted.
+    const games = gameManager.listOpenGames().map((g) => ({
+      ...g,
+      spectator_count: socketHandler.spectatorCount(g.id),
+    }));
+    res.json({ games });
   } catch (err) {
     console.error('[games] list error:', err);
     res.status(500).json({ error: 'Could not list games' });

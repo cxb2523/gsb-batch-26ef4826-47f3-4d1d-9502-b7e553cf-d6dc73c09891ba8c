@@ -27,9 +27,26 @@
 
 'use strict';
 
+const { EventEmitter } = require('events');
 const { v4: uuidv4 } = require('uuid');
 const database = require('./database');
 const gameRegistry = require('./game-registry');
+
+// ── lifecycle events ─────────────────────────────────────────────────────────
+//
+// Runtime-only resources (spectator seats, turn timers) live in the socket
+// handler, not in the persisted GameState.  The manager can't import the
+// socket handler (that would be a cycle — the handler already imports us),
+// so it announces state transitions on this emitter instead.  The socket
+// handler subscribes at module load and drops the matching runtime state:
+//
+//   game:finished → game moved to status 'finished'
+//   game:removed  → game deleted from the DB or evicted from memory
+//   game:loaded   → a game was loaded from the DB into memory
+//
+// Listeners are synchronous; by the time applyAction/deleteGame return, any
+// stale spectator seats have already been cleared.
+const events = new EventEmitter();
 
 /** Return the game-logic module for a given state. */
 function getLogic(state) {
@@ -171,6 +188,10 @@ function loadGame(gameId) {
   }
 
   activeGames.set(gameId, row.state);
+  // Runtime-only resources (spectator seats) are never persisted, so a game
+  // freshly loaded into memory must start with none.  Announced so the socket
+  // handler can drop anything stale left over from a previous incarnation.
+  events.emit('game:loaded', gameId);
   return row.state;
 }
 
@@ -307,6 +328,13 @@ async function applyAction(gameId, userId, action, payload = {}) {
 
     activeGames.set(gameId, result.state);
     persist(result.state);
+
+    // A game that just ended is no longer watchable: drop the runtime
+    // spectator seats and the rooms' spectator counts with it.
+    if (state.status === 'playing' && result.state.status === 'finished') {
+      events.emit('game:finished', gameId);
+    }
+
     return { state: result.state, events: result.events };
   });
 }
@@ -326,6 +354,8 @@ async function deleteGame(gameId, userId) {
 
     activeGames.delete(gameId);
     database.deleteGame(gameId);
+    // Runtime spectator seats belong to a game that no longer exists.
+    events.emit('game:removed', gameId);
     return { success: true };
   });
 }
@@ -379,6 +409,7 @@ async function setPlayerConnected(gameId, userId, connected) {
  */
 function evictGame(gameId) {
   activeGames.delete(gameId);
+  events.emit('game:removed', gameId);
 }
 
 module.exports = {
@@ -396,4 +427,7 @@ module.exports = {
   resumeGame,
   setPlayerConnected,
   evictGame,
+  // Lifecycle event emitter — see the "lifecycle events" block at the top.
+  // Socket-layer code subscribes here instead of the manager importing it.
+  events,
 };

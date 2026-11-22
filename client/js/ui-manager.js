@@ -400,13 +400,17 @@ const UIManager = (() => {
       const statusLabel = { waiting: 'Open', playing: 'In Progress', paused: 'Saved', finished: 'Finished' }[g.status] || g.status;
       const statusClass = { waiting: 'status-waiting', playing: 'status-playing', paused: 'status-paused' }[g.status] || '';
       const gameType    = g.game_type || g.gameType || 'monopoly';
+      const spectatorCount = g.spectator_count || 0;
+      const spectatorLabel = spectatorCount > 0
+        ? ` · 👁 ${spectatorCount} watching`
+        : '';
 
       const card = document.createElement('div');
       card.className = 'game-card';
       card.innerHTML = `
         <div class="game-card-info">
           <h4>${escHtml(g.name)}</h4>
-          <p>Host: ${escHtml(g.host_username || g.hostUsername || '?')} · ${g.player_count || g.playerCount || 0} player(s)</p>
+          <p>Host: ${escHtml(g.host_username || g.hostUsername || '?')} · ${g.player_count || g.playerCount || 0} player(s)${spectatorLabel}</p>
           <span class="game-type-badge">${escHtml(gameType)}</span>
         </div>
         <span class="game-card-status ${statusClass}">${statusLabel}</span>

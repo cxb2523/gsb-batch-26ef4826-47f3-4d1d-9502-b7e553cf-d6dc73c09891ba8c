@@ -58,7 +58,7 @@ npm test                    # unit tests for every bundled game's game-logic
 npm run test:integration    # socket + persistence round-trip tests
 ```
 
-Tests live in `server/test/` (unit) and `server/test/integration/` (integration). At the time of this README pass: **625 unit tests across the eight bundled games** plus the framework interface, and **40 integration tests** covering socket emission, REST state filtering, action-descriptor wiring, spectator mode, and game-lifecycle round-trips.
+Tests live in `server/test/` (unit) and `server/test/integration/` (integration). At the time of this README pass: **633 unit tests across the eight bundled games** plus the framework interface, and **53 integration tests** covering socket emission, REST state filtering, action-descriptor wiring, spectator mode and its connection/game lifecycle (reconnect races, cross-room seat release, cleanup on game end/delete), and game-lifecycle round-trips.
 
 > **Note:** `node_modules/` is gitignored. If you skip `npm install`, the unit suite still partially runs (tests that only use relative imports), but suites requiring `supertest`, `uuid`, or `jest-environment-jsdom` will fail to load silently. Always install dependencies before running tests.
 
