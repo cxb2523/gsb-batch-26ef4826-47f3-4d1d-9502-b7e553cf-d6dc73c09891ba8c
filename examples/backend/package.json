@@ -1,0 +1,20 @@
+{
+	"name": "@ziplayer/web-audio-gateway-example",
+	"private": true,
+	"scripts": {
+		"start": "node index.js",
+		"test": "node --test"
+	},
+	"dependencies": {
+		"@ziplayer/client": "file:../../client",
+		"@ziplayer/plugin": "file:../../plugins",
+		"dotenv": "^18.0.7",
+		"opus-decoder": "^0.7.12",
+		"ws": "^8.19.0",
+		"ziplayer": "file:../../core"
+	},
+	"allowScripts": {
+		"file:../../../../plugins": true,
+		"file:../../../core": true
+	}
+}
