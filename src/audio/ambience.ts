@@ -8,9 +8,18 @@ import type { SoundFrame } from './types';
 
 /** The background beds: sea waves that swell near water, light wind, and intermittent music-box
  * phrases over the slow chord progression. Parameters are retargeted a dozen times a second with
- * smooth time constants; between phrases only the sea and wind remain. */
+ * smooth time constants; between phrases only the sea and wind remain.
+ *
+ * The three sustained sources (sea, foam, wind) live behind a dedicated bed bus and a registered
+ * music loop behind its own gain, so when the engine goes silent (paused, muted, autoplay-locked)
+ * the beds are muted without being torn down: resume never stacks a second set of sources, and
+ * only `teardown()` (engine disposal) actually stops and disconnects the nodes. */
+
+const LOOP_EVENT = 'music.loop';
+const TWINKLE_TAIL = 1.5;
 
 interface Beds {
+  bedBus: GainNode;
   seaGain: GainNode; foamGain: GainNode; windGain: GainNode; windFilter: BiquadFilterNode;
   sources: AudioScheduledSourceNode[];
 }
@@ -29,11 +38,25 @@ export class Ambience {
   private controlClock = 1;
   private readonly rng = mulberry32(0xa11ce);
   private loop: AudioBufferSourceNode | null = null;
+  private loopGain: GainNode | null = null;
+  private muted = false;
 
   constructor(private readonly engine: AudioEngine, private readonly music: MusicPlayer) {}
 
+  /** Drive the bed bus / loop gain to match the engine's live state. Called on every engine
+   * run-state transition and re-asserted from update(), so sustained sources can never stay
+   * audible while the engine is paused, disabled or autoplay-locked. */
+  sync(live: boolean, g: Graph | null): void {
+    this.muted = !live;
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    this.beds?.bedBus.gain.setTargetAtTime(live ? 1 : 0, t, 0.2);
+    this.loopGain?.gain.setTargetAtTime(live ? 1 : 0, t, 0.2);
+  }
+
   update(frame: SoundFrame, g: Graph): void {
     const beds = this.beds ?? (this.beds = this.build(g));
+    if (this.muted) beds.bedBus.gain.setTargetAtTime(0, g.ctx.currentTime, 0.2);
     const dt = Math.min(frame.dt, 0.25);
     const life = clamp(frame.life ?? 0);
     const active = frame.active ?? true;
@@ -48,9 +71,16 @@ export class Ambience {
       this.chord = nextChordIndex(this.chord);
     }
 
-    // A registered recorded music bed replaces the synthesized phrases entirely.
-    const hasLoop = this.engine.samples.has('music.loop');
-    if (hasLoop && !this.loop) this.loop = this.engine.samples.play(g.ctx, g.music.input, 'music.loop');
+    // A decoded recorded music bed replaces the synthesized phrases. While registered but still
+    // loading (or failed), the synth phrases keep playing, and the swap waits for a quiet moment
+    // so the two music systems never overlap.
+    const loopReady = this.engine.samples.ready(LOOP_EVENT);
+    if (loopReady && !this.loop) {
+      if (this.phraseBusy <= 0) this.startLoop(g);
+    } else if (!loopReady && this.loop) {
+      this.stopLoop(g);
+    }
+    const hasLoop = !!this.loop;
 
     if (this.phraseClock <= 0) {
       this.phraseClock = phraseInterval(life, this.rng);
@@ -66,8 +96,9 @@ export class Ambience {
 
     if (this.sparkleClock <= 0) {
       this.sparkleClock = sparkleInterval(life, this.rng);
-      if (active && this.phraseBusy <= 0 && this.phraseClock > PHRASE_GAP) {
+      if (active && !hasLoop && this.phraseBusy <= 0 && this.phraseClock > PHRASE_GAP) {
         this.music.twinkle(g, pickSparkleMidi(life, this.rng), sparkleVelocity(life));
+        this.phraseBusy = Math.max(this.phraseBusy, TWINKLE_TAIL);
       }
     }
 
@@ -88,10 +119,54 @@ export class Ambience {
     beds.windFilter.frequency.setTargetAtTime(420 + 260 * moving + (frame.grounded ? 0 : 300), t, 0.8);
   }
 
+  /** Stop the recorded loop (sample unregistered / failed after playing / engine teardown). */
+  unregisterLoop(g: Graph | null): void {
+    if (!this.loop) return;
+    this.stopLoop(g);
+  }
+
+  private startLoop(g: Graph): void {
+    const source = this.engine.samples.play(g.ctx, g.music.input, LOOP_EVENT);
+    if (!source) return; // still not actually ready; try again on a later frame
+    const loopGain = g.ctx.createGain();
+    loopGain.gain.value = this.muted ? 0 : 1;
+    // Reroute the bank's source through our own gain so the bed can mute with the engine state.
+    source.disconnect();
+    source.connect(loopGain).connect(g.music.input);
+    const bankOnEnded = source.onended as (() => void) | null;
+    source.onended = () => {
+      if (this.loop === source) { this.loop = null; this.loopGain = null; }
+      bankOnEnded?.(); // disconnects the bank's own gain node
+      loopGain.disconnect();
+    };
+    this.loop = source;
+    this.loopGain = loopGain;
+  }
+
+  private stopLoop(g: Graph | null): void {
+    const source = this.loop, gain = this.loopGain;
+    this.loop = null; this.loopGain = null;
+    if (!source) return;
+    try {
+      if (g && gain) {
+        const t = g.ctx.currentTime;
+        gain.gain.setTargetAtTime(0, t, 0.1);
+        try { source.stop(t + 0.4); } catch { source.stop(); }
+      } else {
+        source.stop();
+      }
+    } catch { /* already stopped; its onended handler still disconnects the nodes */ }
+    source.disconnect();
+  }
+
   private build(g: Graph): Beds {
     const { ctx } = g;
     const sources: AudioScheduledSourceNode[] = [];
-    const out = g.ambient.input;
+    const bedBus = ctx.createGain(); bedBus.gain.value = this.muted ? 0 : 1;
+    // Test-only marker (ignored by real WebAudio): lets the fake-context tests find this node.
+    (bedBus as unknown as { ambientBedBus?: boolean }).ambientBedBus = true;
+    bedBus.connect(g.ambient.input);
+    const out = bedBus;
     const start = <T extends AudioScheduledSourceNode>(node: T): T => { node.start(); sources.push(node); return node; };
 
     // ---- sea: dark swell plus a hissing foam layer riding its own slowly drifting LFO
@@ -124,15 +199,21 @@ export class Ambience {
     const windDepth = ctx.createGain(); windDepth.gain.value = 0.4; windLfo.connect(windDepth).connect(windSwell.gain);
     const windSweep = ctx.createGain(); windSweep.gain.value = 180; windLfo.connect(windSweep).connect(windFilter.frequency);
 
-    return { seaGain, foamGain, windGain, windFilter, sources };
+    return { bedBus, seaGain, foamGain, windGain, windFilter, sources };
   }
 
-  /** Fade the beds out (used on dispose / when the game is torn down). */
-  stop(g: Graph | null): void {
-    if (!g || !this.beds) return;
-    const t = g.ctx.currentTime;
-    this.beds.seaGain.gain.setTargetAtTime(0, t, 0.2);
-    this.beds.foamGain.gain.setTargetAtTime(0, t, 0.2);
-    this.beds.windGain.gain.setTargetAtTime(0, t, 0.2);
+  /** Tear every sustained node down (engine disposal). All sources are stopped and disconnected,
+   * so nothing keeps running on the closing context and a later build starts from scratch. */
+  teardown(g: Graph | null): void {
+    this.stopLoop(g);
+    const beds = this.beds;
+    this.beds = null;
+    if (!beds) return;
+    const t = g?.ctx.currentTime;
+    for (const source of beds.sources) {
+      try { if (typeof t === 'number') source.stop(t + 0.4); else source.stop(); } catch { /* already stopped */ }
+      source.disconnect();
+    }
+    beds.bedBus.disconnect();
   }
 }

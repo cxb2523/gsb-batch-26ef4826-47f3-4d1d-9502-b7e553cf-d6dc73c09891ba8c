@@ -56,10 +56,31 @@ export class AudioEngine {
   private offline = false;
   private resumeToken = 0;
   private unlockArmed = false;
+  private unlockRemove: (() => void) | null = null;
+  private readonly runStateListeners = new Set<(live: boolean) => void>();
   private readonly noises = new Map<NoiseColor, AudioBuffer>();
   private readonly plucks = new Map<number, AudioBuffer>();
 
   constructor(private readonly options: EngineOptions = {}) {}
+
+  /** Subscribe to live/silent transitions (enabled, paused, autoplay lock, closed context).
+   * Fires once immediately with the current state so subscribers never miss the first one. */
+  onRunStateChange(listener: (live: boolean) => void): () => void {
+    this.runStateListeners.add(listener);
+    listener(this.live() !== null);
+    return () => this.runStateListeners.delete(listener);
+  }
+
+  private emitRunState(): void {
+    const live = this.live() !== null;
+    for (const listener of this.runStateListeners) listener(live);
+  }
+
+  private setLocked(locked: boolean): void {
+    if (this.locked === locked) return;
+    this.locked = locked;
+    this.emitRunState();
+  }
 
   /** Context time, or 0 when there is no context. */
   get time(): number { return this.ctx?.currentTime ?? 0; }
@@ -76,7 +97,10 @@ export class AudioEngine {
       this.ctx = ctx;
       this.offline = typeof OfflineAudioContext !== 'undefined' && ctx instanceof OfflineAudioContext;
       this.graph = this.build(ctx);
-      ctx.onstatechange = () => { if (ctx.state === 'running') this.locked = false; };
+      ctx.onstatechange = () => {
+        if (ctx.state === 'running') this.setLocked(false);
+        else this.emitRunState();
+      };
       this.applyRunState();
     } catch {
       this.failed = true; this.ctx = null; this.graph = null;
@@ -95,12 +119,20 @@ export class AudioEngine {
     this.started = true;
     if (this.ensure()) this.applyRunState();
   }
-  setEnabled(enabled: boolean): void { this.enabled = enabled; this.applyRunState(); }
-  setPaused(paused: boolean): void { this.paused = paused; this.applyRunState(); }
+  setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) return;
+    this.enabled = enabled; this.applyRunState();
+  }
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused; this.applyRunState();
+  }
 
   dispose(): void {
     const ctx = this.ctx;
+    this.unlockRemove?.(); this.unlockRemove = null; this.unlockArmed = false;
     this.graph = null; this.ctx = null; this.failed = true;
+    this.emitRunState();
     if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => {});
   }
 
@@ -114,6 +146,7 @@ export class AudioEngine {
     const t = ctx.currentTime;
     graph.master.gain.cancelScheduledValues(t);
     graph.master.gain.setTargetAtTime(this.enabled ? MASTER_LEVEL : 0, t, 0.05);
+    this.emitRunState();
     if (this.offline) return;
     if (this.enabled && !this.paused) { if (ctx.state !== 'running') this.requestResume(); }
     else if (this.paused) void ctx.suspend().catch(() => {});
@@ -124,11 +157,12 @@ export class AudioEngine {
     const ctx = this.ctx;
     if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return;
     const token = ++this.resumeToken;
-    ctx.resume().then(() => { if (token === this.resumeToken && ctx.state === 'running') this.locked = false; })
-      .catch(() => { this.locked = true; this.armUnlock(); });
+    ctx.resume().then(() => {
+      if (token === this.resumeToken && ctx.state === 'running') this.setLocked(false);
+    }).catch(() => { this.setLocked(true); this.armUnlock(); });
     // Chrome leaves resume() pending without a gesture: stop scheduling until one arrives.
     setTimeout(() => {
-      if (token === this.resumeToken && ctx.state === 'suspended' && this.enabled && !this.paused) { this.locked = true; this.armUnlock(); }
+      if (token === this.resumeToken && ctx.state === 'suspended' && this.enabled && !this.paused) { this.setLocked(true); this.armUnlock(); }
     }, 450);
   }
 
@@ -140,10 +174,14 @@ export class AudioEngine {
       const ctx = this.ctx;
       if (!ctx) { remove(); return; }
       void ctx.resume().then(() => {
-        if (ctx.state === 'running') { this.locked = false; remove(); }
+        if (ctx.state === 'running') { this.setLocked(false); remove(); }
       }).catch(() => {});
     };
-    const remove = () => { this.unlockArmed = false; for (const name of events) window.removeEventListener(name, unlock, true); };
+    const remove = () => {
+      this.unlockArmed = false; this.unlockRemove = null;
+      for (const name of events) window.removeEventListener(name, unlock, true);
+    };
+    this.unlockRemove = remove;
     for (const name of events) window.addEventListener(name, unlock, true);
   }
 

@@ -218,9 +218,10 @@ test('GameSound is a safe no-op when WebAudio is unavailable', async () => {
 // ---------------------------------------------------------------- fake WebAudio context
 function fakeParam() {
   const param = {
-    value: 0, calls: 0,
-    setValueAtTime() { param.calls++; return param; }, linearRampToValueAtTime() { param.calls++; return param; },
-    exponentialRampToValueAtTime() { param.calls++; return param; }, setTargetAtTime() { param.calls++; return param; },
+    value: 0, calls: 0, targets: [] as number[],
+    setValueAtTime(v: number) { param.calls++; param.value = v; return param; }, linearRampToValueAtTime() { param.calls++; return param; },
+    exponentialRampToValueAtTime() { param.calls++; return param; },
+    setTargetAtTime(v: number) { param.calls++; param.targets.push(v); param.value = v; return param; },
     cancelScheduledValues() { return param; },
   };
   return param;
@@ -231,12 +232,13 @@ function fakeContext() {
   const created: { kind: string; node: Record<string, unknown> }[] = [];
   let disconnects = 0;
   const makeNode = (kind: string) => {
-    const store: Record<string, unknown> = { kind };
+    const store: Record<string, unknown> = { kind, starts: 0, stops: 0 };
     const node: Record<string, unknown> = new Proxy(store, {
       get(target, property: string) {
         if (property === 'connect') return (destination: unknown) => destination;
         if (property === 'disconnect') return () => { disconnects++; };
-        if (property === 'start' || property === 'stop') return () => {};
+        if (property === 'start') return () => { store.starts++; };
+        if (property === 'stop') return () => { store.stops++; };
         if (property === 'then') return undefined;
         if (!(property in target)) target[property] = fakeParam();
         return target[property];
@@ -255,15 +257,30 @@ function fakeContext() {
       duration: length / rate, sampleRate: rate, length, numberOfChannels: channels,
       getChannelData: () => new Float32Array(length),
     }),
+    decodeAudioData: async () => ({ duration: 1, sampleRate: 8000, length: 8000, numberOfChannels: 1, getChannelData: () => new Float32Array(8000) }),
     resume: () => Promise.resolve(), suspend: () => Promise.resolve(), close: () => Promise.resolve(),
   };
   return {
     ctx: ctx as unknown as AudioContext,
     raw: ctx,
+    nodes: () => created.map(entry => entry.node),
     count: (kind: string) => created.filter(entry => entry.kind === kind).length,
     endAll: () => { for (const { node } of created) if (typeof node.onended === 'function') (node.onended as () => void)(); },
     disconnects: () => disconnects,
   };
+}
+
+/** Last value handed to setTargetAtTime on a node's `gain` parameter (undefined when never called). */
+function lastGainTarget(node: Record<string, unknown>): number | undefined {
+  const gain = node.gain as { targets?: number[] } | undefined;
+  return gain?.targets?.at(-1);
+}
+
+/** The ambient bed bus is tagged by Ambience.build so tests can watch its run-state gain. */
+function findBedBus(fake: ReturnType<typeof fakeContext>): Record<string, unknown> {
+  const bus = fake.nodes().find(node => node.ambientBedBus === true);
+  assert.ok(bus, 'bed bus exists and is driven by the ambience run-state sync');
+  return bus;
 }
 
 test('the ambient beds hold no sustained pad oscillators', () => {
@@ -376,4 +393,137 @@ test('a context the browser keeps suspended (autoplay policy) drops sounds until
   assert.equal(sound.live, true, 'plays again once the context runs');
   sound.ui('click');
   assert.ok(fake.count('osc') > before);
+});
+
+const baseFrame = { dt: 0.016, moving: 0, grounded: true, sprinting: false, water: false, verticalSpeed: 0, active: true, life: 0.5 };
+
+test('pausing mutes the ambient beds and resume restores them without stacking sources', () => {
+  const fake = fakeContext();
+  const sound = new GameSound({ createContext: () => fake.ctx, strict: true });
+  sound.start();
+  sound.update(baseFrame);
+  assert.equal(fake.count('source'), 3, 'the sea, foam and wind beds start once');
+  assert.equal(fake.count('osc'), 3, 'with only their three swell LFO oscillators');
+
+  sound.setPaused(true);
+  assert.equal(lastGainTarget(findBedBus(fake)), 0, 'the beds go silent while paused');
+
+  // Frames stop arriving while the menu is open; even if one did, no extra beds are created.
+  sound.update(baseFrame);
+  sound.update(baseFrame);
+  assert.equal(fake.count('source'), 3, 'pause never builds a second set of beds');
+  assert.equal(fake.count('osc'), 3);
+
+  sound.setPaused(false);
+  assert.equal(lastGainTarget(findBedBus(fake)), 1, 'the same beds come back on resume');
+  sound.update(baseFrame);
+  assert.equal(fake.count('source'), 3, 'resume reuses the existing sources');
+  assert.equal(fake.count('osc'), 3);
+});
+
+test('muting and autoplay locking silence the beds; unlock recovery needs no new sources', async () => {
+  const fake = fakeContext();
+  const sound = new GameSound({ createContext: () => fake.ctx, strict: true });
+  sound.start();
+  sound.update(baseFrame);
+  sound.setEnabled(false);
+  assert.equal(lastGainTarget(findBedBus(fake)), 0, 'muted: beds are silent');
+  sound.setEnabled(true);
+  assert.equal(lastGainTarget(findBedBus(fake)), 1, 'unmuted: beds return');
+  assert.equal(fake.count('source'), 3, 'the mute toggle never rebuilt the beds');
+
+  // Autoplay unlock fails: resume stays pending and the engine locks after its grace period.
+  fake.raw.state = 'suspended';
+  fake.raw.resume = () => new Promise(() => {});
+  sound.setPaused(true);
+  sound.setPaused(false);
+  await new Promise(resolve => setTimeout(resolve, 520));
+  assert.equal(sound.live, false, 'locked when resume never resolves');
+  assert.equal(lastGainTarget(findBedBus(fake)), 0, 'locked: beds are silent too');
+  assert.equal(fake.count('source'), 3, 'locking does not tear down or duplicate the beds');
+
+  // A later gesture finally runs the context.
+  fake.raw.state = 'running';
+  (fake.raw.onstatechange as () => void)();
+  assert.equal(sound.live, true);
+  assert.equal(lastGainTarget(findBedBus(fake)), 1, 'beds restored after the unlock succeeds');
+  sound.update(baseFrame);
+  assert.equal(fake.count('source'), 3, 'still exactly the original three beds');
+  assert.equal(fake.count('osc'), 3);
+});
+
+test('dispose stops every sustained ambience node and leaves nothing running', () => {
+  const fake = fakeContext();
+  const sound = new GameSound({ createContext: () => fake.ctx, strict: true });
+  sound.start();
+  for (let i = 0; i < 3; i++) sound.update(baseFrame);
+  const sustained = fake.nodes().filter(node => node.kind === 'source' || node.kind === 'osc');
+  assert.equal(sustained.length, 6, 'three noise sources plus three LFO oscillators');
+  assert.ok(sustained.every(node => (node.starts as number) === 1), 'each bed source was started');
+
+  const disconnectsBefore = fake.disconnects();
+  sound.dispose();
+  assert.ok(sustained.every(node => (node.stops as number) >= 1), 'every sustained node is stopped');
+  assert.ok(fake.disconnects() > disconnectsBefore + sustained.length, 'teardown disconnects every bed node');
+  assert.equal(sound.live, false);
+
+  // Nothing can be scheduled onto the dead engine afterwards.
+  const sourcesAfter = fake.count('source');
+  sound.update(baseFrame); sound.ui('click');
+  assert.equal(fake.count('source'), sourcesAfter, 'post-dispose frames create no new sources');
+});
+
+test('music.loop keeps the synth phrases until decoded, then swaps without overlapping', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(0) })) as unknown as typeof fetch;
+  try {
+    const fake = fakeContext();
+    const sound = new GameSound({ createContext: () => fake.ctx, strict: true });
+    sound.start();
+    sound.registerSample('music.loop', '/audio/music.ogg', { loop: true });
+    // Drive enough frames for a phrase clock (phraseClock starts at 8s) to elapse while loading.
+    for (let i = 0; i < 600; i++) sound.update({ ...baseFrame, dt: 0.05 });
+    assert.equal(fake.count('source'), 3, 'only the three beds: no loop source before decode');
+    assert.ok(fake.count('osc') > 3, 'synthesized phrases keep the music going while the sample loads');
+
+    await sound.preloadSamples();
+    const oscBeforeLoop = fake.count('osc');
+    sound.update(baseFrame);
+    assert.equal(fake.count('source'), 4, 'the decoded loop starts exactly once');
+    assert.ok(fake.count('osc') === oscBeforeLoop, 'the swap adds no oscillators');
+
+    for (let i = 0; i < 400; i++) sound.update({ ...baseFrame, dt: 0.05 });
+    assert.equal(fake.count('source'), 4, 'the loop is never stacked with a second copy');
+    assert.equal(fake.count('osc'), oscBeforeLoop, 'synth phrases stop entirely once the loop plays');
+
+    sound.setPaused(true);
+    assert.equal(fake.count('source'), 4, 'pausing mutes the loop rather than recreating it');
+    sound.setPaused(false);
+    sound.unregisterSample('music.loop');
+    for (let i = 0; i < 10; i++) sound.update(baseFrame);
+    const loopNode = fake.nodes().filter(n => n.kind === 'source')[3] as { stops?: number };
+    assert.ok((loopNode.stops ?? 0) >= 1, 'unregistering stops the recorded loop');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a music.loop sample that never decodes leaves the synth phrases running forever', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('network down'); }) as unknown as typeof fetch;
+  try {
+    const fake = fakeContext();
+    const sound = new GameSound({ createContext: () => fake.ctx, strict: true });
+    sound.start();
+    sound.registerSample('music.loop', '/audio/missing.ogg', { loop: true });
+    for (let i = 0; i < 300; i++) sound.update({ ...baseFrame, dt: 0.05 });
+    await sound.preloadSamples(); // the bank marks the entry failed but never throws
+    assert.equal(fake.count('source'), 3, 'no loop source is ever created');
+    const oscAt = fake.count('osc');
+    for (let i = 0; i < 600; i++) sound.update({ ...baseFrame, dt: 0.05 });
+    assert.ok(fake.count('osc') > oscAt, 'synth phrases continue instead of a permanent silence');
+    assert.equal(fake.count('source'), 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

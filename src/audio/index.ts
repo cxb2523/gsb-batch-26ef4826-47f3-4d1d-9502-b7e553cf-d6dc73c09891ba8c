@@ -51,6 +51,9 @@ export class GameSound {
     this.sfx = new Sfx(this.engine, this.synth, this.music);
     this.ambience = new Ambience(this.engine, this.music);
     this.babble = new Babble(this.engine);
+    // Keep the sustained beds in lock-step with pause / mute / autoplay-lock transitions even
+    // between update() frames (a paused game stops calling update, so the beds must be told here).
+    this.engine.onRunStateChange(live => this.guard(() => this.ambience.sync(live, this.engine.ensure())));
   }
 
   get enabled(): boolean { return this.engine.enabled; }
@@ -62,11 +65,20 @@ export class GameSound {
   start(): void { this.guard(() => this.engine.start()); }
   setEnabled(enabled: boolean): void { this.guard(() => this.engine.setEnabled(enabled)); }
   setPaused(paused: boolean): void { this.guard(() => this.engine.setPaused(paused)); }
-  dispose(): void { this.guard(() => { this.ambience.stop(this.engine.live()); this.babble.stop(); this.engine.dispose(); }); }
+  dispose(): void {
+    this.guard(() => {
+      this.ambience.teardown(this.engine.ensure());
+      this.babble.stop();
+      this.engine.dispose();
+    });
+  }
 
   /** Replace a synthesized event with a recording (decoded lazily on first use; synth until ready). */
   registerSample(event: SoundEvent, url: string, options?: SampleOptions): void { this.engine.samples.register(event, url, options); }
-  unregisterSample(event: SoundEvent): void { this.engine.samples.unregister(event); }
+  unregisterSample(event: SoundEvent): void {
+    this.engine.samples.unregister(event);
+    this.guard(() => { if (event === 'music.loop') this.ambience.unregisterLoop(this.engine.ensure()); });
+  }
   /** Fetch and decode every registered sample now (call after a gesture). */
   async preloadSamples(): Promise<void> {
     const g = this.engine.ensure();
