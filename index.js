@@ -51,6 +51,8 @@ class GradientGL {
   #canvas
   #ownsCanvas
   #program
+  #positionBuffer
+  #positionLocation
   #uniforms
   #isActive
   #externalUniforms
@@ -70,6 +72,10 @@ class GradientGL {
     this.#fragment = fragment
     this.#vertex = vertex
     this.#isActive = false
+    this.#program = null
+    this.#positionBuffer = null
+    this.#positionLocation = null
+    this.#uniforms = null
     this.#currentSeed = seed
     this.#externalUniforms = seed[1]
     this.#currentUniformValues = { speed: 0, hueShift: 0, saturation: 0, lightness: 0 }
@@ -97,15 +103,39 @@ class GradientGL {
 
   init() {
     if (!this.#canvas) return
-    this.#gl = this.#createGLContext(this.#canvas)
-    this.#program = this.#createProgram(this.#vertex, this.#fragment)
-    this.#uniforms = this.#getUniformLocations()
-    this.#isActive = true
+    try {
+      this.#gl = this.#createGLContext(this.#canvas)
+      this.#program = this.#createProgram(this.#vertex, this.#fragment)
+      this.#uniforms = this.#getUniformLocations()
+      this.#isActive = true
 
-    this.#setupBuffers()
-    this.#setupAttributes()
-    this.#updateExternalUniforms(true)
-    this.#render()
+      this.#setupBuffers()
+      this.#setupAttributes()
+      this.#updateExternalUniforms(true)
+      this.#render()
+    } catch (error) {
+      // Roll back anything that was created so no half-initialized program
+      // survives. Caller-owned canvases keep their context for a later mount.
+      this.#teardownGLResources()
+      this.#isActive = false
+      this.#gl = null
+      this.#program = null
+      this.#positionBuffer = null
+      this.#positionLocation = null
+      this.#uniforms = null
+      throw error
+    }
+  }
+
+  // Release only the GL resources this program created on the shared context.
+  // Never touches the canvas itself, so caller-provided canvases stay usable.
+  #teardownGLResources() {
+    if (!this.#gl) return
+    if (this.#positionLocation !== null) {
+      this.#gl.disableVertexAttribArray(this.#positionLocation)
+    }
+    if (this.#positionBuffer) this.#gl.deleteBuffer(this.#positionBuffer)
+    if (this.#program) this.#gl.deleteProgram(this.#program)
   }
 
   #createGLContext(canvas) {
@@ -152,8 +182,8 @@ class GradientGL {
   }
 
   #setupBuffers() {
-    const positionBuffer = this.#gl.createBuffer()
-    this.#gl.bindBuffer(this.#gl.ARRAY_BUFFER, positionBuffer)
+    this.#positionBuffer = this.#gl.createBuffer()
+    this.#gl.bindBuffer(this.#gl.ARRAY_BUFFER, this.#positionBuffer)
     this.#gl.bufferData(
       this.#gl.ARRAY_BUFFER,
       new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
@@ -163,6 +193,7 @@ class GradientGL {
 
   #setupAttributes() {
     const positionLocation = this.#gl.getAttribLocation(this.#program, 'position')
+    this.#positionLocation = positionLocation
     this.#gl.enableVertexAttribArray(positionLocation)
     this.#gl.vertexAttribPointer(positionLocation, 2, this.#gl.FLOAT, false, 0, 0)
   }
@@ -278,13 +309,19 @@ class GradientGL {
 
   destroy(preserveCanvas) {
     this.#isActive = false
-    if (this.#program && this.#gl) this.#gl.deleteProgram(this.#program)
     const reuse = this.#canvas === preserveCanvas
-    if (this.#ownsCanvas && !reuse) {
+    this.#teardownGLResources()
+    // Only the library's own canvas owns its context lifecycle. A
+    // caller-provided canvas is left connected with its context intact so a
+    // later boot can keep rendering on it.
+    if (this.#ownsCanvas && !reuse && this.#canvas) {
       this.#gl?.getExtension('WEBGL_lose_context')?.loseContext()
-      this.#canvas?.remove()
+      this.#canvas.remove()
     }
     this.#program = null
+    this.#positionBuffer = null
+    this.#positionLocation = null
+    this.#uniforms = null
     this.#canvas = null
     this.#gl = null
     if (activeProgram === this) activeProgram = null
@@ -352,19 +389,30 @@ export default function boot(seed, selector = 'body') {
       return activeProgram
     }
 
+    // Resolve the shader before touching the live program: an unknown shader
+    // then fails fast without tearing down a program that is still rendering.
+    const shader = await fetchShader(shaderId)
+    const fragment = common + shader + main
+
     if (activeProgram) {
       activeProgram.destroy(target)
       activeProgram = null
     }
 
-    const shader = await fetchShader(shaderId)
-    const fragment = common + shader + main
     const canvas = createCanvas(target)
-    const program = new GradientGL(canvas, fragment, parsedSeed, !isCanvas(target))
-    program.shaderId = shaderId
-    program.init()
-    activeProgram = program
-    return program
+    try {
+      const program = new GradientGL(canvas, fragment, parsedSeed, !isCanvas(target))
+      program.shaderId = shaderId
+      program.init()
+      activeProgram = program
+      return program
+    } catch (error) {
+      // init() already rolled back its GL resources. Make sure no
+      // half-initialized program remains reachable as the active one, so the
+      // next boot can mount normally.
+      if (activeProgram?.shaderId === shaderId) activeProgram = null
+      throw error
+    }
   })
 
   bootLock = task.catch(() => {})
