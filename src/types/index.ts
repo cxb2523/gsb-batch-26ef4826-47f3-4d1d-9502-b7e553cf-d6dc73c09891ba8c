@@ -1,5 +1,5 @@
 import { type WaveSurferOptions } from 'wavesurfer.js'
-import type { Ref } from 'vue'
+import type { ComputedRef, Ref } from 'vue'
 import type { useWaveSurferInstance } from '../core/useWaveSurferInstance'
 import type { useWaveSurferState } from '../core/useWaveSurferState'
 import type { RecordPluginOptions } from 'wavesurfer.js/dist/plugins/record'
@@ -32,4 +32,27 @@ export type Plugins = {
 
 export type UseWaveSurferRecorder = WaveSurferIns & {
   recordPluginOptions?: RecordPluginOptions
+}
+
+/**
+ * High level recorder state.
+ * - `idle`: nothing is captured, the next start begins a new recording
+ * - `recording`: audio is being captured
+ * - `paused`: a recording is open but no audio is being captured
+ */
+export type RecorderStatus = 'idle' | 'recording' | 'paused'
+
+export interface RecordingController {
+  /** Recording duration formatted as `mm:ss`, frozen while paused. */
+  currentTime: ComputedRef<string>
+  isRecording: ComputedRef<boolean>
+  isPaused: ComputedRef<boolean>
+  /** `true` when the primary action is pause, `false` when it is resume. */
+  isPauseResume: ComputedRef<boolean>
+  /** Start a recording, or resume the paused one. */
+  startRecording: () => Promise<void>
+  /** Pause the running recording, or resume the paused one. */
+  pauseRecording: () => void
+  /** Stop the recording and resolve with the blob of this recording. */
+  stopRecording: () => Promise<Blob>
 }

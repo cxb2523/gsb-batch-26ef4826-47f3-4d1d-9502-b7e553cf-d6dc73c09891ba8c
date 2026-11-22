@@ -363,12 +363,24 @@ const stopHandler = async () => {
 |----------|------|-------------|
 | `waveSurfer` | `Ref<WaveSurfer \| null>` | WaveSurfer instance |
 | `waveSurferRecorder` | `Ref<RecordPlugin \| null>` | Record plugin instance |
-| `currentTime` | `ComputedRef<string>` | Current recording time in `mm:ss` format |
-| `isPaused` | `ComputedRef<boolean \| undefined>` | Whether recording is paused |
-| `isRecording` | `ComputedRef<boolean \| undefined>` | Whether recording is in progress |
-| `startRecording()` | `() => void` | Start or resume recording |
-| `stopRecording()` | `() => Promise<Blob>` | Stop recording and return blob |
+| `currentTime` | `ComputedRef<string>` | Current recording time in `mm:ss` format, frozen while paused |
+| `isPaused` | `ComputedRef<boolean>` | Whether recording is paused |
+| `isRecording` | `ComputedRef<boolean>` | Whether recording is in progress |
+| `isPauseResume` | `ComputedRef<boolean>` | `true` when the primary action is pause, `false` when it is resume |
+| `startRecording()` | `() => Promise<void>` | Start a recording, or resume the paused one |
+| `stopRecording()` | `() => Promise<Blob>` | Stop recording and resolve with this recording's blob (empty blob when nothing was recording) |
 | `pauseRecording()` | `() => void` | Pause/resume recording |
+
+Both `useWaveSurferRecorder` and `useWaveSurferRecorderStandalone` share the same
+state machine, so their behaviour is identical:
+
+- calling `startRecording()` while paused **resumes** instead of restarting
+- `stopRecording()` always settles: it resolves with the blob of the recording it
+  stopped, or with an empty `Blob` when nothing was being recorded
+- the `record-progress` listener is registered once per plugin instance, it never
+  stacks across repeated starts
+- `isRecording`, `isPaused`, `isPauseResume` and `currentTime` stay in sync after
+  every action, and `currentTime` stops growing while paused
 
 ## 🏗️ Architecture
 

@@ -7,6 +7,12 @@ export { useWaveSurferSpectrogram } from './useWaveSurferSpectrogram'
 export { useWaveSurferHover } from './useWaveSurferHover'
 export { useWaveSurferRegions } from './useWaveSurferRegions'
 export { useWaveSurferRecorder } from './useWaveSurferRecorder'
+export { createRecordingLogic } from './useWaveSurferRecorder'
+export type {
+  UseWaveSurferRecorderOptions,
+  UseWaveSurferRecorderStandaloneOptions,
+  RecordingLogicOptions
+} from './useWaveSurferRecorder'
 
 // Standalone plugin composables (creates own WaveSurfer instance)
 export { useWaveSurferTimelineStandalone } from './useWaveSurferTimeline'
