@@ -365,6 +365,25 @@ Supported skin changes rebuild the view and preserve accumulated track time
 and its wrapped animation time. A held checked live view becomes stale; retained
 snapshots keep their old values. Unsupported views still name the oracle fallback.
 
+**A fallback is continuous and invalidating.** When a live track operation
+(`environment`, `moved`, a physics-clock read) or a composition/sets/skin
+change retires the runtime for the oracle, the oracle is re-posed at the
+runtime's own track time and under the same view, so `time` and every slot's
+clip polygon carry across the switch unchanged. The retired runtime is gone for
+good: any later borrow is the oracle's, its generation is newer than the
+retired frame's, and drawing the old borrow throws `LIVE_FRAME_STALE` rather
+than repeating the last runtime pose. A physics-skin switch, an attachment-set
+change and a cleared second track all follow the same rule.
+
+**A stale borrow never draws, checked or not.** `DomRenderer.render` and
+`CanvasRenderer.render` both resolve a borrowed frame through the same gate, so
+a frame that is no longer the player's current one throws `LIVE_FRAME_STALE` in
+either mode instead of painting old vertices. `dispose()` expires every borrow
+(reading it after disposal throws `LIVE_FRAME_STALE`; borrowing a new one
+throws `LIVE_FRAME_DISPOSED`), restores the root's borrowed `clip-path`, and
+drops the renderer's element, clip, queued-mesh and page references, so no node
+or bitmap is left behind.
+
 A production borrowed view is reused and overwritten: keeping its object does
 not keep its values or its old generation. Use `player.posedFrame()` for a
 detached snapshot that survives later steps, including when the runtime is

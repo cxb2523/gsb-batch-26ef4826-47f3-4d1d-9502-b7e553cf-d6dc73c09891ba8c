@@ -70,7 +70,18 @@ do not recalculate it on each feature PR.
   `DomRenderer.render(frame)` and `CanvasRenderer.render(frame)` form the
   interface between posing and drawing. `posedFrame()` remains a retained
   snapshot on either poser; a live frame expires at the next pose mutation.
-  See [Borrowing a live frame](docs/REFERENCE.md#borrowing-a-live-frame) for
+  **Both renderers refuse an expired borrow** — they resolve it through the
+  shared `renderFrameOf` gate in `liveFrameSource.ts`, which runs the player's
+  freshness probe before drawing, so a production (unchecked) frame that a
+  fallback retired or a disposal expired throws `LIVE_FRAME_STALE` in `dom` and
+  `canvas` alike rather than painting old data. A **runtime→oracle fallback**
+  re-poses the oracle at the runtime's own track time under the same view, so
+  `time` and clip coverage are continuous; the retired runtime view and the
+  last oracle pack report stale at their own `generation`/`count` getters, and
+  a live-track fallback (`stepper()`) advances the generation. `dispose()`
+  retires both borrow kinds, and each renderer drops its element, clip, queued
+  mesh and page references. See
+  [Borrowing a live frame](docs/REFERENCE.md#borrowing-a-live-frame) for
   the buffer layout, lifetime and fallback policy.
 - **The `rig-c/core` adapter is `src/posedFrame.ts` (`frameOf`), re-cut from
   rigc's `src/render_core.ts`**, which is its specification and

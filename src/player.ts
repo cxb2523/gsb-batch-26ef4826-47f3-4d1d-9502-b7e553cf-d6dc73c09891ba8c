@@ -1,6 +1,7 @@
 import { type CompiledDocument, type CoreSlotRow, eventsFired, type LiveTrack, type LiveTracks, type LocalAdjust as CoreLocalAdjust, openTrack, openTracks, physicsClockStep, poseRawSetup, type RawClip, type RawDrawn, type RawPose, type TrackEntryView, underNoSkin, underSkin } from '@rig-c/core/core';
 import { compileRuntime, RuntimeRefusal, type RuntimeModel } from '@rig-c/core/runtime';
-import { checkedLiveFrame, oracleLiveFrame, RuntimeFrames, type LiveFrame } from './liveFrame.js';
+import { checkedLiveFrame, oracleLiveFrame, retireLiveFrame, RuntimeFrames, type LiveFrame } from './liveFrame.js';
+import { registerLiveValidity } from './liveFrameSource.js';
 import { CanvasRenderer } from './CanvasRenderer.js';
 import { DomRenderer, type MeshBackend } from './DomRenderer.js';
 import type { ModelAssets, ReadDocument, RigSet } from './loadModel.js';
@@ -1191,6 +1192,9 @@ export class RigPlayer {
     this.pose = set === null ? raw : applySetToPose(this.view, raw, set);
     this.poseGeneration++;
     this.cachedIdentity = null;
+    // An oracle borrow from an earlier generation is spent the moment the
+    // generation moves; retire it so even an unchecked read reports stale.
+    this.retireBorrowedOracle();
   }
 
   /**
@@ -1560,7 +1564,9 @@ export class RigPlayer {
 
   /** What is open: the tracks, the single track, or nothing before `play`. */
   private stepper(): LiveTrack | LiveTracks | null {
-    this.oracle('oracle track operation');
+    // A live track operation retires the runtime with no pose of its own, so
+    // the oracle frame it materializes is a new generation for old borrows.
+    this.oracle('oracle track operation', true);
     return this.tracks ?? this.track;
   }
 
@@ -1671,6 +1677,9 @@ export class RigPlayer {
   draw(): void {
     if (this.runtimeFrames !== null) {
       this.runtimeFrames.update(this.poseGeneration, this.color, this.draws, false);
+      // The runtime view is its own current borrow: mark it so the renderer's
+      // stale probe accepts the very object about to be drawn.
+      this.markRuntimeFrame(this.runtimeFrames, this.poseGeneration);
       this.renderer.render(this.runtimeFrames.live);
       return;
     }
@@ -2402,36 +2411,139 @@ export class RigPlayer {
     frames.update(this.poseGeneration, this.color, this.draws);
   }
 
-  /** Materialize the old track only at an operation stage 0 cannot execute. */
-  private oracle(reason: string): void {
+  /**
+   * Materialize the old track only at an operation stage 0 cannot execute.
+   *
+   * The oracle is re-posed at the runtime's own track time and under the same
+   * view, so time and clip coverage carry across the switch. When a live track
+   * operation (an environment, a movement, a physics-clock read) forces the
+   * switch, that is one pose change the runtime never staged, so the new
+   * frame's generation advances; re-selections that stage their own poses
+   * (composition, sets, skin) keep counting through their own writes.
+   */
+  private oracle(reason: string, retired = false): void {
     if (this.runtimeFrames === null || this.animation === null) return;
     const time = this.runtimeFrames.pose.trackTime;
     const generation = this.poseGeneration;
+    // Retire the runtime view being abandoned: its stable borrow object stays
+    // in held code, and must read as stale from here on.
+    this.runtimeFrames.retire();
     this.runtimeFrames = null;
     this.runtimeReadback = null;
+    this.retireBorrowedOracle();
     if (this.poserLabel === 'runtime') this.poserLabel = `oracle: ${reason}`;
     this.track = openTrack(this.view, this.animation, { loop: this.loop, reset: 'animation', adjust: this.adjustHook, clock: this.clockHook });
     this.setRawPose(this.track.first);
     if (time > 0) this.setRawPose(this.track.step(time));
-    this.poseGeneration = generation;
+    this.poseGeneration = retired ? generation + 1 : generation;
+    if (retired) this.cachedIdentity = null;
     this.applyEnvironment(this.track);
+  }
+
+  /**
+   * A probe a renderer runs before drawing a borrowed frame: it throws
+   * `LIVE_FRAME_STALE` once the borrow is no longer the player's current frame.
+   * The runtime's live object is reused in place across plain steps, so its
+   * probe is one stable function installed once; an oracle pack is one object
+   * per borrow, tied to the generation it was packed at. Either is stale once
+   * the player is disposed or has moved on to another frame.
+   */
+  private readonly runtimeFrameProbe = (): void => {
+    if (this.liveDisposed) throw new Error('LIVE_FRAME_STALE: borrowed frame was invalidated by dispose; call liveFrame() again');
+    const state = this.runtimeFrames;
+    if (state === null || this.runtimeLive !== state.live || this.runtimeGeneration !== this.poseGeneration || this.runtimeRevision !== state.revision) {
+      throw new Error('LIVE_FRAME_STALE: borrowed frame was invalidated; call liveFrame() again');
+    }
+  };
+  /** The runtime live object, generation and revision the stable probe above accepts. */
+  private runtimeLive: LiveFrame | null = null;
+  private runtimeGeneration = -1;
+  private runtimeRevision = -1;
+  /** The runtime live object already registered with the validity map, so a steady step allocates nothing. */
+  private runtimeRegistered: LiveFrame | null = null;
+  /**
+   * The most recent oracle pack handed out, so a pose mutation or disposal can
+   * mark it spent at its own getters. Only worth tracking while the player is
+   * on the oracle; a runtime step clears it and the pack's own generation probe
+   * covers the rest.
+   */
+  private borrowedOracle: { frame: LiveFrame; generation: number } | null = null;
+
+  /** Retire the last oracle borrow, if the player has moved on from it. */
+  private retireBorrowedOracle(): void {
+    const borrowed = this.borrowedOracle;
+    if (borrowed === null) return;
+    if (borrowed.generation !== this.poseGeneration) retireLiveFrame(borrowed.frame);
+    this.borrowedOracle = null;
+  }
+
+  /** Record the runtime view as the current borrow — from a `liveFrame()` or the player's own draw. */
+  private markRuntimeFrame(state: RuntimeFrames, generation: number): void {
+    this.runtimeLive = state.live;
+    this.runtimeGeneration = generation;
+    this.runtimeRevision = state.revision;
+    this.borrowedOracle = null;
+  }
+
+  /**
+   * Install the stable probe on the runtime's live object once. It is reused in
+   * place, so a second registration would only churn the weak map; the probe
+   * itself reads the current generation and revision.
+   */
+  private ensureRuntimeRegistered(state: RuntimeFrames): void {
+    if (this.runtimeRegistered === state.live) return;
+    this.runtimeRegistered = state.live;
+    registerLiveValidity(state.live, this.runtimeFrameProbe);
+  }
+
+  /**
+   * The probe an oracle pack borrows with: one closure per borrow (the pack is
+   * a fresh object every call), stale the moment the generation moves or the
+   * player is disposed.
+   */
+  private oracleFrameProbe(generation: number): () => void {
+    return (): void => {
+      if (this.liveDisposed) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${generation} was invalidated by dispose; call liveFrame() again`);
+      if (this.runtimeFrames !== null || this.poseGeneration !== generation) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${generation} was invalidated; call liveFrame() again`);
+    };
   }
 
   /** Borrow buffers until the next pose mutation. Request posedFrame() to retain a snapshot. */
   liveFrame(): LiveFrame {
     if (this.liveDisposed) throw new Error('LIVE_FRAME_DISPOSED: cannot borrow a frame after dispose');
-    let frame: LiveFrame;
-    if (this.runtimeFrames !== null) {
-      this.runtimeFrames.update(this.poseGeneration, this.color, this.draws, false);
-      frame = this.runtimeFrames.live;
-    } else {
-      const identities = new Map(this.slotIdentity().slots.map(slot => [slot.slot, slot]));
-      frame = oracleLiveFrame(this.posedFrame(), identities, this.source.slotIndex);
+    const frames = this.runtimeFrames;
+    const generation = this.poseGeneration;
+    if (frames !== null) {
+      frames.update(generation, this.color, this.draws, false);
+      this.markRuntimeFrame(frames, generation);
+      // A production borrow carries no proxy, so this registry is what makes
+      // DomRenderer and CanvasRenderer refuse its expired view at the draw.
+      this.ensureRuntimeRegistered(frames);
+      return this.liveChecks ? this.checkedFrame(frames.live) : frames.live;
     }
-    return this.liveChecks ? this.checkedFrame(frame) : frame;
+    // A new oracle borrow retires the last one: the oracle packs a fresh object
+    // every call, so anything still held from before must now read stale.
+    this.retireBorrowedOracle();
+    const identities = new Map(this.slotIdentity().slots.map(slot => [slot.slot, slot]));
+    const frame = oracleLiveFrame(this.posedFrame(), identities, this.source.slotIndex);
+    const borrowed = this.liveChecks ? this.checkedFrame(frame) : frame;
+    // The oracle packs a fresh object per borrow, so its probe is per borrow.
+    registerLiveValidity(borrowed, this.oracleFrameProbe(generation));
+    this.borrowedOracle = { frame, generation };
+    return borrowed;
   }
 
-  /** Keep lease closures out of the production borrow's call environment. */
+  /**
+   * Wrap a borrow in a development lease. A lease is fresh while the player is
+   * still at the generation it was borrowed at; a colour refresh that
+   * overwrites borrowed tint data without a pose step moves the runtime state's
+   * revision, which invalidates it too.
+   *
+   * Every fallback that retires a runtime view advances the generation (the
+   * `stepper()` path bumps it; composition, sets and skin stage their own
+   * poses), so a lease taken before any of them reads stale, exactly as after a
+   * plain step.
+   */
   private checkedFrame(frame: LiveFrame): LiveFrame {
     const generation = this.poseGeneration;
     const state = this.runtimeFrames;
@@ -2592,10 +2704,14 @@ export class RigPlayer {
 
   /** Removes the renderer's elements and hands its GPU pages back. The assets stay the caller's. */
   dispose(): void {
+    // Retire the live runtime view (its stale getters cover a held borrow) and
+    // the last oracle pack; disposal is the final pose mutation.
+    this.runtimeFrames?.retire();
     this.runtimeFrames = null;
     this.runtimeReadback = null;
     this.liveDisposed = true;
     this.poseGeneration++;
+    this.retireBorrowedOracle();
     this.renderer.dispose();
     this.clearSeekCache();
     this.cachedIdentity = null;

@@ -544,7 +544,9 @@ export class DomRenderer {
    * revokeRegions() once no renderer needs them.
    *
    * Idempotent: the retained-page ledger is cleared here, so a second call
-   * releases nothing a second time.
+   * releases nothing a second time. Every reference the last frame left in
+   * hand — the active clip, the clip ledger, the queued mesh batch — is
+   * dropped too, so a disposed renderer pins no polygon and no page image.
    */
   dispose(): void {
     // The root is the caller's element and outlives this renderer, so the
@@ -559,6 +561,17 @@ export class DomRenderer {
       if (blitter) for (const page of this.glPages) blitter.release(page);
       this.glPages = null;
     }
+    // Drop the clip state the last frame held: the polygon it borrowed, the
+    // identity set it counted, and any mesh job still queued (a renderer
+    // disposed mid-frame never flushes them). Nothing here is ours to free
+    // beyond the references — the clips and pages belong to the caller.
+    this.clipActive = null;
+    this.clipsSeen.clear();
+    this.clipInverse = false;
+    this.clipOnRoot = false;
+    this.clipPolygonLength = 0;
+    this.pendingJobs.length = 0;
+    this.pendingViews.length = 0;
   }
 
   // --- rigid tier -----------------------------------------------------------

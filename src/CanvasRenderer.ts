@@ -241,7 +241,11 @@ export class CanvasRenderer {
       if (blitter) for (const page of this.glPages) blitter.release(page);
       this.glPages.clear();
     }
+    // Drop the last frame's identity references (pages, UVs, triangles, clips)
+    // and its run list, so a disposed renderer pins no borrowed geometry.
     this.sigLength = -1;
+    this.sigRefs.length = 0;
+    this.runs.length = 0;
   }
 
   // --- the rect -------------------------------------------------------------

@@ -135,6 +135,19 @@ export class RuntimeFrames {
   private readonly previousColor = new Float64Array(4).fill(Number.NaN);
   private drawn = 0;
   private epoch = 0;
+  /** Set once this runtime view is retired by a fallback or disposal; its borrow then reads stale. */
+  private retired = false;
+
+  /**
+   * Retire this view. The player nulls its reference at the same time, so a
+   * frame borrowed from it stops being updated; from here `generation` and
+   * `count` throw `LIVE_FRAME_STALE`, which is what makes a *production*
+   * borrow (no proxy lease) report expiry to a direct read after a fallback or
+   * disposal, not only at the renderer boundary.
+   */
+  retire(): void {
+    this.retired = true;
+  }
 
   constructor(source: FrameSource, model?: RuntimeModel) {
     this.model = model ?? compileRuntime(source.doc);
@@ -186,7 +199,8 @@ export class RuntimeFrames {
     this.colours = colours;
     const owner = this;
     this.live = Object.freeze({
-      get generation() { return owner.epoch; }, get count() { return owner.drawn; },
+      get generation() { if (owner.retired) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${owner.epoch} was invalidated; call liveFrame() again`); return owner.epoch; },
+      get count() { if (owner.retired) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${owner.epoch} was invalidated; call liveFrame() again`); return owner.drawn; },
       drawOrder: this.order, vertices: this.pose.vertices, tint: this.tint, attachments: Object.freeze(metadata),
     });
     drawings.set(this.live, this.renderFrame);
@@ -272,6 +286,14 @@ export class RuntimeFrames {
   }
 }
 
+/** @internal Oracle-fallback packs that have been retired (by a fallback or disposal). */
+const retiredOracleFrames = new WeakSet<object>();
+
+/** @internal Retire a borrowed pack so its `generation`/`count` reads throw `LIVE_FRAME_STALE`. */
+export function retireLiveFrame(frame: LiveFrame): void {
+  retiredOracleFrames.add(frame);
+}
+
 /** @internal Oracle fallback keeps the same borrowed-buffer layout, without a zero-allocation claim. */
 export function oracleLiveFrame(frame: PosedFrame, identities: ReadonlyMap<string, { attachment: string | null; skin: string | null }>, indices: ReadonlyMap<string, number>): LiveFrame {
   let size = 0;
@@ -293,7 +315,12 @@ export function oracleLiveFrame(frame: PosedFrame, identities: ReadonlyMap<strin
     offset += points.length;
     return metadata;
   });
-  const live = { generation: frame.generation ?? 0, count: attachments.length, drawOrder, vertices, tint, attachments };
+  const generation = frame.generation ?? 0;
+  const live = Object.freeze({
+    get generation() { if (retiredOracleFrames.has(live)) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${generation} was invalidated; call liveFrame() again`); return generation; },
+    get count() { if (retiredOracleFrames.has(live)) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${generation} was invalidated; call liveFrame() again`); return attachments.length; },
+    drawOrder, vertices, tint, attachments,
+  });
   drawings.set(live, frame);
   return live;
 }

@@ -80,6 +80,58 @@ test('runtime composition fallback keeps time and invalidates old views', async 
   expect(result.disposed).toBe(true);
 });
 
+for (const reason of ['composition', 'environment', 'skin'] as const) {
+  for (const mode of ['dom', 'canvas'] as const) {
+    for (const checked of [true, false]) {
+      test(`runtime→oracle fallback (${reason}, ${mode}, ${checked ? 'checked' : 'production'}): time and clip continuity, expired old borrow, fresh new frame`, async ({ page }) => {
+        await page.goto('/tests/harness.html');
+        await page.waitForFunction(() => Boolean(window.rigPlayHarness));
+        const r = await page.evaluate(([reason, mode, checked]) => window.rigPlayHarness.liveFrameContinuityProbe(reason, mode, checked), [reason, mode, checked] as const);
+        // The poser names its oracle reason and time does not jump.
+        expect(r.poser).toMatch(/^oracle: /);
+        expect(r.timeContinuous, `time ${r.timeBefore} → ${r.timeAfter}`).toBe(true);
+        // Clip coverage carries across the switch, and the generation advances.
+        expect(r.clipsContinuous, `clips ${r.clipsBefore} → ${r.clipsAfter}`).toBe(true);
+        expect(r.generationAdvanced, `gen ${r.leaseGen} → ${r.freshGen}`).toBe(true);
+        // Old borrows are dead to both reads and draws; the fresh one draws.
+        expect(r.oldDraw).toContain('LIVE_FRAME_STALE');
+        expect(r.freshDraw).toBe('drew');
+        if (checked) {
+          expect(r.oldRead).toContain('LIVE_FRAME_STALE');
+          expect(r.oldReadNested).toContain('LIVE_FRAME_STALE');
+        }
+        // Disposal expires the borrow, refuses a new one, and cleans the root.
+        expect(r.disposedRead).toContain('LIVE_FRAME_STALE');
+        expect(r.disposedDraw).toContain('LIVE_FRAME_STALE');
+        expect(r.borrowAfterDispose).toContain('LIVE_FRAME_DISPOSED');
+        expect(r.childrenAfterDispose).toBe(0);
+        expect(r.rootClipAfterDispose).toBe('inset(3px)');
+        console.log('LIVE_FRAME_CONTINUITY', JSON.stringify(r));
+      });
+    }
+  }
+}
+
+test('normal playback draws the same picture in dom and canvas', async ({ page }) => {
+  await page.goto('/tests/harness.html');
+  await page.waitForFunction(() => Boolean(window.rigPlayHarness));
+  for (const animation of ['tilted', 'inverse', 'mask']) {
+    const rows = await page.evaluate(animation => window.rigPlayHarness.liveFrameModeParity(animation), animation);
+    expect(rows.map(row => row.mode)).toEqual(['dom', 'canvas']);
+    for (const row of rows) {
+      // The runtime is selected in both modes, its borrowed + detached frame
+      // agrees slot-for-slot, and matches the oracle record to the bit — so the
+      // two machines draw from identical numbers. Clip coverage is present.
+      expect(row.poser, `${animation}/${row.mode}`).toBe('runtime');
+      expect(row.frameDifference, `${animation}/${row.mode}`).toBeNull();
+      expect(row.oracleDifference, `${animation}/${row.mode}`).toBeNull();
+      expect(row.clipCount, `${animation}/${row.mode}`).toBeGreaterThan(0);
+      if (row.drawRedrawPixelDifferences !== null) expect(row.drawRedrawPixelDifferences, `${animation}/${row.mode}`).toBe(0);
+    }
+    console.log('LIVE_FRAME_MODE_PARITY', JSON.stringify({ animation, rows }));
+  }
+});
+
 test('planted vertex, snapshot and unchecked-lease defects fail their gates', async ({ page }) => {
   await page.goto('/tests/harness.html');
   await page.waitForFunction(() => Boolean(window.rigPlayHarness));
@@ -87,7 +139,12 @@ test('planted vertex, snapshot and unchecked-lease defects fail their gates', as
   expect(corrupt.rows.some(row => row.poser === 'runtime' && row.numeric.length > 0)).toBe(true);
   expect(corrupt.rows.some(row => row.pixelDifferences > 0)).toBe(true);
   const unchecked = await page.evaluate(() => window.rigPlayHarness.liveFrameProbe('turned', 'lease'));
-  expect(unchecked.rows.some(row => row.poser === 'runtime' && !row.stale && !row.nestedStale && !row.rendererStale && !row.readonly)).toBe(true);
+  // The mutant disables `liveFrameChecks`, so a production borrow loses its
+  // proxy: direct reads and retained nested views stop throwing. The renderer
+  // boundary still refuses the expired frame in every mode — that gate is not
+  // a lease the caller can switch off.
+  expect(unchecked.rows.some(row => row.poser === 'runtime' && !row.stale && !row.nestedStale && !row.readonly)).toBe(true);
+  expect(unchecked.rows.every(row => row.poser !== 'runtime' || row.rendererStale)).toBe(true);
   const shared = await page.evaluate(() => window.rigPlayHarness.liveFrameProbe('walk', 'snapshot'));
   expect(shared.rows.some(row => row.poser === 'runtime' && !row.snapshotKept)).toBe(true);
 });

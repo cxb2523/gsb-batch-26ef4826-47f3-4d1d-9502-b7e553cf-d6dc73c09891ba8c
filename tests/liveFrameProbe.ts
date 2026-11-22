@@ -236,3 +236,158 @@ export async function liveFrameNullIdentity(plantOldCheck = false) {
     return rows;
   } finally { runtime.dispose(); oracle.dispose(); assets.dispose(); roots.forEach(root => root.remove()); }
 }
+
+type RendererMode = 'dom' | 'canvas';
+
+/** A predicted clip list from a frame: polygon values or null per drawn slot. */
+function clipList(frame: PosedFrame): string {
+  return JSON.stringify(frame.order.map(slot => slot.clip ? {
+    polygon: Array.from(slot.clip.polygon), inverse: slot.clip.inverse, convex: slot.clip.convex,
+  } : null));
+}
+
+function attempt<T>(read: () => T): { ok: true; value: T } | { ok: false; error: string } {
+  try { return { ok: true, value: read() }; } catch (error) { return { ok: false, error: String(error) }; }
+}
+
+/**
+ * The requirement's transition matrix, in both render modes and both lease
+ * settings: a runtime→oracle fallback must keep `time` and clip coverage, must
+ * advance the generation, must expire the old borrow (reads and draws), and
+ * must let the fresh borrow draw; disposal must expire borrows, refuse new
+ * ones, and leave the root and its `clip-path` as the caller left them.
+ *
+ * `reason` selects which fallback fires: `composition` (a second track's
+ * collapse), `environment` (a live-track operation) and `skin` (a skin switch
+ * onto a physics constraint). The clip rig is `figure`, whose `tilted`,
+ * `inverse`, `cover`, `nested` and `window` animations each carry a clip.
+ */
+export async function liveFrameContinuityProbe(reason: 'composition' | 'environment' | 'skin', mode: RendererMode, checked: boolean) {
+  const [rig, animation] = reason === 'skin' ? ['parameters', 'keyed'] : ['figure', 'tilted'];
+  const assets = await loadModel({ modelUrl: `/rigs/${rig}/skeleton.model.json` });
+  const root = document.createElement('div');
+  root.style.clipPath = 'inset(3px)';
+  document.body.append(root);
+  const player = new RigPlayer(root, assets, { mode, liveFrameChecks: checked, skin: reason === 'skin' ? 'default' : undefined });
+  try {
+    player.play(animation, { loop: false });
+    player.advance(0.35);
+    const timeBefore = player.time;
+    const genBefore = player.generation;
+    const clipsBefore = clipList(player.posedFrame());
+    const lease = player.liveFrame();
+    const leaseGen = lease.generation;
+
+    if (reason === 'composition') {
+      player.play('walk', { track: 1 });
+      player.clear(1, { mix: 0 });
+    } else if (reason === 'environment') {
+      player.environment({ wind: [1, 0] });
+    } else {
+      player.skin = 'active';
+    }
+
+    const timeAfter = player.time;
+    const clipsAfter = clipList(player.posedFrame());
+    const fresh = player.liveFrame();
+    const freshGen = fresh.generation;
+
+    const oldRead = attempt(() => lease.count);
+    const oldReadNested = attempt(() => lease.vertices[0]);
+    const oldDraw = attempt(() => (player.renderer as CanvasRenderer | DomRenderer).render(lease));
+    const freshDraw = attempt(() => (player.renderer as CanvasRenderer | DomRenderer).render(fresh));
+
+    const rootClipAfterFallback = root.style.clipPath;
+    const childrenBeforeDispose = root.childElementCount;
+    const disposed = player.liveFrame();
+    player.dispose();
+    const disposedRead = attempt(() => disposed.count);
+    const disposedDraw = attempt(() => (player.renderer as CanvasRenderer | DomRenderer).render(disposed));
+    const borrowAfterDispose = attempt(() => player.liveFrame());
+    return {
+      reason, mode, checked, poser: player.poser,
+      timeBefore, timeAfter, timeContinuous: timeAfter === timeBefore,
+      clipsBefore, clipsAfter, clipsContinuous: clipsBefore === clipsAfter,
+      genBefore, leaseGen, freshGen, generationAdvanced: freshGen > leaseGen,
+      oldRead: oldRead.ok ? 'read' : oldRead.error,
+      oldReadNested: oldReadNested.ok ? 'read' : oldReadNested.error,
+      oldDraw: oldDraw.ok ? 'drew' : oldDraw.error,
+      freshDraw: freshDraw.ok ? 'drew' : freshDraw.error,
+      rootClipAfterFallback, childrenBeforeDispose,
+      disposedRead: disposedRead.ok ? 'read' : disposedRead.error,
+      disposedDraw: disposedDraw.ok ? 'drew' : disposedDraw.error,
+      borrowAfterDispose: borrowAfterDispose.ok ? 'borrowed' : borrowAfterDispose.error,
+      childrenAfterDispose: root.childElementCount,
+      rootClipAfterDispose: root.style.clipPath,
+    };
+  } finally {
+    player.dispose();
+    root.remove();
+    assets.dispose();
+  }
+}
+
+/**
+ * Normal playback across the two render modes on the same clipped pose, at the
+ * same steps. Two claims, both deterministic and both required by the
+ * acceptance:
+ *
+ * - The borrowed frame and the detached snapshot are identical in `dom` and
+ *   `canvas` — the same numbers the two machines draw from — and the runtime
+ *   frame matches its oracle in each mode to the bit, which is what makes the
+ *   two modes' pictures agree beyond rasterizer noise (that pixel-level
+ *   agreement is `tests/parity.spec.ts`'s dom/canvas cells).
+ * - Each mode renders deterministically: the same borrowed frame drawn twice
+ *   reproduces the same pixels (a canvas-mode capture before/after).
+ */
+export async function liveFrameModeParity(animation: string) {
+  const assets = await loadModel({ modelUrl: '/rigs/figure/skeleton.model.json' });
+  const roots = [document.createElement('div'), document.createElement('div'), document.createElement('div'), document.createElement('div')];
+  roots.forEach(root => document.body.append(root));
+  const rows: Array<{ mode: RendererMode; poser: string; frameDifference: string | null; oracleDifference: string | null; clipCount: number; drawRedrawPixelDifferences: number | null }> = [];
+  try {
+    // The runtime players share one deterministic pair of roots per mode; the
+    // oracle comparison uses the second pair, stepped in lockstep.
+    for (const mode of ['dom', 'canvas'] as RendererMode[]) {
+      const runtime = new RigPlayer(roots[0], assets, { mode });
+      const oracle = new RigPlayer(roots[1], assets, { mode, poser: 'oracle' });
+      let frameDifference: string | null = null;
+      let oracleDifference: string | null = null;
+      let drawRedrawPixelDifferences: number | null = null;
+      let clipCount = 0;
+      try {
+        runtime.play(animation, { loop: false }); oracle.play(animation, { loop: false });
+        runtime.advance(0.35); oracle.advance(0.35);
+        const live = runtime.liveFrame();
+        const detached = runtime.posedFrame();
+        const oracleFrame = oracle.posedFrame();
+        // The live borrow and the detached snapshot name the same draw list and
+        // clip coverage.
+        const liveSlots = Array.from({ length: live.count }, (_, i) => live.attachments[live.drawOrder[i]].slot);
+        const detachedSlots = detached.order.map(slot => slot.slot);
+        if (JSON.stringify(liveSlots) !== JSON.stringify(detachedSlots)) frameDifference = 'live/detached slot order differs';
+        clipCount = detached.order.filter(slot => slot.clip).length;
+        oracleDifference = mismatch(detached, oracleFrame);
+        if (mode === 'canvas') {
+          const bounds = oracle.bounds();
+          if (bounds) {
+            const viewport = { x: Math.floor(bounds.x) - 2, y: Math.floor(bounds.y) - 2, width: Math.ceil(bounds.width) + 5, height: Math.ceil(bounds.height) + 5 };
+            (runtime.renderer as CanvasRenderer).viewport = viewport;
+            runtime.draw();
+            const first = pixels(runtime);
+            runtime.draw();
+            const second = pixels(runtime);
+            let diff = 0;
+            for (let i = 0; i < first.length; i++) if (first[i] !== second[i]) diff++;
+            drawRedrawPixelDifferences = diff;
+          }
+        }
+        rows.push({ mode, poser: runtime.poser, frameDifference, oracleDifference, clipCount, drawRedrawPixelDifferences });
+      } finally { runtime.dispose(); oracle.dispose(); }
+    }
+    return rows;
+  } finally {
+    roots.forEach(root => root.remove());
+    assets.dispose();
+  }
+}
