@@ -4,7 +4,7 @@ import { setupNativeCaptionPip } from './native-caption-pip.js';
 import { toast } from './util.js';
 import { errorMessage } from './errors.js';
 
-export function setupAudioPip({ media, engine, app, beforeOpen, releaseLandscape, onStateChange }) {
+export function setupAudioPip({ media, engine, app, releaseLandscape, onStateChange, pipSession }) {
   const getBridge = () => nativeApp()?.captionPip ?? null;
   let nativePip = null, opening = false;
   const supported = () => !!getBridge() || hasSession();
@@ -18,7 +18,7 @@ export function setupAudioPip({ media, engine, app, beforeOpen, releaseLandscape
   };
   const bind = () => {
     const bridge = getBridge();
-    if (bridge && !nativePip) nativePip = setupNativeCaptionPip({ bridge, media, engine, onStateChange: notify });
+    if (bridge && !nativePip) nativePip = setupNativeCaptionPip({ bridge, media, engine, onStateChange: notify, pipSession });
   };
   bind();
   window.addEventListener('native-caption-capabilities', () => { bind(); notify(); });
@@ -31,10 +31,6 @@ export function setupAudioPip({ media, engine, app, beforeOpen, releaseLandscape
     if (media.readyState < 2) { toast('媒体正在加载，请稍后再试字幕小窗'); return; }
     opening = true;
     try {
-      if (beforeOpen) {
-        const result = beforeOpen();
-        if (!(result?.then ? await result : result)) return;
-      }
       await nativePip.open();
     } catch (error) { toast(errorMessage(error, '字幕小窗启动失败，请重试')); }
     finally { opening = false; }

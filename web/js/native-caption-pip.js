@@ -3,8 +3,9 @@ import { trackCfg } from './trackcfg.js';
 import { pipLines } from './video-pip.js';
 import { randomId, toast } from './util.js';
 import { mediaControl } from './media-controls.js';
+import { createPipSession } from './pip-session.js';
 
-export function setupNativeCaptionPip({ bridge, media, engine, onStateChange }) {
+export function setupNativeCaptionPip({ bridge, media, engine, onStateChange, pipSession = createPipSession() }) {
   let session = '', sequence = 0, active = false, opening = false, closing = false;
   let disposed = false, stalled = false, lastSent = -Infinity, lastTimeline = '';
   let inFlight = false, queued = null, originalDisablePip = false;
@@ -26,6 +27,7 @@ export function setupNativeCaptionPip({ bridge, media, engine, onStateChange }) 
   function clear() {
     media.disablePictureInPicture = originalDisablePip;
     session = ''; active = opening = closing = false; queued = null; lastTimeline = '';
+    pipSession.release('captions');
     onStateChange?.();
   }
 
@@ -62,6 +64,19 @@ export function setupNativeCaptionPip({ bridge, media, engine, onStateChange }) 
     originalDisablePip = !!media.disablePictureInPicture;
     media.disablePictureInPicture = true;
     onStateChange?.();
+    // 互斥会话: 空闲时同步拿下 (启动请求不离开时序); 被视频小窗占用时先等它真正退出。
+    const grant = pipSession.tryClaim('captions') || await pipSession.acquire('captions');
+    if (session !== current || disposed || closing) {
+      if (grant === true) pipSession.release('captions');
+      return;
+    }
+    if (grant !== true) {
+      // 没抢到会话: 回滚本次启动, 对方的状态保持原样。
+      clear();
+      throw grant === 'busy'
+        ? Object.assign(new Error('字幕小窗正在切换，请稍后重试'), { code: 'PIP_BUSY' })
+        : new Error('请先关闭正在播放的小窗，再开启字幕小窗');
+    }
     const sentences = timeline(); lastTimeline = JSON.stringify(sentences);
     try {
       await bridge.open({ ...state(), sentences });
@@ -133,5 +148,6 @@ export function setupNativeCaptionPip({ bridge, media, engine, onStateChange }) 
   document.addEventListener('visibilitychange', () => sync(true));
   window.addEventListener('pagehide', () => { disposed = true; observer.disconnect(); void close(); });
   window.addEventListener('pageshow', () => { disposed = false; observe(); });
+  pipSession.register('captions', { isBusy, close });
   return { open, close, refresh: () => sync(true, true), isActive, hasSession, isBusy };
 }

@@ -4,6 +4,7 @@ import { isIOS } from './util.js';
 import { setupVideoGestures } from './video-gestures.js';
 import { setupVideoPip } from './video-pip.js';
 import { setupAudioPip } from './audio-pip.js';
+import { createPipSession } from './pip-session.js';
 import { nativeApp } from './native.js';
 
 export function setupVideo({ app, video, media = video, engine, toggle, onLayout, overlayOpen, openSettings }) {
@@ -228,9 +229,11 @@ export function setupVideo({ app, video, media = video, engine, toggle, onLayout
     },
   });
   //  小窗的最后一步: 视频被搬进系统窗口后, 播放页只剩一块占位提示 (点它收回画面)。
+  //  视频小窗与字幕浮层共用一条互斥会话: 同一时刻只允许一个系统小窗, 两边的
+  //  按钮态、占位提示和字幕轨都跟随这条会话刷新。
   let pip = null;
-  const audioPip = setupAudioPip({ media, engine, app, releaseLandscape,
-    beforeOpen: () => pip?.isActive() ? pip.close() : true,
+  const pipSession = createPipSession();
+  const audioPip = setupAudioPip({ media, engine, app, releaseLandscape, pipSession,
     onStateChange: () => { paintPip(); paintAudioPip(); } });
   const audioPipButton = document.getElementById('btnAudioPip');
   if (audioPipButton) audioPipButton.hidden = !audioPip.supported();
@@ -254,9 +257,9 @@ export function setupVideo({ app, video, media = video, engine, toggle, onLayout
     }
     syncLayout();
   };
-  pip = setupVideoPip({ video, stage, app, engine, releaseLandscape,
-    onLayout, onStateChange: paintPip, ownsActivity: audioPip.ownsActivity,
-    beforeOpen: () => audioPip.hasSession() ? audioPip.close() : true });
+  pip = setupVideoPip({ video, stage, app, engine, releaseLandscape, pipSession,
+    onLayout, onStateChange: paintPip, ownsActivity: audioPip.ownsActivity });
+  pipSession.onChange(() => { paintPip(); paintAudioPip(); });
   pipBtn?.addEventListener('click', () => pip.toggle());
   pipTool?.addEventListener('click', () => pip.toggle());
   pipNote?.addEventListener('click', () => audioPip.isActive() ? audioPip.close() : pip.toggle());
@@ -272,5 +275,5 @@ export function setupVideo({ app, video, media = video, engine, toggle, onLayout
     .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   apply();
   return { apply, syncLayout, showControls, media: video, isFullscreen, isImmersive, leaveHorizontal, pip, audioPip,
-    refreshPip: () => pip.refresh() };
+    pipSession, refreshPip: () => pip.refresh() };
 }

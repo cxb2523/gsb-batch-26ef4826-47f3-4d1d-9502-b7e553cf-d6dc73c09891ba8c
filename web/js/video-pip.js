@@ -21,6 +21,7 @@ import { trackCfg } from './trackcfg.js';
 import { locate, randomId, toast } from './util.js';
 import { nativeApp } from './native.js';
 import { activityPipControls } from './media-controls.js';
+import { createPipSession } from './pip-session.js';
 
 /**  折叠空白: 小窗只有一行位置, 换行和连续空格都不该撑高盒子.
     中日韩文本里换进来的换行不该变成一个空格 (「每天/都练习」中间不该有缝), 所以
@@ -56,7 +57,8 @@ export function pipCues(track, showTr = true) {
   return out;
 }
 
-export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onLayout, onStateChange, beforeOpen, ownsActivity }) {
+export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onLayout, onStateChange, ownsActivity,
+  pipSession = createPipSession() }) {
   const activityPip = nativeApp()?.activityPip;
   const controls = activityPip ? activityPipControls(activityPip, engine.audio || video, engine, randomId()) : null;
   let activityActive = false;
@@ -68,6 +70,9 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     if (detail.action) { controls?.control(detail); return; }
     if (ownsActivity?.()) return;
     activityActive = detail.active;
+    activityStarting = false;
+    // 系统自己进了 Activity PiP: 补登记互斥会话, 把字幕浮层请出去。
+    if (activityActive) void pipSession.acquire('video', () => activityActive);
     controls?.activate(activityActive && activityControlsSupported);
     app.classList.toggle('is-pip', activityActive);
     // The Activity contains the same video; native cues replace the hidden reader.
@@ -75,6 +80,7 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     cuesOn(activityActive);
     document.documentElement.classList.toggle('native-activity-pip', activityActive);
     onStateChange?.(); onLayout?.();
+    settle();
   });
   /*  只认「真的能调用」的接口: 有些宿主会把 documentPictureInPicture 暴露成残缺对象,
       按存在性判断会走进死路, 然后被 catch 掉、误报成「不支持小窗」。               */
@@ -99,10 +105,15 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
   let observer = null;
   let lastPaint = '';
   let skinCss = null;       //  小窗样式只在第一次打开时取一次
+  let starting = false;     // open() 在进行中: 互斥会话里算「占用中」
+  let activityStarting = false;  // 已请求 Activity PiP, 等系统回调确认
 
   const classicOn = () => video === document.pictureInPictureElement
     || video.webkitPresentationMode === 'picture-in-picture';
   const isActive = () => activityActive || !!pipWin || classicOn();
+
+  /** 不再占用系统小窗时归还互斥会话, 字幕浮层的按钮随之恢复可用。 */
+  const settle = () => { if (!isActive() && !starting && !activityStarting) pipSession.release('video'); };
 
   /**  小窗的样式表在主页面里取好再内联写进小窗: 小窗是独立文档, 外链在请求被拦截的
        环境里会一直挂着不生效 (DevTools/扩展/自动化都会), 内联则永远算得出样式。     */
@@ -213,6 +224,7 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     onStateChange?.();
     onLayout?.();
     try { win.close(); } catch { /* 用户已经自己关掉了 */ }
+    settle();   // 用户直接关掉系统小窗 (pagehide) 也走这里: 复位互斥会话
   };
 
   function mountDocument(win, css) {
@@ -273,17 +285,23 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
       try { video.webkitSetPresentationMode('inline'); } catch { /* 已经退出 */ }
     }
     syncClassic();
+    settle();
     return !isActive();
   }
 
   /** 经典 PiP 的系统状态 → 页面状态 (字幕轨开合、占位提示、按钮态). */
   function syncClassic() {
     const on = classicOn();
-    if (on) fillCues();   // iOS 用户上滑回桌面会自动进 PiP, 字幕轨得这时才建
+    if (on) {
+      fillCues();   // iOS 用户上滑回桌面会自动进 PiP, 字幕轨得这时才建
+      // 系统事件驱动的小窗同样参与互斥: 登记后字幕浮层会被请出去。
+      void pipSession.acquire('video', () => classicOn() || !!pipWin);
+    }
     cuesOn(on);
     app.classList.toggle('is-pip', on || !!pipWin);
     if (on) void releaseLandscape?.();
     onStateChange?.();
+    settle();
   }
 
   /**  原生路径挨个试: 残缺的接口会让位给下一条, 两个都没有就老实告诉用户。 */
@@ -294,31 +312,42 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
       toast('视频正在加载，请稍后再试小窗'); return;
     }
+    // 互斥会话: 空闲时同步拿下; 被字幕浮层占用时先等它真正退出, 它正在切换就提示稍后。
+    const grant = pipSession.tryClaim('video') || await pipSession.acquire('video');
+    if (grant === 'busy') { toast('另一个小窗正在切换，请稍后重试'); return; }
+    if (!grant) return;   // 对方没有关掉: 它的状态保持原样, 自己也不能亮成「已开启」
+    starting = true;
     const failures = [];
-    if (activityPip) {
-      try {
-        await releaseLandscape?.();
-        const result = await activityPip.enterPip({ width: video.videoWidth || 16, height: video.videoHeight || 9,
-          ...controls.snapshot() });
-        activityControlsSupported = result?.controls === true;
-        controls.activate(activityControlsSupported);
-        return;
-      } catch (error) { failures.push(error); }
+    try {
+      if (activityPip) {
+        try {
+          await releaseLandscape?.();
+          activityStarting = true;
+          const result = await activityPip.enterPip({ width: video.videoWidth || 16, height: video.videoHeight || 9,
+            ...controls.snapshot() });
+          activityControlsSupported = result?.controls === true;
+          controls.activate(activityControlsSupported);
+          return;
+        } catch (error) { activityStarting = false; failures.push(error); }
+      }
+      if (documentPip()) {
+        try { await openDocument(); return; } catch (error) { failures.push(error); }
+      }
+      if (classicKind()) {
+        try { await openClassic(); return; } catch (error) { failures.push(error); }
+      }
+      if (failures.length) console.warn('[pip] 原生小窗没有打开', failures);
+      toast(failures.length ? '无法开启画中画，请检查系统权限后重试' : '当前环境不支持画中画');
+    } finally {
+      starting = false;
+      settle();   // 每条路径都失败 (含用户取消系统请求) 时归还互斥会话
     }
-    if (documentPip()) {
-      try { await openDocument(); return; } catch (error) { failures.push(error); }
-    }
-    if (classicKind()) {
-      try { await openClassic(); return; } catch (error) { failures.push(error); }
-    }
-    if (failures.length) console.warn('[pip] 原生小窗没有打开', failures);
-    toast(failures.length ? '无法开启画中画，请检查系统权限后重试' : '当前环境不支持画中画');
   }
 
   async function toggle() {
     try {
       if (isActive()) await close();
-      else if (!beforeOpen || await beforeOpen()) await open();
+      else await open();
     } catch (error) {
       console.warn('[pip]', error);
       toast('画中画启动失败，请重试');
@@ -341,6 +370,7 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
   video.addEventListener('enterpictureinpicture', syncClassic);
   video.addEventListener('webkitpresentationmodechanged', syncClassic);
   window.addEventListener('pagehide', () => { controls?.activate(false); if (pipWin) unmountDocument(); });
+  pipSession.register('video', { isBusy: () => starting || activityStarting, close });
 
   return { toggle, close, refresh, paint: () => paint(true), isActive,
     supported: () => !!(activityPip || documentPip() || classicKind()) };
