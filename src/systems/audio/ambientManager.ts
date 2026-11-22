@@ -58,11 +58,12 @@ export class AmbientManager {
     } else {
       id = A.cityFallback as SoundId;
     }
-    if (!this.current || this.current.id !== id) this.switchTo(id);
+    if (!this.current || this.current.id !== id || !this.current.handle.alive) this.switchTo(id);
 
     const night = world ? world.night01 : 0;
     const quiet = interior !== null || (district !== null && A.noCricketDistricts.includes(district.id));
     const target = quiet ? 0 : night * A.cricketsMax;
+    if (this.crickets && !this.crickets.alive) this.crickets = null;
     if (target > 0.005 || this.crickets) {
       if (!this.crickets) this.crickets = this.host.loop(A.fallback as SoundId, { volume: 0, bus: 'ambient' });
       this.host.fadeLoop(this.crickets, target, A.crossfade);

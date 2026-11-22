@@ -1,4 +1,4 @@
-import type { V3 } from '../../core/entities';
+import type { IVehicle, V3 } from '../../core/entities';
 import type { Game } from '../../core/Game';
 import type { Vehicle } from '../../entities/Vehicle';
 import type { LoopHandle } from '../audio/api';
@@ -29,8 +29,20 @@ export class VehicleAudio {
     fire: new Map(),
     siren: new Map(),
   };
+  private readonly offs: (() => void)[] = [];
 
-  constructor(private readonly game: Game) {}
+  constructor(private readonly game: Game) {
+    // Stop the long loops the moment the engine matters no more: the player left the
+    // car or it was destroyed. `sync` is idempotent so a later despawn stop is a no-op.
+    // Payloads are typed `IVehicle` but are always our `Vehicle` instances.
+    this.offs.push(
+      game.events.on('vehicle:exited', ({ vehicle }) => {
+        // A passenger stepping out must not cut the engine: wait until nobody drives.
+        if (!vehicleHasController(vehicle)) this.stopEngineAndSiren(vehicle as Vehicle);
+      }),
+      game.events.on('vehicle:exploded', ({ vehicle }) => this.remove(vehicle as Vehicle)),
+    );
+  }
 
   update(vehicles: readonly Vehicle[], listener: V3): void {
     const audio = this.game.audio;
@@ -59,6 +71,11 @@ export class VehicleAudio {
   private sync(kind: LoopKind, v: Vehicle, wanted: boolean): LoopHandle | null {
     const map = this.loops[kind];
     let handle = map.get(v) ?? null;
+    if (handle && !handle.alive) {
+      // The pool stole the voice: the handle is dead and the sound must be restarted.
+      map.delete(v);
+      handle = null;
+    }
     if (wanted && !handle) {
       handle = this.game.audio.loop(LOOP_IDS[kind], { position: v.position });
       if (kind === 'siren') this.game.audio.siren(handle, true);
@@ -72,15 +89,28 @@ export class VehicleAudio {
     return handle;
   }
 
-  /** Stop everything attached to a vehicle (despawn). */
+  /** Stop everything attached to a vehicle (despawn). Idempotent. */
   remove(v: Vehicle): void {
     for (const kind of Object.keys(this.loops) as LoopKind[]) this.sync(kind, v, false);
   }
 
+  /** Stops the engine/siren loops the moment the player leaves or the car is destroyed. */
+  stopEngineAndSiren(v: Vehicle): void {
+    this.sync('engine', v, false);
+    this.sync('siren', v, false);
+  }
+
   dispose(): void {
+    for (const off of this.offs) off();
+    this.offs.length = 0;
     for (const map of Object.values(this.loops)) {
       for (const handle of map.values()) this.game.audio.stop(handle);
       map.clear();
     }
   }
+}
+
+/** `hasController` without importing the class (payloads are interfaces). */
+function vehicleHasController(vehicle: IVehicle): boolean {
+  return (vehicle as Vehicle).hasController === true;
 }

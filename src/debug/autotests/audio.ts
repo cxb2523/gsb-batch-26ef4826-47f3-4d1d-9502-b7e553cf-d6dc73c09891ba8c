@@ -56,8 +56,54 @@ export default async function audio(game: Game): Promise<void> {
     game.audio.stop(engine);
     game.audio.stop(siren);
     assert(!engine.alive && !siren.alive, 'stopped handles still alive');
+    // Calls on a stopped handle are silent no-ops (they must not throw or touch a dead voice).
     game.audio.setLoopParams(engine, { pitch: 2 });
     game.audio.engine(engine, 1, 1, 30);
+    game.audio.siren(siren, true);
+    // Repeated stops are safe and leave no loop residue.
+    game.audio.stop(engine);
+    game.audio.stop(engine);
+    const v = game.debug.run('audio.voices') as VoiceStats;
+    assert(v.loops < V.maxLoops || v.stolen > 0, `loop residue after stop: ${v.loops}/${v.maxLoops}`);
+  });
+
+  await suite.check('loop-steal-invalidates-handle', () => {
+    const before = game.debug.run('audio.voices') as VoiceStats;
+    const handles: { alive: boolean }[] = [];
+    for (let i = 0; i < V.maxLoops + 2; i++) handles.push(game.audio.loop('vehicle.engine.loop', { volume: 0.3 }));
+    const after = game.debug.run('audio.voices') as VoiceStats;
+    assert(after.loops <= V.maxLoops, `loops ${after.loops} > cap ${V.maxLoops}`);
+    assert(after.stolen > before.stolen, 'no steal was recorded');
+    const dead = handles.filter((h) => !h.alive);
+    assert(dead.length >= 2, `stolen handles still alive (${dead.length} invalidated)`);
+    // The dead handles accept calls without throwing.
+    for (const h of dead) {
+      game.audio.setLoopParams(h as never, { pitch: 2, volume: 0.5 });
+      game.audio.engine(h as never, 1, 1, 20);
+      game.audio.siren(h as never, true);
+      game.audio.stop(h as never);
+    }
+    for (const h of handles) if (h.alive) game.audio.stop(h as never);
+  });
+
+  await suite.check('pause-resume-keeps-loops', async () => {
+    const engine = game.audio.loop('vehicle.engine.loop');
+    const before = game.debug.run('audio.state') as { context: string };
+    // Drive the same events the UI pause menu emits (the ui system is optional here).
+    game.events.emit('ui:paused', {});
+    await wait(80);
+    const paused = game.debug.run('audio.state') as { context: string };
+    // A running browser context is suspended; headless stays 'unavailable'.
+    if (before.context === 'running') assert(paused.context === 'suspended', `context ${paused.context} while paused`);
+    game.events.emit('ui:resumed', {});
+    await wait(80);
+    const resumed = game.debug.run('audio.state') as { context: string };
+    if (before.context === 'running') assert(resumed.context === 'running', `context ${resumed.context} after resume`);
+    assert(engine.alive, 'engine handle died across pause/resume');
+    game.audio.engine(engine, 0.8, 1, 20);
+    game.audio.setLoopParams(engine, { pitch: 1.1, volume: 0.7 });
+    game.audio.stop(engine);
+    assert(!engine.alive, 'stopped handle alive after resume');
   });
 
   await suite.check('radio-toggle', () => {

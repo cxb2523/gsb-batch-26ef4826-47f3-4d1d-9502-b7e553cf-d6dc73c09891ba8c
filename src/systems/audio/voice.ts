@@ -21,6 +21,8 @@ export class Voice implements PoolVoice {
   volume: number;
   ended = false;
   onEnd: ((voice: Voice) => void) | null = null;
+  /** Graceful steal hook set for loops: fade out and invalidate the handle. */
+  onStolen: (() => void) | null = null;
   /** Set for voices started through `loop()`. */
   handle: LoopHandle | null = null;
   private userVolume: number;
@@ -125,6 +127,8 @@ export class Voice implements PoolVoice {
   fadeOut(at: number, seconds: number): void {
     this.input.gain.setTargetAtTime(MIN_GAIN, at, seconds / 3);
     this.synth.stopAt(at + seconds);
+    // A dying voice is the preferred steal victim while it fades.
+    this.volume = 0;
     const end = at + seconds;
     this.stopTime = Math.min(this.stopTime, end);
     this.wallStop = Math.min(this.wallStop, performance.now() + Math.max(0, end - this.graph.now) * 1000 + 250);

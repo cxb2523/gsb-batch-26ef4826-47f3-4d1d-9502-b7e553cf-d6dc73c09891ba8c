@@ -8,6 +8,12 @@ export interface PoolVoice {
   /** Estimated loudness at the listener, used to pick a steal victim. */
   volume: number;
   kill(): void;
+  /**
+   * Optional graceful release used instead of `kill()` when this voice is stolen.
+   * The pool has already freed the slot; the voice owner fades the sound out and
+   * invalidates any handle. Falls back to `kill()` when not set.
+   */
+  onStolen?: (() => void) | null;
 }
 
 export class VoicePool<T extends PoolVoice> {
@@ -76,6 +82,8 @@ export class VoicePool<T extends PoolVoice> {
     const v = list[victim];
     list.splice(victim, 1);
     this.stolen++;
-    v.kill();
+    // Graceful release first (fade + handle invalidation); kill() is the fallback.
+    if (v.onStolen) v.onStolen();
+    else v.kill();
   }
 }

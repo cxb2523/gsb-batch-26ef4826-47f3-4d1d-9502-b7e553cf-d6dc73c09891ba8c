@@ -189,7 +189,13 @@ export class Helicopter implements Entity, IDamageable {
     this.object3d.position.copy(this.position);
     this.object3d.rotation.y = this.heading;
     this.body.setNextKinematicTranslation(this.position);
-    if (this.loop) this.ctx.game.audio.setLoopParams(this.loop, { position: this.position });
+    if (this.loop && !this.loop.alive) this.loop = null;
+    if (!this.loop) {
+      // The pool may have stolen the voice: restart it while the aircraft is alive.
+      if (this.isAlive) this.loop = this.ctx.game.audio.loop('vehicle.engine.helicopter.loop', { position: this.position, pitch: H.loopPitch, bus: 'engine' });
+      return;
+    }
+    this.ctx.game.audio.setLoopParams(this.loop, { position: this.position });
   }
 
   applyDamage(info: DamageInfo): void {

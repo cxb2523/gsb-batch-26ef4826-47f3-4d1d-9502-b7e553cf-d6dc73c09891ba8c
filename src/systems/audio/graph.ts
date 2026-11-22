@@ -86,6 +86,13 @@ export class AudioGraph {
     }
   }
 
+  /** Freezes the context while a menu owns the screen; scheduled sounds resume where they left off. */
+  suspend(): void {
+    if (this.ctx.state === 'running') {
+      this.ctx.suspend().catch(() => undefined);
+    }
+  }
+
   setBusVolume(bus: AudioBus, volume: number): void {
     this.buses[bus].gain.setTargetAtTime(volume, this.ctx.currentTime, 0.03);
   }

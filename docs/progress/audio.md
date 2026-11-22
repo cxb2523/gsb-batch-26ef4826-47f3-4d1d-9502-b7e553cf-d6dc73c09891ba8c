@@ -16,6 +16,7 @@
 - Radio (`recipes/radio.ts`): 120 BPM 16-step sequencer (Am–F–C–G): saw bass, detuned saw pad, kick (sine pitch drop), snare, hats, delayed triangle arpeggio on odd bars. `radio(on)` plays `radio.switch`/`radio.off` and starts/stops the loop on the `music` bus.
 - Debug actions: `audio.playAll`, `audio.voices`, `audio.radio:<on>`, `audio.bus:<bus>:<volume>`, `audio.state`.
 - Tests: `tests/audio/recipes.test.ts`, `engine.test.ts`, `voicePool.test.ts` (16 tests, no AudioContext). Autotest `src/debug/autotests/audio.ts`.
+- **Loop lifecycle (steal / stop / destroy / pause)** — one teardown path, `retireLoop`, is shared by `stop()` and `VoicePool` steals (`PoolVoice.onStolen`), so a stolen loop's `LoopHandle.alive` flips to `false`, the slot leaves `voiceStats().loops` and `loopVoices`, and the voice fades out before being killed by `update`. Every handle-based call (`setLoopParams`/`engine`/`siren`/`fadeLoop`/`stop`) is a silent no-op on a dead handle. `stop()` is idempotent and leaves no residue. `VehicleAudio` stops engine+siren on `vehicle:exited` (when no controller is left) and everything on `vehicle:exploded`, and restarts any loop whose handle the pool stole; `Helicopter` does the same; the ambient manager rebuilds a stolen bed. `ui:paused` suspends the `AudioContext` (`AudioGraph.suspend`), `ui:resumed` resumes it: live loops keep playing and stay adjustable, stopped ones stay dead, and a gesture while paused cannot unfreeze it. Tests: `tests/audio/loopLifecycle.test.ts`, `vehicleAudio.test.ts` (with `tests/audio/fakeAudio.ts`).
 
 ## Cut or deferred
 
@@ -32,6 +33,8 @@
 - `play()` of a `.loop` id plays it for 1.5 s then fades (useful for `playAll`); callers should use `loop()` for real loops.
 - `AudioParam.value` writes for the listener every frame can zipper on very fast camera cuts; not audible in normal play.
 - Stealing picks by estimated loudness (volume × distance falloff), not measured RMS, so a quiet-but-important one-shot can be stolen during a 40-voice burst.
+- `ui:paused` freezes the context immediately, so the pause cue started in the same frame can be cut short depending on browser timing; use the settings sliders (which write bus gains while frozen) if the cue matters.
+- Long loops fading after `stop()` are removed from the pool at once but their nodes are only freed once the fade window elapses; a rapid stop/start can briefly double their Web Audio node count.
 
 ## How to test
 
