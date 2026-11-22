@@ -10,8 +10,24 @@ let lastReport = 0;
 let ended = false;
 let previewing = false;
 let format = {}, fps = null, sampleTime = performance.now(), sampleFrames = 0;
+let hello = null;
+
+// Terminal teardown for every ending. Only OUR extension media element and
+// channel are touched; the source website's player is never accessed.
+function finish(text) {
+  if (ended) return;
+  ended = true;
+  clearInterval(hello);
+  $("quick-controls").hidden = true;
+  $("play").hidden = true;
+  playback.close();
+  $("overlay").hidden = false;
+  $("status").textContent = text;
+}
+
 const playback = new AVPlayback($("video"), {
   onStatus: state => {
+    if (ended) return;
     const now = performance.now();
     const quality = $("video").getVideoPlaybackQuality();
     const displayed = quality.totalVideoFrames - quality.droppedVideoFrames;
@@ -31,7 +47,13 @@ const playback = new AVPlayback($("video"), {
     if (now - lastReport > 500) { lastReport = now; channel.postMessage({ type: "STATUS", ...state,
       outputFps: fps, outputWidth: width, outputHeight: height }); }
   },
-  onError: error => { $("quick-controls").hidden = true; $("overlay").hidden = false; $("status").textContent = error; channel.postMessage({ type: "ERROR", error }); },
+  onError: error => {
+    if (ended) return;
+    finish(error);
+    // Report to the worker so it can release capture; a failed page no longer
+    // has a usable output, so the source audio must be restored.
+    try { channel.postMessage({ type: "ERROR", error }); } catch { /* worker already gone */ }
+  },
 });
 
 const stepButtons = document.querySelectorAll("button[data-step]");
@@ -116,6 +138,13 @@ $("quality").addEventListener("change", async event => {
 });
 
 channel.onmessage = async ({ data }) => {
+  // A STOP still gets acknowledged after an error teardown, so the worker's
+  // bounded silence wait ends immediately instead of timing out.
+  if (data.type === "STOP") {
+    finish("已停止音画延迟，网页恢复原声。");
+    try { channel.postMessage({ type: "RELEASED" }); } catch { /* worker already closed */ }
+    return;
+  }
   if (ended) return;
   if (data.type === "CONFIG" && !configured) {
     configured = true;
@@ -145,26 +174,19 @@ channel.onmessage = async ({ data }) => {
     playback.maxQueuedBytes = data.maxQueuedBytes;
     showQuality(data.quality);
   }
-  if (data.type === "STOP") {
-    ended = true;
-    $("quick-controls").hidden = true;
-    playback.close();
-    channel.postMessage({ type: "RELEASED" });
-    $("overlay").hidden = false;
-    $("play").hidden = true;
-    $("status").textContent = "已停止音画延迟，网页恢复原声。";
-  }
 };
-const hello = setInterval(() => channel.postMessage({ type: "HELLO" }), 500);
+hello = setInterval(() => channel.postMessage({ type: "HELLO" }), 500);
 channel.postMessage({ type: "HELLO" });
 $("play").addEventListener("click", () => { void playback.play(true); });
 $("fullscreen").addEventListener("click", async () => {
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await $("stage").requestFullscreen(); }
   catch (error) { $("overlay").hidden = false; $("status").textContent = `无法进入全屏：${error.message}`; }
 });
+// Closing the page stops delayed output immediately, without waiting for the
+// worker; the CLOSED notice then releases capture and restores source audio.
 window.addEventListener("pagehide", () => {
-  clearInterval(hello);
-  playback.close();
-  channel.postMessage({ type: "CLOSED" });
-  channel.close();
+  const wasEnded = ended;
+  finish("");
+  if (!wasEnded) { try { channel.postMessage({ type: "CLOSED" }); } catch { /* worker may be gone */ } }
+  try { channel.close(); } catch { /* already closed */ }
 });

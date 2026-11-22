@@ -11,6 +11,9 @@ export class AudioEngine {
     this.state = idleState();
     this.session = null;
     this.generation = 0;
+    // Pending terminal cleanup, so a STOP/INTERRUPT/CLEANUP that arrives after
+    // another end path can still wait for tracks and the AudioContext.
+    this.cleanupPromise = Promise.resolve();
     this.deviceChanged = () => {
       if (!this.session) return;
       this.state.notice = "音频设备发生变化；输出跟随系统默认设备。如无声音，请停止后重新启动。";
@@ -128,11 +131,20 @@ export class AudioEngine {
 
   async release(session) {
     if (!session) return;
+    // Concurrent ends (track ended, tab closed, STOP) share one cleanup.
+    if (session.releasePromise) return session.releasePromise;
+    session.releasePromise = this.performRelease(session);
+    return session.releasePromise;
+  }
+
+  async performRelease(session) {
     clearInterval(session.timer);
+    session.timer = null;
     session.listeners.forEach(remove => remove());
+    session.listeners = [];
     // Disconnect output FIRST, then stop tracks; no delayed tail over restored audio.
     try { session.graph?.disconnect(); } catch { /* context may already be closed */ }
-    if (session.stream) stopTracks(session.stream);
+    try { if (session.stream) stopTracks(session.stream); } catch { /* already stopped */ }
     if (session.context && session.context.state !== "closed") {
       try { await withTimeout(session.context.close(), 2000); } catch { /* capture is already released */ }
     }
@@ -144,16 +156,21 @@ export class AudioEngine {
     this.session = null;
     // Mark terminal state before awaiting close; a concurrent new session cannot be overwritten.
     this.state = { ...this.state, phase, active: false, error: message, notice: "", bufferRemaining: 0, transitionRemaining: 0, pauseRemaining: 0 };
-    await this.release(session);
+    const cleanup = this.cleanupPromise = this.release(session);
     this.emit();
+    await cleanup;
   }
 
   async stop(reason = "") {
-    ++this.generation;
     const session = this.session;
     this.session = null;
+    if (session) this.cleanupPromise = this.release(session);
+    const token = ++this.generation;
+    const cleanup = this.cleanupPromise;
+    await cleanup;
+    // A session started while this one released owns the state now.
+    if (this.session || this.generation !== token) return this.snapshot();
     this.state = { ...idleState(this.state.delay), tabId: this.state.tabId, tabTitle: this.state.tabTitle, notice: reason };
-    await this.release(session);
     this.emit();
     return this.snapshot();
   }

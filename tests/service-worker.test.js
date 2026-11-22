@@ -13,6 +13,7 @@ async function fixture({ beforeStart = async () => {}, onCapture = () => {} } = 
   const local = { delay: 30 }, session = {};
   let offscreen = false, engine = idleState(), captures = 0, starts = 0, closes = 0;
   let captureStatus = "active";
+  const messages = [];
   const tab = { id: 8, title: "Local test", url: "https://example.test/", active: true, windowId: 1 };
   const viewers = new Map();
   const removed = [];
@@ -32,9 +33,17 @@ async function fixture({ beforeStart = async () => {}, onCapture = () => {} } = 
       sendMessage: async message => {
         if (message.target === "control") return;
         if (!offscreen) throw new Error("No document");
+        messages.push(structuredClone(message));
         if (message.type === "START") { starts++; await beforeStart(); engine = { ...idleState(message.data.delay), ...message.data, active: true, phase: "running" }; }
-        if (message.type === "STOP") engine = idleState(engine.delay);
-        if (message.type === "INTERRUPT") engine = { ...engine, active: false, phase: "interrupted", error: message.reason };
+        if (message.type === "STOP") {
+          // Mirrors the engine: scoped to the session it was told to stop.
+          if (message.sessionId && engine.sessionId && message.sessionId !== engine.sessionId) return { ok: true, state: structuredClone(engine) };
+          engine = idleState(engine.delay);
+        }
+        if (message.type === "INTERRUPT") {
+          if (message.sessionId && engine.sessionId && message.sessionId !== engine.sessionId) return { ok: true, state: structuredClone(engine) };
+          engine = { ...engine, active: false, phase: "interrupted", error: message.reason };
+        }
         if (message.type === "DELAY") engine.delay = message.delay;
         if (message.type === "QUALITY") engine.quality = message.quality;
         return { ok: true, state: structuredClone(engine) };
@@ -72,7 +81,7 @@ async function fixture({ beforeStart = async () => {}, onCapture = () => {} } = 
       if (!handled) resolve(undefined);
     });
   }
-  return { api, local, session, tab, viewers, removed, load, message, captures: () => captures, starts: () => starts, closes: () => closes, setCaptureStatus: value => { captureStatus = value; } };
+  return { api, local, session, tab, viewers, removed, messages, load, message, captures: () => captures, starts: () => starts, closes: () => closes, setCaptureStatus: value => { captureStatus = value; } };
 }
 
 test("popup starts its pinned tab; duplicate Start and worker restart keep the same capture", async () => {
@@ -160,6 +169,40 @@ test("late stopped event does not end a new active capture; real closure release
   const ended = await f.message("STATE");
   assert.equal(ended.state.phase, "interrupted"); assert.equal(ended.state.active, false);
   assert.equal(f.closes(), 1);
+});
+
+test("stop/interrupt are scoped to the session the worker observed so a new capture survives", async () => {
+  const f = await fixture();
+  const old = await f.message("START", { tabId: 8 });
+  await f.message("STOP");
+  assert.equal((await f.message("STATE")).state.active, false);
+  const next = await f.message("START", { tabId: 8 });
+  const stopCommand = f.api.runtime.sendMessage({ channel: CHANNEL, target: "worker", type: "STOP", sessionId: old.state.sessionId });
+  const stale = await stopCommand;
+  assert.equal(stale.ok, true);
+  assert.equal(stale.state.sessionId, next.state.sessionId);
+  assert.equal(stale.state.active, true);
+  // The real stop carries the current session and releases it.
+  await f.message("STOP");
+  assert.equal((await f.message("STATE")).state.active, false);
+});
+
+test("closing a viewer and stopping at once still releases the worker document exactly once", async () => {
+  const f = await fixture();
+  const started = await f.message("START", { tabId: 8, mode: "av" });
+  // Simulate the race: viewer tab removal and the user's STOP arrive together.
+  f.viewers.delete(9);
+  const removal = f.api.tabs.onRemoved.listeners.at(-1)(9);
+  const stopping = f.message("STOP");
+  await settle();
+  await Promise.all([removal, stopping]);
+  assert.equal((await f.message("STATE")).state.active, false);
+  assert.equal(f.closes(), 1);
+  // Whichever path wins, the engine sees exactly one terminal command, scoped
+  // to the session the worker observed. The loser only closes the document.
+  const terminal = f.messages.filter(message => message.type === "STOP" || message.type === "INTERRUPT");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].sessionId, started.state.sessionId);
 });
 
 test("Stop closes only the session viewer when Edge hides tabs.Tab.url", async () => {

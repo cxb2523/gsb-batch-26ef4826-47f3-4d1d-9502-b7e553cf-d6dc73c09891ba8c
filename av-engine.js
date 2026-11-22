@@ -17,8 +17,18 @@ export class AVEngine {
     this.state = idleState();
     this.session = null;
     this.cleanupPromise = Promise.resolve();
+    // Invalidates state writes from a stop/fail that finishes after a new
+    // session has been started. Each session's cleanup only touches its own
+    // resources, never the engine's current state or channel.
+    this.generation = 0;
   }
   emit() { this.onChange(this.snapshot()); }
+  // A closed or closing BroadcastChannel throws on postMessage. Session writes
+  // are also fenced so a released session can never signal a new one.
+  post(session, message) {
+    if (session.closing) return;
+    try { session.channel.postMessage(message); } catch { /* channel already closed */ }
+  }
   snapshot() {
     const elapsed = (performance.now() - (this.session?.reportedAt || performance.now())) / 1000;
     const paused = this.state.active && this.session?.context && this.session.context.state !== "running";
@@ -26,29 +36,22 @@ export class AVEngine {
       ...(paused ? { phase: "interrupted", notice: "音画模式音频处理暂停，正在恢复。" } : {}),
       pauseRemaining: Math.max(0, (this.state.pauseRemaining || 0) - elapsed) };
   }
-  async start({ streamId, tabId, tabTitle, sessionId, delay, viewerTabId, quality, region, geometry }) {
-    if (this.session) return this.snapshot();
-    const session = { stream: null, encoder: null, channel: new BroadcastChannel(AV_CHANNEL(sessionId)),
-      context: null, audioSource: null, audioDestination: null, recovering: false,
-      timer: null, reportedAt: performance.now(), lastHeartbeat: performance.now(), sequence: 0,
-      unacknowledged: new Map(), inFlightBytes: 0, listeners: [] };
-    this.session = session;
-    const options = videoOptions({ quality, region });
-    const preset = VIDEO_PRESETS[options.quality];
-    const budget = queueBudget(preset.bitrate);
-    session.budget = budget;
-    this.state = { ...idleState(normalizeDelay(delay)), ...options, mode: "av", active: true, phase: "capturing",
-      tabId, tabTitle, sessionId, viewerTabId, startedAt: Date.now(), bufferRemaining: delay,
-      actualDelay: null, bufferedSeconds: 0, contextState: "not-used" };
-    const config = () => ({ type: "CONFIG", mime: this.state.mime, delay: this.state.delay, tabTitle, quality: this.state.quality,
-      region: options.region, width: this.state.width, height: this.state.height, targetFps: this.state.targetFps, maxQueuedBytes: session.budget.playback });
-    this.emit();
-    let ready;
-    const consumerReady = new Promise(resolve => { ready = resolve; });
+  // Session-scoped channel handling. Late messages from a released session
+  // are dropped because every write is fenced on this.session === session.
+  attachChannel(session, config, ready) {
     session.channel.onmessage = ({ data }) => {
+      // Viewer-driven ending: the viewer silenced itself on pagehide without
+      // waiting for our STOP. Release this session only, and unblock any stop
+      // already waiting on its bounded acknowledgement.
+      if (data.type === "CLOSED") {
+        session.viewerGone = true;
+        session.released?.();
+        void this.fail(session, "interrupted", "延迟播放页已关闭，采集已释放，网页恢复原声。");
+        return;
+      }
       if (data.type === "RELEASED") { session.released?.(); return; }
       if (this.session !== session) return;
-      if (data.type === "HELLO" && session.configReady) session.channel.postMessage(config());
+      if (data.type === "HELLO" && session.configReady) this.post(session, config());
       if (data.type === "RECEIVED" && session.unacknowledged.has(data.sequence)) {
         session.inFlightBytes -= session.unacknowledged.get(data.sequence);
         session.unacknowledged.delete(data.sequence);
@@ -62,8 +65,31 @@ export class AVEngine {
         if (changed) this.emit(); // Status transitions only; no worker heartbeat.
       }
       if (data.type === "ERROR") void this.fail(session, "error", data.error);
-      if (data.type === "CLOSED") void this.fail(session, "interrupted", "延迟播放页已关闭，采集已释放，网页恢复原声。");
     };
+  }
+  async start({ streamId, tabId, tabTitle, sessionId, delay, viewerTabId, quality, region, geometry }) {
+    if (this.session) return this.snapshot();
+    ++this.generation; // A new start supersedes any older cleanup's state write.
+    const session = { stream: null, encoder: null, channel: new BroadcastChannel(AV_CHANNEL(sessionId)),
+      context: null, audioSource: null, audioDestination: null, recovering: false,
+      timer: null, reportedAt: performance.now(), lastHeartbeat: performance.now(), sequence: 0,
+      unacknowledged: new Map(), inFlightBytes: 0, listeners: [],
+      viewerGone: false, releasePromise: null };
+    this.session = session;
+    const options = videoOptions({ quality, region });
+    const preset = VIDEO_PRESETS[options.quality];
+    const budget = queueBudget(preset.bitrate);
+    session.budget = budget;
+    this.state = { ...idleState(normalizeDelay(delay)), ...options, mode: "av", active: true, phase: "capturing",
+      tabId, tabTitle, sessionId, viewerTabId, startedAt: Date.now(), bufferRemaining: delay,
+      actualDelay: null, bufferedSeconds: 0, contextState: "not-used" };
+    const config = () => ({ type: "CONFIG", mime: this.state.mime, delay: this.state.delay, tabTitle, quality: this.state.quality,
+      region: options.region, width: this.state.width, height: this.state.height, targetFps: this.state.targetFps, maxQueuedBytes: session.budget.playback });
+    this.emit();
+    let ready;
+    const consumerReady = new Promise(resolve => { ready = resolve; });
+    session.consumerReady = ready;
+    this.attachChannel(session, config, ready);
     try {
       if (options.region !== "tab" && !geometry?.rect) throw new Error("播放器区域定位失败，请重新启动或手动框选。");
       const size = captureSize(preset, geometry);
@@ -102,16 +128,17 @@ export class AVEngine {
         sourceWidth: geometry?.sourceWidth, sourceHeight: geometry?.sourceHeight,
         frameRate: settings.frameRate, targetFps: preset.fps, videoBitrate: preset.bitrate, mime: videoMime(preset) });
       session.encoder = new AVEncoder({ preset, geometry: options.region === "tab" ? null : geometry, maxBytes: budget.pending,
-        onFormat: format => Object.assign(this.state, format),
-        onClock: (origin, first) => session.channel.postMessage({ type: first ? "STARTED" : "CLOCK", origin }),
+        onFormat: format => { if (this.session === session) Object.assign(this.state, format); },
+        onClock: (origin, first) => this.post(session, { type: first ? "STARTED" : "CLOCK", origin }),
         onBytes: (bytes, mime) => {
+          if (this.session !== session || session.closing) return;
           session.lastFragment = performance.now();
           session.inFlightBytes += bytes.byteLength;
           if (session.inFlightBytes > session.budget.pending) throw new Error("播放页接收编码数据过慢，请重新启动或降低画质。");
           session.unacknowledged.set(session.sequence, bytes.byteLength);
           session.encodedBytes += bytes.byteLength;
           this.state.encodedMbps = session.encodedBytes * 8 / 1_000_000 / Math.max(0.1, (performance.now() - session.recordingAt) / 1000);
-          session.channel.postMessage({ type: "CHUNK", sequence: session.sequence++, bytes, mime });
+          this.post(session, { type: "CHUNK", sequence: session.sequence++, bytes, mime });
         },
         onError: error => void this.fail(session, "error", `音画编码失败：${errorText(error)}`) });
       for (const track of stream.getTracks()) {
@@ -120,7 +147,7 @@ export class AVEngine {
         session.listeners.push(() => track.removeEventListener("ended", ended));
       }
       session.configReady = true;
-      session.channel.postMessage(config());
+      this.post(session, config());
       await withTimeout(consumerReady, 8000);
       if (this.session !== session) return this.snapshot();
       session.lastFragment = session.recordingAt = performance.now();
@@ -144,7 +171,7 @@ export class AVEngine {
   }
   setDelay(value) {
     this.state.delay = normalizeDelay(value);
-    this.session?.channel.postMessage({ type: "DELAY", delay: this.state.delay });
+    if (this.session) this.post(this.session, { type: "DELAY", delay: this.state.delay });
     this.emit();
     return this.snapshot();
   }
@@ -167,7 +194,7 @@ export class AVEngine {
     session.encoder.maxBytes = session.budget.pending;
     Object.assign(this.state, { quality, mime: videoMime(preset), targetFps: preset.fps, videoBitrate: preset.bitrate,
       frameRate: videoTrack.getSettings().frameRate });
-    session.channel.postMessage({ type: "QUALITY", quality, maxQueuedBytes: session.budget.playback });
+    this.post(session, { type: "QUALITY", quality, maxQueuedBytes: session.budget.playback });
   }
   async setRegion({ sessionId, geometry, error }) {
     const session = this.session;
@@ -181,22 +208,45 @@ export class AVEngine {
   }
   async release(session) {
     if (!session) return;
+    // Concurrent end paths (viewer CLOSED, worker STOP, track ended) share one
+    // idempotent release: the first caller owns the work, the rest await it.
+    if (session.releasePromise) return session.releasePromise;
+    session.closing = true;
+    session.releasePromise = this.performRelease(session);
+    return session.releasePromise;
+  }
+  async performRelease(session) {
     clearInterval(session.timer);
+    session.timer = null;
     session.listeners.forEach(remove => remove());
-    const encoderStopped = session.encoder?.close();
-    // Silence buffered output before allowing Chrome to restore the source audio.
-    const released = new Promise(resolve => { session.released = resolve; });
-    session.channel.postMessage({ type: "STOP" });
-    await withTimeout(released, 1000).catch(() => {});
-    session.audioSource?.disconnect();
-    session.audioDestination?.stream.getTracks().forEach(track => track.stop());
-    if (session.stream) stopTracks(session.stream);
+    session.listeners = [];
+    // 1) Silence our delayed output first. A closed viewer has already done
+    //    this on pagehide; otherwise wait (bounded) for its acknowledgement
+    //    before Chrome can restore the source audio.
+    if (!session.viewerGone) {
+      const released = new Promise(resolve => { session.released = resolve; });
+      // Not routed through post(): closing is already set and this STOP is the
+      // very message that silences the viewer before tracks are stopped.
+      try { session.channel.postMessage({ type: "STOP" }); } catch { /* viewer channel already gone */ }
+      await withTimeout(released, 1000).catch(() => {});
+    }
+    // 2) Stop capture tracks, then close the encoder and audio processing.
+    //    Every step is independently bounded so one stuck resource cannot
+    //    block the rest.
+    try { if (session.stream) stopTracks(session.stream); } catch { /* already stopped */ }
+    let encoderStopped;
+    try { encoderStopped = session.encoder?.close(); } catch { /* encoder already closed */ }
     await withTimeout(encoderStopped, 2000).catch(() => {});
-    if (session.context) await withTimeout(session.context.close(), 2000).catch(() => {});
-    session.channel.close();
+    try { session.audioDestination?.stream.getTracks().forEach(track => track.stop()); } catch { /* already stopped */ }
+    try { session.audioSource?.disconnect(); } catch { /* context may already be closed */ }
+    if (session.context && session.context.state !== "closed") {
+      await withTimeout(session.context.close(), 2000).catch(() => {});
+    }
+    // 3) Only then close the communication channel.
+    try { session.channel.close(); } catch { /* already closed */ }
   }
   async recover(session) {
-    if (this.session !== session || session.recovering) return;
+    if (this.session !== session || session.recovering || session.closing) return;
     session.recovering = true;
     this.emit();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -209,19 +259,31 @@ export class AVEngine {
   async fail(session, phase, error) {
     if (!session || this.session !== session) return;
     this.session = null; // Cancel pending capture/consumer initialization too.
+    ++this.generation; // Fence late status writes from the released session.
     this.state = { ...this.state, active: false, phase, error, notice: "", bufferRemaining: 0, pauseRemaining: 0 };
+    // Unblock a start() still waiting for the consumer so its response (and
+    // the worker's STOP) does not stall for the full readiness timeout.
+    session.consumerReady?.();
     // A viewer CLOSED event can race with the worker's STOP command. Keep the
     // release promise after clearing session so STOP still waits for tracks,
     // encoder and AudioContext cleanup before the document is destroyed.
-    this.cleanupPromise = this.release(session);
+    const cleanup = this.cleanupPromise = this.release(session);
     this.emit();
-    await this.cleanupPromise;
+    await cleanup;
   }
   async stop(reason = "") {
     const session = this.session;
     this.session = null;
-    if (session) this.cleanupPromise = this.release(session);
-    await this.cleanupPromise;
+    if (session) {
+      session.consumerReady?.();
+      this.cleanupPromise = this.release(session);
+    }
+    const token = ++this.generation;
+    const cleanup = this.cleanupPromise;
+    await cleanup;
+    // A new session may have started while the old one was releasing. Its
+    // state and channel must not be overwritten by this stale stop.
+    if (this.session || this.generation !== token) return this.snapshot();
     this.state = { ...idleState(this.state.delay), mode: "av", tabId: this.state.tabId, tabTitle: this.state.tabTitle, notice: reason };
     this.emit();
     return this.snapshot();

@@ -176,16 +176,29 @@ async function start(tab, requestedMode) {
 
 async function stop() {
   const current = await readState().catch(() => idleState());
+  let released = true;
   try {
-    await closeViewer(current); // Remove A/V output before restoring source audio.
-    if (await hasOffscreen()) await engineMessage("STOP", {}, current.mode === "av" ? 7000 : 5000);
+    // STOP first: the viewer silences its own output and acknowledges before
+    // the engine stops tracks, so silence always precedes capture release.
+    // Scoped to this session: a late stop must not release a newer capture.
+    if (await hasOffscreen()) {
+      const final = await engineMessage("STOP", { sessionId: current.sessionId }, current.mode === "av" ? 7000 : 5000);
+      released = !final.active;
+    }
   } catch {
-    // Closing the offscreen document below is an independent release path.
+    // Closing the viewer tab and the offscreen document are independent
+    // release paths if messaging fails.
   } finally {
+    // Remove our A/V output page as well; a replaced session's viewer has a
+    // different document URL and is left alone.
+    await closeViewer(current);
     await removeLocator(current);
-    // Last-resort cleanup if messaging/context.close failed.
-    await closeOffscreen();
+    // The document is only destroyed after STOP has awaited the engine's own
+    // release, and a capture that survived as a newer session keeps it.
+    if (released) await closeOffscreen();
   }
+  const final = await readState().catch(() => idleState());
+  if (final.active) return remember(final);
   return remember({ ...idleState(await savedDelay()), ...await savedVideoOptions(), mode: await savedMode(), tabId: current.tabId, tabTitle: current.tabTitle, notice: "已停止延迟，网页恢复原始声音。" });
 }
 
@@ -324,9 +337,12 @@ async function interruptTab(tabId, reason) {
   if (!state.active || (state.tabId !== tabId && state.viewerTabId !== tabId) || !(await hasOffscreen())) return;
   await removeLocator(state);
   await closeViewer(state);
-  const final = await engineMessage("INTERRUPT", { reason }, state.mode === "av" ? 7000 : 5000);
+  // Scope the interrupt to the session we just observed so a newer capture on
+  // the same tab is never torn down by this late event.
+  const final = await engineMessage("INTERRUPT", { reason, sessionId: state.sessionId }, state.mode === "av" ? 7000 : 5000);
   await remember(final);
-  await closeOffscreen();
+  // Only retire the document when the session it reported on really ended.
+  if (!final.active) await closeOffscreen();
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {

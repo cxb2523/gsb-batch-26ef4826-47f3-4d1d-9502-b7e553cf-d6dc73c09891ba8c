@@ -33,12 +33,16 @@ export class AVPlayback {
       const timer = setTimeout(() => reject(new Error("延迟播放页初始化超时。")), 6000);
       this.mediaSource.addEventListener("sourceopen", () => {
         clearTimeout(timer);
+        // A stop/error may have torn the media source down while it opened.
+        if (this.closed) { resolve(); return; }
         try {
           this.buffer = this.mediaSource.addSourceBuffer(mime);
           this.mime = mime;
           this.buffer.addEventListener("updateend", () => { this.pump(); this.tick(); });
           this.buffer.addEventListener("error", () => this.fail("媒体缓冲解析失败，请重新启动。"));
           this.timer = setInterval(() => this.tick(), 250);
+          // Chunks that arrived while sourceopen was pending are appended now.
+          this.pump();
           resolve();
         } catch (error) { reject(error); }
       }, { once: true });
@@ -49,6 +53,8 @@ export class AVPlayback {
     });
   }
   append(bytes, sequence, mime) {
+    // Chunks can arrive while configure() is still awaiting sourceopen; they
+    // queue here and append once the buffer exists. After teardown they drop.
     if (this.closed) return;
     if (sequence !== this.sequence++) { this.fail("音画数据不连续，已停止播放，请重新启动。"); return; }
     this.queue.push({ bytes, mime });
@@ -67,7 +73,7 @@ export class AVPlayback {
     return Math.max(start + 0.01, Math.min(end - 0.15, this.liveTime() - this.delay - SAFETY_BUFFER));
   }
   pump() {
-    if (this.closed || !this.buffer || this.buffer.updating || this.mediaSource.readyState !== "open") return;
+    if (this.closed || !this.buffer || !this.mediaSource || this.buffer.updating || this.mediaSource.readyState !== "open") return;
     const { end } = this.range();
     const retention = Math.min(RETAIN_SECONDS, this.delay + SAFETY_BUFFER + 6);
     const removeBefore = Math.min(end - retention, this.video.currentTime - 3);
@@ -169,17 +175,27 @@ export class AVPlayback {
     this.pump();
   }
   fail(error) { if (!this.closed) { this.close(); this.onError(error); } }
+  // Terminal teardown for stop, error and pagehide. Only our own extension
+  // video element is touched; the source website player is never accessed.
   close() {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.timer);
     clearTimeout(this.resumeTimer);
+    this.timer = null;
+    this.resumeTimer = null;
     this.video.removeEventListener("error", this.errorHandler);
-    this.video.pause();
-    this.video.removeAttribute("src");
-    this.video.load();
-    if (this.url) URL.revokeObjectURL(this.url);
+    // Drop queued work first so no late append can reach the media source.
     this.queue = [];
     this.queuedBytes = 0;
+    this.buffer = null;
+    try { this.video.pause(); } catch { /* element already detached */ }
+    this.video.removeAttribute("src");
+    this.video.load();
+    if (this.url) {
+      URL.revokeObjectURL(this.url);
+      this.url = null;
+    }
+    this.mediaSource = null;
   }
 }

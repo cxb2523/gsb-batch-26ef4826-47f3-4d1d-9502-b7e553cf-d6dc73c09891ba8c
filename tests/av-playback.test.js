@@ -17,6 +17,105 @@ function fixture() {
     status: () => status, error: () => error, removed: () => removed };
 }
 
+test('stop/error teardown drops queued bytes, revokes the media source and stops only our video element', () => {
+  const original = { revoke: URL.revokeObjectURL };
+  const revoked = [];
+  URL.revokeObjectURL = url => revoked.push(url);
+  const sourcePlayer = { pause() { throw new Error('source player touched'); }, paused: false, src: 'https://site.test/stream' };
+  const calls = [];
+  const video = { currentTime: 9.25, readyState: 4, paused: false, error: null,
+    addEventListener() {}, removeEventListener() {}, pause() { calls.push('pause'); this.paused = true; },
+    async play() { this.paused = false; }, removeAttribute(name) { calls.push(`remove:${name}`); },
+    load() { calls.push('load'); } };
+  try {
+    const f = fixture();
+    const player = new AVPlayback(video);
+    player.mediaSource = { readyState: 'open' };
+    player.buffer = { updating: true, buffered: { length: 0 }, appendBuffer() { calls.push('append'); } };
+    player.url = 'blob:extension';
+    player.queue = [{ bytes: new ArrayBuffer(10) }, { bytes: new ArrayBuffer(20) }];
+    player.queuedBytes = 30;
+    player.started = true;
+    player.append(new ArrayBuffer(5), player.sequence);
+    assert.equal(player.queuedBytes, 35);
+    player.close();
+    assert.equal(player.closed, true);
+    assert.deepEqual(player.queue, []);
+    assert.equal(player.queuedBytes, 0);
+    assert.equal(player.buffer, null);
+    assert.equal(player.url, null);
+    assert.deepEqual(revoked, ['blob:extension']);
+    assert.ok(calls.includes('pause') && calls.includes('remove:src') && calls.includes('load'));
+    assert.equal(calls.includes('append'), false);
+    // A late chunk after teardown is ignored rather than reaching the buffer.
+    player.append(new ArrayBuffer(5), player.sequence);
+    assert.equal(player.queuedBytes, 0);
+    // The website's own player is never paused or mutated.
+    assert.equal(sourcePlayer.src, 'https://site.test/stream');
+    assert.equal(sourcePlayer.paused, false);
+    assert.equal(f.player.closed, false); // Independent instance untouched.
+    f.player.close();
+  } finally { URL.revokeObjectURL = original.revoke; }
+});
+
+test('a chunk arriving before sourceopen is queued and appended once the buffer exists', async () => {
+  const original = { MediaSource: globalThis.MediaSource, create: URL.createObjectURL, revoke: URL.revokeObjectURL };
+  URL.createObjectURL = () => 'blob:early';
+  URL.revokeObjectURL = () => {};
+  const appended = [];
+  globalThis.MediaSource = class extends EventTarget {
+    static isTypeSupported() { return true; }
+    readyState = 'open';
+    addSourceBuffer() {
+      return { updating: false, buffered: { length: 0 }, addEventListener() {}, appendBuffer: bytes => appended.push(bytes) };
+    }
+  };
+  let mediaSource;
+  const video = { currentTime: 0, readyState: 0, paused: true, addEventListener() {}, removeEventListener() {},
+    pause() {}, removeAttribute() {}, async play() {}, load() { mediaSource = player.mediaSource; } };
+  const player = new AVPlayback(video);
+  try {
+    const opening = player.configure('video/mp4', 30);
+    // An encoded chunk can beat sourceopen on the channel.
+    player.append(Uint8Array.of(7), 0);
+    assert.equal(player.queue.length, 1);
+    assert.equal(appended.length, 0);
+    mediaSource.dispatchEvent(new Event('sourceopen'));
+    await opening;
+    assert.equal(player.queue.length, 0);
+    assert.deepEqual([...appended[0]], [7]);
+  } finally {
+    player.close();
+    globalThis.MediaSource = original.MediaSource;
+    URL.createObjectURL = original.create;
+    URL.revokeObjectURL = original.revoke;
+  }
+});
+
+test('a media-source open that resolves after teardown does not recreate a buffer', async () => {
+  const original = { MediaSource: globalThis.MediaSource, create: URL.createObjectURL, revoke: URL.revokeObjectURL };
+  URL.createObjectURL = () => 'blob:late';
+  URL.revokeObjectURL = () => {};
+  globalThis.MediaSource = class extends EventTarget { static isTypeSupported() { return true; } };
+  let mediaSource;
+  const video = { addEventListener() {}, removeEventListener() {}, pause() {}, removeAttribute() {},
+    load() { mediaSource = player.mediaSource; } };
+  const player = new AVPlayback(video);
+  try {
+    const opening = player.configure('video/mp4', 30);
+    player.close();
+    // sourceopen can still be delivered after the page tore the player down.
+    mediaSource.dispatchEvent(new Event('sourceopen'));
+    await opening; // A closed player must still settle instead of hanging.
+    assert.equal(player.buffer, null);
+    assert.equal(player.closed, true);
+  } finally {
+    globalThis.MediaSource = original.MediaSource;
+    URL.createObjectURL = original.create;
+    URL.revokeObjectURL = original.revoke;
+  }
+});
+
 test('MSE startup registers sourceopen before explicitly loading the extension video', async () => {
   const original = { MediaSource: globalThis.MediaSource, create: URL.createObjectURL, revoke: URL.revokeObjectURL };
   let loads = 0;

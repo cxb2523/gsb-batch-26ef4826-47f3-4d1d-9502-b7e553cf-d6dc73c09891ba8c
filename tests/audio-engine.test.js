@@ -166,3 +166,51 @@ test("timeout helper disposes a late resolved value", async () => {
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(disposed, true);
 });
+
+test("track ended and user stop racing release capture only once and stop awaits it", async () => {
+  const f = fixture();
+  await f.engine.start(request);
+  let closed = 0;
+  const close = f.context.close.bind(f.context);
+  f.context.close = async () => { closed++; await new Promise(resolve => setTimeout(resolve, 10)); await close(); };
+  // Both terminal paths observe the interrupted track before either clears it.
+  const ended = f.engine.fail(f.engine.session, "interrupted", "ended");
+  let finished = false;
+  const stopping = f.engine.stop().then(() => { finished = true; });
+  await Promise.resolve();
+  assert.equal(finished, false); // Stop waits for the AudioContext to close.
+  await Promise.all([ended, stopping]);
+  assert.equal(finished, true);
+  assert.equal(f.track.stops, 1);
+  assert.equal(closed, 1);
+  assert.equal(f.context.state, "closed");
+  assert.equal(f.engine.snapshot().active, false);
+});
+
+test("a release that finishes after a new session started does not overwrite its state", async () => {
+  const log = [];
+  let contexts = 0;
+  const tracks = [];
+  const mediaDevices = new EventTarget();
+  mediaDevices.getUserMedia = async () => {
+    const track = new Track(log);
+    tracks.push(track);
+    return { getTracks: () => [track], getAudioTracks: () => [track] };
+  };
+  const engine = new AudioEngine({ mediaDevices, createContext: () => {
+    const context = new Context(log);
+    if (contexts++ === 0) context.close = async () => { await new Promise(resolve => setTimeout(resolve, 20)); context.state = "closed"; };
+    return context;
+  } });
+  await engine.start(request);
+  const old = engine.stop("old");
+  const starting = engine.start({ ...request, sessionId: "session2" });
+  await old;
+  assert.equal(engine.state.active, true);
+  assert.equal(engine.state.sessionId, "session2");
+  await starting;
+  assert.equal(engine.snapshot().phase, "running");
+  await engine.stop();
+  assert.equal(engine.snapshot().active, false);
+  assert.equal(tracks.filter(track => track.readyState === "ended").length, 2);
+});

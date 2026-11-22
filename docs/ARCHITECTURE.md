@@ -56,6 +56,10 @@ Offscreen 获取标签页的音频轨和视频轨，在本地用 WebCodecs 编�
 
 Chrome 原生 tabCapture 在采集期间抑制该标签页的直接声音。因此只需输出延迟链路，无需改动网页静音状态。初始 delayTime 在连接输入前设定，避免启动时泄漏原声。停止先静音并断开输出，再停止全部 MediaStreamTrack、关闭 AudioContext 和 Offscreen；不会保留延迟尾音。
 
+音画模式的结束链路是**按会话、幂等**的：播放页关闭（`CLOSED`）、面板「停止」（`STOP`）和采集轨道 `ended` 三条路径共用同一个 `release`，谁先到谁执行，其余只等待同一 Promise，因此轨道、编码器和 AudioContext 都只释放一次。释放顺序固定为：① 让延迟输出静音（向播放页发 `STOP` 并等待其 `RELEASED`，最多 1 秒；播放页已自行关闭时跳过）；② 停止采集轨道，再关闭编码器；③ 停止 Web Audio 目标轨、断开音频源并关闭 AudioContext（各步有超时）；④ 最后关闭 BroadcastChannel。每一步独立兜底异常，任一资源已关闭或抛错都不会中断后续步骤。`stop()` 会 await 这次释放后才返回，Offscreen 文档也只在释放完成后销毁。
+
+每次启动都会递增引擎的 generation；旧会话的清理完成时若 generation 或当前会话已变化，就只清理自己的资源，不写引擎状态、不向新会话的通道发送消息。播放页收到的迟到消息同样按 `session === this.session` 丢弃。Service Worker 发出的 `STOP`/`INTERRUPT` 都带上它读取到的 `sessionId`，Offscreen 若发现当前会话已不同，只等待旧清理、不会停止新采集。
+
 流 ID 在 Offscreen 创建完成后才生成，立刻消费，不缓存、不重用，也不设置 `consumerTabId`。Chrome 116+ 才支持 Service Worker 生成的 ID 在 Offscreen 内消费。仅使用 `runtime.getContexts()` 检查文档，以兼容 116，而不依赖较新版本才有的 `offscreen.hasDocument()`。
 
 Offscreen 使用 **USER_MEDIA**，与官方 tabCapture 示例一致，它实际负责 `getUserMedia()` 流；不用有「无音频 30 秒后关闭」规则的 AUDIO_PLAYBACK 文档，避免初始 30～60 秒缓冲或静音时丢失采集。AudioContext、DelayNode 和本地健康检查均在 Offscreen；Service Worker 不处理样本、不维持心跳，休眠不影响音频。Popup 只发消息；关闭面板不触发停止。Worker 重启后从现有 Offscreen 查询真实状态，而不是根据缓存重建采集。配置 default_popup 后没有注册 action.onClicked，避免 Chrome 不触发该事件造成失效。
