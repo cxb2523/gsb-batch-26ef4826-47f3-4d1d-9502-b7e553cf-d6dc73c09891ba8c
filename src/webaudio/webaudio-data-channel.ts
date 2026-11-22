@@ -111,7 +111,9 @@ export class WebAudioDataChannel extends AudioWorkletNode implements IDataChanne
         abortHandler = () => {
           const operation = this.pendingOperations.get(id);
           if (operation) {
-            this.port.postMessage({ id: null, type: 'abort', data: {} });
+            // 対象操作のIDを付けてabortを送る（ワークレット側で他の進行中操作を
+            // 巻き込まずにキャンセルできるようにするため）
+            this.port.postMessage({ id: null, type: 'abort', data: { id } });
           }
         };
         

@@ -67,8 +67,16 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
   private awaitingCallback: (() => void) | null = null;
   private modulationWaitCallback: () => void = () => {};
   private instanceName: string;
-  private abortController: MyAbortController | null = null;
-  
+  // 変調と復調は独立したAbortControllerを持ち、相互にキャンセルしない。
+  // （以前は単一controllerを共有していたため、demodulate開始が進行中の
+  //   modulateをキャンセルするなどの副作用があった）
+  private modulationAbortController: MyAbortController | null = null;
+  private demodulationAbortController: MyAbortController | null = null;
+  // 進行中操作のメッセージID。abortメッセージが data.id を持つ場合、
+  // 対象の操作だけをキャンセルするために使用する。
+  private currentModulationId: string | null = null;
+  private currentDemodulationId: string | null = null;
+
   constructor(options?: AudioWorkletNodeOptions) {
     super();
     
@@ -88,65 +96,149 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
 
   async modulate(data: Uint8Array, options: {signal: AbortSignal }): Promise<void> {
     console.log(`[FSKProcessor:${this.instanceName}] modulate() called with ${data.length} bytes: [${Array.from(data).map(b => `0x${b.toString(16).padStart(2, '0')}`).join(', ')}]`);
-    
+
     if (this.pendingModulation) {
       throw new Error('Modulation already in progress');
     }
-    
-    this.pendingModulation = new ChunkedModulator(this.fskCore);
-    await this.pendingModulation.startModulation(data);
-    await new Promise<void>((resolve, reject) => {
-      const handleAbort = () => {
-        console.warn(`[FSKProcessor:${this.instanceName}] Modulation aborted`);
+
+    // 開始前にすでにキャンセルされていた場合は即座に終了
+    if (options?.signal?.aborted) {
+      throw new Error('FSK Processor Modulation aborted');
+    }
+
+    const modulator = new ChunkedModulator(this.fskCore);
+    this.pendingModulation = modulator;
+
+    try {
+      await modulator.startModulation(data);
+
+      await new Promise<void>((resolve, reject) => {
+        // 自分自身の変調インスタンスである場合のみ状態をクリアする。
+        // キャンセルと完了・後続操作が競合しても互いの状態を上書きしない。
+        const cleanupOwnState = () => {
+          if (this.pendingModulation === modulator) {
+            modulator.cancel();
+            this.pendingModulation = null;
+          }
+          if (this.modulationWaitCallback === onComplete) {
+            this.modulationWaitCallback = () => {};
+          }
+          this.samplesGenerated = 0;
+        };
+        const handleAbort = () => {
+          console.warn(`[FSKProcessor:${this.instanceName}] Modulation aborted`);
+          cleanupOwnState();
+          // 中断された波形の自己受信残渣（受信バッファ・復調器の同期状態）を除去し、
+          // 次の送信/受信に持ち越さない
+          this.demodulatedBuffer.clear();
+          this.fskCore.reset();
+          reject(new Error('FSK Processor Modulation aborted'));
+        };
+        const onComplete = () => {
+          options?.signal.removeEventListener('abort', handleAbort);
+          resolve();
+        };
+        this.modulationWaitCallback = onComplete;
+        options?.signal.addEventListener('abort', handleAbort, { once: true });
+        // startModulation() 待機中にabortが届いていた場合に備える
+        if (options?.signal?.aborted) {
+          handleAbort();
+        }
+      });
+    } catch (error) {
+      // 失敗・キャンセル時に自分の残留状態が残らないことを保証
+      if (this.pendingModulation === modulator) {
+        modulator.cancel();
         this.pendingModulation = null;
-        this.modulationWaitCallback = () => {};
-        reject(new Error('FSK Processor Modulation aborted'));
-      };
-      this.modulationWaitCallback = () => {
-        options?.signal.removeEventListener('abort', handleAbort);
-        resolve();
       }
-      options?.signal.addEventListener('abort', handleAbort, { once: true });
-    });
+      throw error;
+    }
   }
 
   async demodulate(options: {signal: AbortSignal }): Promise<Uint8Array> {
       // Return currently buffered demodulated data
       const availableBytes = this.demodulatedBuffer.length;
       if (availableBytes === 0) {
+        // 開始前にすでにキャンセルされていた場合は即座に終了
+        if (options?.signal?.aborted) {
+          throw new Error('Demodulation aborted');
+        }
         await new Promise<void>((resolve, reject) => {
-          this.awaitingCallback = resolve;
-          options?.signal.addEventListener('abort', () => {
-            this.awaitingCallback = null;
+          // 自分自身の待機コールバックである場合のみクリアする。
+          // キャンセル済みリクエストのリスナーが後続リクエストの
+          // コールバックを上書きしないようにする。
+          const onData = () => {
+            options?.signal.removeEventListener('abort', onAbort);
+            if (this.awaitingCallback === onData) {
+              this.awaitingCallback = null;
+            }
+            resolve();
+          };
+          const onAbort = () => {
+            if (this.awaitingCallback === onData) {
+              this.awaitingCallback = null;
+            }
             reject(new Error('Demodulation aborted'));
-          }, { once: true });
+          };
+          this.awaitingCallback = onData;
+          options?.signal.addEventListener('abort', onAbort, { once: true });
+          // リスナー登録前にabortが届いていた場合に備える
+          if (options?.signal?.aborted) {
+            onAbort();
+          }
         });
       }
 
       const finalAvailableBytes = this.demodulatedBuffer.length;
       const demodulatedBytes = new Uint8Array(finalAvailableBytes);
-      
+
       for (let i = 0; i < finalAvailableBytes; i++) {
         const byte = this.demodulatedBuffer.remove();
         demodulatedBytes[i] = byte;
       }
-      
+
       return demodulatedBytes;
   }
 
   async reset(): Promise<void> {
       console.log(`[FSKProcessor:${this.instanceName}] Resetting FSKProcessor state`);
-      this.demodulatedBuffer.clear();
+
+      // 進行中の操作をabortし、待機中のPromiseを確実に終了させる
+      // （以前はPromiseが吊られたまま残り、応答が返らない可能性があった）
+      if (this.modulationAbortController) {
+        this.modulationAbortController.abort();
+        this.modulationAbortController = null;
+      }
+      if (this.demodulationAbortController) {
+        this.demodulationAbortController.abort();
+        this.demodulationAbortController = null;
+      }
+
+      // 未再生の波形・受信バッファ・待機状態をクリア
+      this.pendingModulation?.cancel();
       this.pendingModulation = null;
+      this.demodulatedBuffer.clear();
       this.awaitingCallback = null;
       this.modulationWaitCallback = () => {};
+      this.samplesGenerated = 0;
+      this.processDemodulationCallCount = 0;
+
+      // FSK復調器の同期状態・内部バッファもリセット（設定は維持される）
+      this.fskCore.reset();
   }
   
-  private resetAbortController(): void {
-    if (this.abortController) {
-      this.abortController.abort();
+  private resetModulationAbortController(): void {
+    if (this.modulationAbortController) {
+      this.modulationAbortController.abort();
     }
-    this.abortController = new MyAbortController();
+    this.modulationAbortController = new MyAbortController();
+  }
+
+  private resetDemodulationAbortController(): void {
+    if (this.demodulationAbortController) {
+      this.demodulationAbortController.abort();
+    }
+    this.demodulationAbortController = new MyAbortController();
   }
   
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
@@ -190,32 +282,55 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
 
         case 'abort': {
           // Handle abort signal
-          if (this.abortController) {
-            console.warn(`[FSKProcessor:${this.instanceName}] Received abort signal`);
-            this.abortController.abort();
-            this.abortController = null;
+          // data.id が指定されていればその操作のみ、なければ進行中の全操作をキャンセルする。
+          // （キャンセル要求と完了/データ到着の順序が入れ替わっても、
+          //   別操作の状態を巻き込まないようにする）
+          const targetId = data?.id as string | undefined;
+          if (!targetId || targetId === this.currentModulationId) {
+            if (this.modulationAbortController) {
+              console.warn(`[FSKProcessor:${this.instanceName}] Received abort signal for modulation`);
+              this.modulationAbortController.abort();
+              this.modulationAbortController = null;
+            }
+          }
+          if (!targetId || targetId === this.currentDemodulationId) {
+            if (this.demodulationAbortController) {
+              console.warn(`[FSKProcessor:${this.instanceName}] Received abort signal for demodulation`);
+              this.demodulationAbortController.abort();
+              this.demodulationAbortController = null;
+            }
           }
           if (id) this.port.postMessage({ id, type: 'result', data: { success: true } });
           break;
         }
 
         case 'modulate': {
-          this.resetAbortController();
-          // console.log(`[FSKProcessor:${this.instanceName}] Modulating ${data.bytes.length} bytes: [${data.bytes.map((b: number) => `0x${b.toString(16).padStart(2, '0')}`).join(', ')}]`);
-          // @ts-expect-error 
-          await this.modulate(new Uint8Array(data.bytes), { signal: this.abortController!.signal });
-          // Clear receive buffer after modulation to avoid self-reception
-          this.demodulatedBuffer.clear();
-          this.port.postMessage({ id, type: 'result', data: { success: true } });
+          this.resetModulationAbortController();
+          this.currentModulationId = id;
+          try {
+            // console.log(`[FSKProcessor:${this.instanceName}] Modulating ${data.bytes.length} bytes: [${data.bytes.map((b: number) => `0x${b.toString(16).padStart(2, '0')}`).join(', ')}]`);
+            // @ts-expect-error
+            await this.modulate(new Uint8Array(data.bytes), { signal: this.modulationAbortController!.signal });
+            // Clear receive buffer after modulation to avoid self-reception
+            this.demodulatedBuffer.clear();
+            this.port.postMessage({ id, type: 'result', data: { success: true } });
+          } finally {
+            if (this.currentModulationId === id) this.currentModulationId = null;
+          }
           break;
         }
-          
+
         case 'demodulate': {
-          this.resetAbortController();
-          // console.log(`[FSKProcessor:${this.instanceName}] Demodulating data request received`);
-          // @ts-expect-error 
-          const demodulatedBytes = await this.demodulate({ signal: this.abortController!.signal });
-          this.port.postMessage({ id, type: 'result', data: { bytes: Array.from(demodulatedBytes) } });
+          this.resetDemodulationAbortController();
+          this.currentDemodulationId = id;
+          try {
+            // console.log(`[FSKProcessor:${this.instanceName}] Demodulating data request received`);
+            // @ts-expect-error
+            const demodulatedBytes = await this.demodulate({ signal: this.demodulationAbortController!.signal });
+            this.port.postMessage({ id, type: 'result', data: { bytes: Array.from(demodulatedBytes) } });
+          } finally {
+            if (this.currentDemodulationId === id) this.currentDemodulationId = null;
+          }
           break;
         }
 
@@ -228,6 +343,7 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
             data: {
               demodulatedBufferLength: this.demodulatedBuffer.length,
               pendingModulation: !!this.pendingModulation,
+              awaitingDemodulation: !!this.awaitingCallback,
               fskCoreReady: this.fskCore.isReady(),
               processDemodulationCallCount: this.processDemodulationCallCount,
               ...fskStatus
