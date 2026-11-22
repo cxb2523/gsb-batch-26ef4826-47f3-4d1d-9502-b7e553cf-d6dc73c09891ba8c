@@ -189,3 +189,97 @@ test('SpatialHash: large negative AND positive coordinates work together', () =>
     assert.equal(h.occupiedCellCount(), 2);
     assert.equal(h.findNearest(-4990, -4990, 100).id, 'a');
 });
+
+// ---------------------------------------------------------------------------
+// remove() — stale-entity correctness. The battle loop mutates the enemy
+// roster between index rebuilds (kills, despawns), so queries must never
+// resurface something that has been removed.
+// ---------------------------------------------------------------------------
+test('SpatialHash.remove: removed item is no longer returned by any query', () => {
+    const h = new SpatialHash(64);
+    const a = { x: 10, y: 10, id: 'a' };
+    const b = { x: 20, y: 20, id: 'b' };
+    h.insert(a);
+    h.insert(b);
+
+    assert.equal(h.remove(a), true);
+    assert.equal(h.size, 1);
+
+    const hits = collect(h.queryRect(10, 10, 500)).map((i) => i.id);
+    assert.deepEqual(hits, ['b']);
+    assert.equal(h.findNearest(10, 10, 500).id, 'b');
+});
+
+test('SpatialHash.remove: works even after the item moved to another cell', () => {
+    // Enemies walk between insertion and removal. The recorded bucket key must
+    // be the one used at insert time, not recomputed from the current x/y.
+    const h = new SpatialHash(64);
+    const e = { x: 5, y: 5, id: 'walker' };
+    h.insert(e);
+    e.x = 5000;
+    e.y = 5000; // moved far away — now would hash to a different bucket
+
+    assert.equal(h.remove(e), true);
+    assert.equal(h.size, 0);
+    assert.equal(h.occupiedCellCount(), 0);
+    assert.equal(collect(h.queryRect(5, 5, 10000)).length, 0);
+});
+
+test('SpatialHash.remove: empty bucket is discarded so cell count stays honest', () => {
+    const h = new SpatialHash(64);
+    const a = { x: 0, y: 0 };
+    const b = { x: 100, y: 100 };
+    h.insert(a);
+    h.insert(b);
+    assert.equal(h.occupiedCellCount(), 2);
+
+    h.remove(a);
+    assert.equal(h.occupiedCellCount(), 1);
+    h.remove(b);
+    assert.equal(h.occupiedCellCount(), 0);
+});
+
+test('SpatialHash.remove: unknown / already-removed item is a no-op', () => {
+    const h = new SpatialHash(64);
+    const a = { x: 0, y: 0 };
+    assert.equal(h.remove(a), false);
+    h.insert(a);
+    assert.equal(h.remove(a), true);
+    assert.equal(h.remove(a), false);
+    assert.equal(h.size, 0);
+});
+
+test('SpatialHash.remove: keeps same-cell neighbours intact', () => {
+    const h = new SpatialHash(64);
+    const keep = { x: 5, y: 5, id: 'keep' };
+    const drop = { x: 15, y: 15, id: 'drop' };
+    h.insert(keep);
+    h.insert(drop);
+
+    h.remove(drop);
+    const hits = collect(h.queryRect(10, 10, 50)).map((i) => i.id);
+    assert.deepEqual(hits, ['keep']);
+    assert.equal(h.size, 1);
+});
+
+test('SpatialHash.remove: re-inserting a removed item works', () => {
+    const h = new SpatialHash(64);
+    const a = { x: 0, y: 0, id: 'a' };
+    h.insert(a);
+    h.remove(a);
+    h.insert(a);
+    assert.equal(h.size, 1);
+    assert.deepEqual(
+        collect(h.queryRect(0, 0, 10)).map((i) => i.id),
+        ['a']
+    );
+});
+
+test('SpatialHash.clear: forgets removal bookkeeping', () => {
+    const h = new SpatialHash(64);
+    const a = { x: 0, y: 0 };
+    h.insert(a);
+    h.clear();
+    assert.equal(h.remove(a), false);
+    assert.equal(h.size, 0);
+});

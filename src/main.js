@@ -120,6 +120,12 @@ export class Game {
 
         this.player = null;
 
+        // Combat session token. Bumped whenever a run begins or ends so that
+        // anything scheduled against a previous fight (e.g. the evolved Frost
+        // Nova's delayed second ring) can recognise it has been superseded and
+        // refuse to touch the entities of the new run. Monotonic, never reset.
+        this.combatSessionId = 0;
+
         // Systems
         this.spatial = new SpatialHash(CONFIG.SPATIAL_CELL_SIZE);
         this.camera = new ShakeCamera();
@@ -554,6 +560,9 @@ export class Game {
 
     start() {
         this.state = GameState.PLAYING;
+        // New run → new combat session. Anything scheduled by the previous
+        // fight (delayed nova pulse, etc.) is now stale and must no-op.
+        this.combatSessionId = (this.combatSessionId || 0) + 1;
         this.gameTime = 0;
         this.kills = 0;
         this.enemies = [];
@@ -563,6 +572,10 @@ export class Game {
         this.particles = [];
         this.floatingTexts = [];
         this.mines = [];
+        // Drop the broad-phase index along with the roster it described. The
+        // spawner repopulates it on the next update; until then any query
+        // must see zero enemies rather than last run's corpses.
+        this.spatial.clear();
         this._bossesSpawned.clear();
         this._bossWarnedAt.clear();
         this._spawnAccumulator = 0;
@@ -907,6 +920,11 @@ export class Game {
 
     gameOver() {
         this.state = GameState.GAMEOVER;
+        // End the combat session: any pulse still sitting in the effects
+        // delay queue belongs to the run that just died. Bumping the token
+        // here — before the game-over UI can start another run — closes the
+        // window where a leftover timer could hit the next run's enemies.
+        this.combatSessionId = (this.combatSessionId || 0) + 1;
         cancelAnimationFrame(this.raf);
         this.audio.stopMusic();
         this.audio.death();
@@ -1252,11 +1270,16 @@ export class Game {
             if (e.hp <= 0) {
                 this._onEnemyKilled(e, hpMult, dmgMult);
                 this.enemies.splice(i, 1);
+                // Keep the broad-phase index honest within the frame: a
+                // delayed pulse (or any later query) must not resurface a
+                // corpse that was removed after the start-of-frame rebuild.
+                this.spatial.remove(e);
                 continue;
             }
 
             if (d > CONFIG.DESPAWN_RADIUS && !e.boss) {
                 this.enemies.splice(i, 1);
+                this.spatial.remove(e);
             }
         }
     }

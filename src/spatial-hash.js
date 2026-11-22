@@ -29,12 +29,22 @@ export class SpatialHash {
         /** @type {Map<string, Array<object>>} */
         this.map = new Map();
         this._size = 0;
+        /**
+         * Remember the bucket key each item was inserted under. Items move
+         * between `insert()` and `remove()` (enemies walk every frame), so
+         * recomputing the key from the item's *current* position would look
+         * in the wrong bucket and leave a stale reference behind. A WeakMap
+         * keeps this bookkeeping from pinning items alive.
+         * @type {WeakMap<object, string>}
+         */
+        this._keys = new WeakMap();
     }
 
     /** Empty every bucket. Cheap and allocation-free. */
     clear() {
         this.map.clear();
         this._size = 0;
+        this._keys = new WeakMap();
     }
 
     get size() {
@@ -57,7 +67,41 @@ export class SpatialHash {
             this.map.set(k, bucket);
         }
         bucket.push(item);
+        this._keys.set(item, k);
         this._size++;
+    }
+
+    /**
+     * Remove a previously inserted item from the index. Returns `true` when an
+     * entry was found and dropped. Uses the key captured at insertion time so
+     * a moved item is still found; the bucket is deleted once it empties so
+     * `occupiedCellCount()` never reports a phantom cell.
+     *
+     * Needed because the battle loop mutates the enemy roster between spatial
+     * rebuilds (kills, despawns, splitter children). Queries must not keep
+     * returning entities that have already left the fight.
+     */
+    remove(item) {
+        const k = this._keys.get(item);
+        if (k === undefined) return false;
+        const bucket = this.map.get(k);
+        if (!bucket) {
+            this._keys.delete(item);
+            return false;
+        }
+        const idx = bucket.indexOf(item);
+        if (idx === -1) {
+            this._keys.delete(item);
+            return false;
+        }
+        // Swap-with-last keeps removal O(1); the bucket is an unordered bag.
+        const last = bucket.length - 1;
+        if (idx !== last) bucket[idx] = bucket[last];
+        bucket.pop();
+        if (bucket.length === 0) this.map.delete(k);
+        this._keys.delete(item);
+        this._size--;
+        return true;
     }
 
     /** Bulk-insert after a `clear()`. */

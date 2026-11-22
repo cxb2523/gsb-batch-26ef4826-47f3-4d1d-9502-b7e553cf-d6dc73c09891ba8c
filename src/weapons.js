@@ -351,25 +351,72 @@ export class Weapon {
             // the effects layer so it pauses with the game / tab visibility,
             // unlike a wall-clock setTimeout. Captures `range`/`baseDmg` at
             // fire-time so a stat change between pulses doesn't retro-buff.
+            //
+            // Bound to the combat session that fired it: if the player dies,
+            // restarts, or switches stage inside those 0.4s, `start()` /
+            // `gameOver()` bump `combatSessionId` and this callback must not
+            // touch the entities of the next run.
+            //
+            // The cast origin is captured too (not read live from `player`):
+            // the ring belongs to where the nova was cast, so a hero who
+            // walks during the delay can't drag the second pulse elsewhere.
+            const ox = player.x;
+            const oy = player.y;
             const r = range;
             const d2 = baseDmg * 0.6;
+            const session = game?.combatSessionId;
             game.effects?.schedule?.(0.4, () => {
-                if (!game.player || game.player.dead) return;
-                // iter-16 perf: spatial probe for the delayed pulse too —
-                // by the time it fires the enemy roster may have grown,
-                // and the linear scan was the dominant cost on tundra
-                // when the player held an evolved nova during a heavy wave.
-                const cands = game?.spatial
-                    ? game.spatial.queryRect(player.x, player.y, r)
-                    : game.enemies;
-                for (const e of cands) {
-                    const d = Math.hypot(e.x - player.x, e.y - player.y);
-                    if (d < r) e.takeDamage(d2);
-                }
-                game.createParticles(player.x, player.y, '#88ccff', 16);
+                if (!player || player.dead) return;
+                // Session invalidation: a new run / game over has superseded
+                // the run that fired this pulse. Also catches a swapped-out
+                // player object even if the host never bumped the counter.
+                if (game.player !== player) return;
+                if (game.combatSessionId !== undefined && game.combatSessionId !== session) return;
+                this._applyNovaPulse(game, ox, oy, r, d2);
             });
         }
         game.audio?.shoot?.();
+    }
+
+    /**
+     * Resolve the evolved nova's delayed ring against the *current* battle
+     * state. Between fire-time and the pulse the roster can be rebuilt, foes
+     * can die or despawn, and the spatial index can briefly lag those edits.
+     * So:
+     *   - candidates come from the live spatial index, falling back to a
+     *     straight `game.enemies` walk when no index is available;
+     *   - the current roster, when present, is unioned in so an enemy that
+     *     the index no longer tracks is still hit (and acts as the authority
+     *     on whether a candidate is still a valid combatant);
+     *   - a Set guarantees each enemy is settled at most once even if the
+     *     same reference is reachable through several buckets / paths.
+     * Damage is the fire-time-captured value passed in — never recomputed.
+     */
+    _applyNovaPulse(game, ox, oy, r, d2) {
+        const index = game?.spatial;
+        const roster = Array.isArray(game?.enemies) ? game.enemies : null;
+        const rosterSet = roster ? new Set(roster) : null;
+        const settled = new Set();
+        const settle = (e) => {
+            if (!e || settled.has(e)) return;
+            settled.add(e);
+            // Dead / despawned entities must not soak a second hit.
+            if (e.hp !== undefined && e.hp <= 0) return;
+            // With a roster available, anything it no longer contains is a
+            // ghost left behind by a stale bucket — never damage it.
+            if (rosterSet && !rosterSet.has(e)) return;
+            const dx = e.x - ox;
+            const dy = e.y - oy;
+            if (Math.hypot(dx, dy) >= r) return;
+            e.takeDamage(d2);
+        };
+        if (index && typeof index.queryRect === 'function') {
+            for (const e of index.queryRect(ox, oy, r)) settle(e);
+        }
+        if (roster) {
+            for (const e of roster) settle(e);
+        }
+        game.createParticles(ox, oy, '#88ccff', 16);
     }
 
     /**

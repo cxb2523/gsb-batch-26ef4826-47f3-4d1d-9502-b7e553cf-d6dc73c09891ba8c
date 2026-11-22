@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import { Weapon } from '../src/weapons.js';
 import { WEAPONS } from '../src/data.js';
 import { CONFIG } from '../src/config.js';
+import { EffectLayer } from '../src/effects.js';
+import { SpatialHash } from '../src/spatial-hash.js';
 
 // Minimal player that satisfies every getter Weapon touches.
 function makePlayer({ crit = 0, dmgMult = 1, cdMult = 1, areaMult = 1 } = {}) {
@@ -35,6 +37,45 @@ function makeGame() {
         enemies: [],
         mines: []
     };
+}
+
+// Evolved Frost Nova: its delayed pulse is the thing under test here, so we
+// drive time through a real EffectLayer instead of wall-clock timers.
+function makeEvolvedNova() {
+    const w = new Weapon(WEAPONS.FROST_NOVA);
+    while (!w.isEvolved()) w.levelUp();
+    return w;
+}
+
+// A game with a real EffectLayer + spatial index and a hand-managed roster.
+function makeNovaGame(player, enemies) {
+    const g = makeGame();
+    g.player = player;
+    g.enemies = enemies;
+    g.effects = new EffectLayer();
+    g.spatial = new SpatialHash(CONFIG.SPATIAL_CELL_SIZE);
+    g.combatSessionId = 1;
+    return g;
+}
+
+// Enemy stub: tracks every damage application so double-settles are visible.
+function makeEnemy(x, y, hp = 1000, id = 'e') {
+    return {
+        x,
+        y,
+        id,
+        hp,
+        hits: [],
+        takeDamage(d) {
+            this.hp -= d;
+            this.hits.push(d);
+        }
+    };
+}
+
+// Advance the effect delay queue until the nova's 0.4s pulse has fired.
+function tickPulse(g, dt = 0.1, steps = 6) {
+    for (let i = 0; i < steps; i++) g.effects.update(dt);
 }
 
 test('Weapon: starts at level 1', () => {
@@ -298,4 +339,197 @@ test('Weapon: orbit shard damage scales with player damageMult', () => {
     const low = w.getDamage(makePlayer({ dmgMult: 1 }));
     const high = w.getDamage(makePlayer({ dmgMult: 3 }));
     assert.ok(Math.abs(high / low - 3) < 1e-6);
+});
+
+// ---------------------------------------------------------------------------
+// Evolved Frost Nova — delayed second pulse. Covers the three regressions:
+//   1. a pulse from a dead/finished run must not hit the next run's enemies;
+//   2. the pulse settles against the *current* index, not the fire-time one;
+//   3. the pulse damages each enemy exactly once, and never a removed one.
+// ---------------------------------------------------------------------------
+test('nova pulse: damages an in-range enemy once, at 60% of fire-time damage', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    const fireDmg = w.getDamage(p);
+    w.fire(p, g);
+    // First (immediate) burst already applied full damage.
+    assert.deepEqual(e.hits, [fireDmg]);
+
+    tickPulse(g);
+    assert.equal(e.hits.length, 2, 'delayed pulse should land exactly once');
+    assert.ok(Math.abs(e.hits[1] - fireDmg * 0.6) < 1e-9);
+});
+
+test('nova pulse: is discarded when the combat session changes (restart / death)', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+    const hitsAfterFire = e.hits.length;
+
+    // Simulate the run ending: a new run bumps the session (main.js does this
+    // in start()) and installs a fresh player + roster.
+    const newPlayer = makePlayer();
+    const newEnemy = makeEnemy(20, 0, 1000, 'next-run');
+    g.combatSessionId++;
+    g.player = newPlayer;
+    g.enemies = [newEnemy];
+    g.spatial.insertAll(g.enemies);
+
+    tickPulse(g);
+    assert.equal(newEnemy.hits.length, 0, 'old pulse must not touch the new session');
+    assert.equal(e.hits.length, hitsAfterFire, 'old enemy took no extra damage');
+});
+
+test('nova pulse: is discarded if the firing player died during the delay', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+    const hitsAfterFire = e.hits.length;
+    p.dead = true; // player dies before the 0.4s elapses
+
+    tickPulse(g);
+    assert.equal(e.hits.length, hitsAfterFire);
+});
+
+test('nova pulse: is discarded if the player object was swapped without a session bump', () => {
+    // Defensive: a host that forgets to bump `combatSessionId` still must not
+    // let the old pulse leak; identity of the live player is checked too.
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+    const hitsAfterFire = e.hits.length;
+    g.player = makePlayer(); // swapped, session unchanged
+
+    tickPulse(g);
+    assert.equal(e.hits.length, hitsAfterFire);
+});
+
+test('nova pulse: settles against the current index (newly-arrived enemy is hit)', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const first = makeEnemy(50, 0, 1000, 'first');
+    const g = makeNovaGame(p, [first]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+
+    // A fresh enemy walks into the ring during the 0.4s window and the index
+    // is rebuilt — the pulse must see it.
+    const late = makeEnemy(-40, 0, 1000, 'late');
+    g.enemies.push(late);
+    g.spatial.insertAll(g.enemies);
+
+    tickPulse(g);
+    assert.equal(late.hits.length, 1, 'late arrival should be caught by the pulse');
+});
+
+test('nova pulse: counts an enemy once even if it appears in multiple buckets', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(30, 30, 1000, 'dup');
+    const g = makeNovaGame(p, [e]);
+    // Deliberately double-insert the same reference to model a stale index
+    // that still holds an entry from before the owner moved.
+    g.spatial.insert(e);
+    g.spatial.insert(e);
+    const fireDmg = w.getDamage(p);
+
+    w.fire(p, g);
+    const hitsAfterImmediate = e.hits.length;
+    tickPulse(g);
+
+    // The delayed pulse must add exactly one settle, and at 0.6× — the
+    // duplicate bucket entry cannot make it hit twice.
+    assert.equal(e.hits.length, hitsAfterImmediate + 1);
+    assert.ok(Math.abs(e.hits[e.hits.length - 1] - fireDmg * 0.6) < 1e-9);
+});
+
+test('nova pulse: skips an enemy removed from the roster even if the index is stale', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const dead = makeEnemy(50, 0, 1000, 'dead');
+    const alive = makeEnemy(-50, 0, 1000, 'alive');
+    const g = makeNovaGame(p, [dead, alive]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+    const deadHitsAfterFire = dead.hits.length;
+
+    // During the delay the first enemy is killed and spliced out of the
+    // roster, but — simulating the reported bug — the index was not updated.
+    dead.hp = 0;
+    g.enemies = g.enemies.filter((x) => x !== dead);
+
+    tickPulse(g);
+    assert.equal(dead.hits.length, deadHitsAfterFire, 'removed enemy must not be hit');
+    assert.equal(alive.hits.length, 2, 'surviving enemy still takes the pulse');
+});
+
+test('nova pulse: falls back to walking game.enemies when no index exists', () => {
+    const w = makeEvolvedNova();
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    delete g.spatial; // no broad-phase index at all
+    const fireDmg = w.getDamage(p);
+
+    w.fire(p, g);
+    tickPulse(g);
+
+    assert.equal(e.hits.length, 2);
+    assert.ok(Math.abs(e.hits[1] - fireDmg * 0.6) < 1e-9);
+});
+
+test('nova pulse: damage is the fire-time snapshot, ignoring later stat buffs', () => {
+    const w = makeEvolvedNova();
+    let dmgMult = 1;
+    const p = makePlayer();
+    // Rebind the player damage source so we can buff it after firing.
+    p.getDamageMult = () => dmgMult;
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    const fireDmg = w.getDamage(p);
+    w.fire(p, g);
+
+    // Player picks up a damage passive during the delay.
+    dmgMult = 5;
+
+    tickPulse(g);
+    assert.ok(
+        Math.abs(e.hits[1] - fireDmg * 0.6) < 1e-9,
+        `pulse should use captured ${fireDmg * 0.6}, got ${e.hits[1]}`
+    );
+});
+
+test('nova pulse: only evolved nova schedules a follow-up', () => {
+    const w = new Weapon(WEAPONS.FROST_NOVA); // level 1, not evolved
+    assert.equal(w.isEvolved(), false);
+    const p = makePlayer();
+    const e = makeEnemy(50, 0);
+    const g = makeNovaGame(p, [e]);
+    g.spatial.insertAll(g.enemies);
+
+    w.fire(p, g);
+    assert.equal(g.effects.delays.length, 0, 'no delayed pulse before evolution');
+
+    tickPulse(g);
+    assert.equal(e.hits.length, 1, 'only the immediate burst lands');
 });
