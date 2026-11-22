@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Wario Synth — Turn Any Song Into 8-Bit Game Boy Music Online</title>
+
+    <!-- General Meta -->
+    <meta name="description" content="Search any song, fetch its real MIDI, and hear it reborn as authentic Game Boy chiptune music — free, instant, right in your browser. No downloads, no installs.">
+    <meta name="keywords" content="midi to game boy converter, 8-bit music generator, chiptune converter online, turn song into 8-bit, game boy music maker, free midi player online, retro game music generator, convert midi to chiptune">
+    <meta name="author" content="Wario Synth">
+    <link rel="canonical" href="https://www.wario.style/">
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/png" href="/wario-sprite.png">
+    <link rel="apple-touch-icon" href="/wario-sprite.png">
+    <meta name="theme-color" content="#0b0b0b">
+
+    <!-- OpenGraph / Social Media Preview -->
+    <meta property="og:title" content="Wario Synth — Turn Any Song Into 8-Bit Game Boy Music">
+    <meta property="og:description" content="Search any song, fetch its real MIDI, and hear it reborn as authentic Game Boy chiptune music — free, instant, right in your browser.">
+    <meta property="og:image" content="https://www.wario.style/warioX.png">
+    <meta property="og:image:width" content="1472">
+    <meta property="og:image:height" content="704">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Wario Synth">
+    <meta property="og:url" content="https://www.wario.style/">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Wario Synth — Turn Any Song Into 8-Bit Game Boy Music">
+    <meta name="twitter:description" content="Search any song, fetch its real MIDI, and hear it reborn as authentic Game Boy chiptune music — free, instant, right in your browser.">
+    <meta name="twitter:image" content="https://www.wario.style/warioX.png">
+
+    <!-- Structured Data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "Wario Synth",
+      "url": "https://www.wario.style/",
+      "description": "Search any song, fetch its real MIDI, and hear it reborn as authentic Game Boy chiptune music in your browser.",
+      "applicationCategory": "MusicApplication",
+      "operatingSystem": "Any (Web Browser)",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      }
+    }
+    </script>
+
+    <link rel="stylesheet" href="/src/styles/wario.css" />
+</head>
+<body>
+    <div class="container">
+        <div class="hero">
+            <div class="hero-top">
+                <h1>WARIO SYNTH </h1>
+                <button id="faqBtnTop" class="faq-link" type="button">FAQ</button>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="songInput" placeholder="Search for a song…" />
+            <button id="searchBtn" class="primary">Search</button>
+            <button id="uploadBtn" type="button">Upload MIDI</button>
+            <input id="uploadInput" class="upload-inline-input" type="file" accept=".mid,.midi,audio/midi,audio/x-midi" />
+        </div>
+        <p class="upload-helper">Optional: upload your own MIDI.</p>
+
+        <div id="status">Ready. Search any song to make a Game Boy version.</div>
+
+        <div id="resultsSection" class="results-section">
+            <div id="chooseHelper" class="chooser-helper" style="display:none;">
+                <p>Pick a midi source. Try another if it sounds bad, some work better than others.</p>
+            </div>
+
+            <div class="results-header">
+                <h3>Search Results</h3>
+            </div>
+            <table id="resultsTable" class="results-table">
+                <thead>
+                    <tr>
+                        <th>Song</th>
+                        <th class="source-col">Source</th>
+                        <th class="action-col">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="resultsBody">
+                </tbody>
+            </table>
+        </div>
+        
+        <div id="playerSection" class="player-section">
+            <div id="selectedCard" class="selected-card">
+                <h2 id="selectedTitle" class="selected-title">No source selected</h2>
+                <div id="selectedMeta" class="selected-meta">Search for a song, then choose a source to use.</div>
+
+
+                <div class="selected-actions" id="preGenActions">
+                    <button id="motifBtn" class="primary" disabled>Play 8-bit version</button>
+                </div>
+
+                <div class="selected-support" id="preGenSupport">
+                    <div class="preview-inline">
+                        <button id="previewBtn" type="button" class="linklike" disabled>Preview original MIDI</button>
+                        <span id="previewState" class="preview-state">Previewing…</span>
+                        <button id="previewStopBtn" type="button" class="linklike" style="display:none;">Stop preview</button>
+                    </div>
+                </div>
+
+                <div id="iosAudioBanner" class="ios-audio-banner" aria-live="polite">
+                    <div class="row">
+                        <div class="copy">
+                            <strong>iPhone:</strong> check not on silent, volume up, Focus mode off. Then tap:
+                        </div>
+                        <button id="enableAudioBtn" type="button">Enable Audio</button>
+                    </div>
+                    <div id="iosAudioState" class="state">Audio: …</div>
+                </div>
+
+                <!-- generated only: artifact playback + sharing -->
+                <div id="generatedBlock" style="display:none;">
+                    <div style="display:flex; justify-content:center; margin-top: 14px; margin-bottom: 14px;">
+                        <button id="playPauseBtn" class="primary" type="button">Play</button>
+                    </div>
+
+                    <div class="motif-progress-container" id="motifProgressContainer" style="display: none;">
+                        <div class="progress-time">
+                            <span id="motifCurrentTime">0:00</span>
+                            <span id="motifDuration">0:00</span>
+                        </div>
+                        <div class="progress-bar-wrapper">
+                            <input type="range" id="motifProgressBar" class="progress-bar" min="0" max="100" value="0" step="0.1" />
+                            <div class="progress-fill" id="motifProgressFill"></div>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 14px; display: flex; gap: 12px; flex-wrap: wrap;">
+                        <button id="saveAudioBtn" type="button" disabled>Save 30s WAV</button>
+                        <button id="copyLinkBtn" type="button" disabled>Copy link</button>
+                        <button id="shareToXBtn" type="button" disabled>Share to X</button>
+                    </div>
+                    <div id="shareUploadNotice" style="display:none; margin-top: 10px; font-size: 8px; color: var(--gb-light);">
+                        Local uploads can be played/generated but not shared.
+                    </div>
+                    <div id="shareFallback" style="display: none; margin-top: 12px;">
+                        <p style="font-size: 8px; margin: 0 0 8px 0; color: var(--gb-light);">Sorry, copy doesn't work on your device. Here's the link:</p>
+                        <input id="shareFallbackInput" type="text" readonly style="width: 100%; padding: 8px; font-size: 8px; font-family: 'Press Start 2P', monospace; background: var(--gb-darkest); color: var(--gb-lightest); border: 2px solid var(--gb-light);" />
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+    </div>
+
+    <div class="footer">
+        <button id="newSearchBtn" class="faq-link" type="button" style="display:none;">New search</button>
+    </div>
+
+    <div class="version-history">
+        <details>
+            <summary>Version History</summary>
+            <div class="version-content">
+                <div class="version-item"><strong>2.0</strong> — One Wario Synth: the new engine with MIDI uploads, original previews, audio export and sharing.</div>
+                <div class="version-item">
+                    <strong>How it works:</strong> Search a song or upload your own MIDI (.mid/.midi). The Wario Synthesis Engine analyses the file, maps melody/bass/chords to Game Boy channels, and resynthesises it with Web Audio oscillators. All processing runs client-side in your browser — no server-side audio generation. Save up to 30 seconds as WAV.
+                </div>
+                <div class="version-divider"></div>
+                <div class="version-item">
+                    <strong>v1.7.1</strong> - Clearer melodies and fuller mixes: the engine no longer drops same-role tracks, and keeps a lead when one's there to find. Thanks to <a href="https://github.com/joenb33" target="_blank" rel="noopener noreferrer">@joenb33</a> for the suggestion.
+                </div>
+                <div class="version-item">
+                    <strong>v1.7.0</strong> - New "v2 beta" tab: an experimental engine that targets the real Game Boy sound chip (15-bit noise, duty cycles, wavetables). v1 stays the default.
+                </div>
+                <div class="version-item">
+                    <strong>v1.6.1</strong> - Faster, more reliable song search — now runs directly in your browser
+                </div>
+                <div class="version-item">
+                    <strong>v1.6</strong> - Local MIDI upload, Save Audio (WAV) and Save MIDI export, offline export stability for dense files
+                </div>
+                <div class="version-item">
+                    <strong>v1.5</strong> - Playback polish, iOS audio fixes, footer links
+                </div>
+                <div class="version-item">
+                    <strong>v1.4</strong> - 16-bit to 8-bit audio fixes, improved synthesis quality
+                </div>
+                <div class="version-item">
+                    <strong>v1.3</strong> - Share to X, light Game Boy palette, iOS audio fixes, local font hosting
+                </div>
+                <div class="version-item">
+                    <strong>v1.2</strong> - Short share links with dynamic previews, copy link button, improved MIDI selection
+                </div>
+                <div class="version-item">
+                    <strong>v1.1</strong> - Search MIDI files, generate Game Boy style music, basic playback with progress bar
+                </div>
+            </div>
+        </details>
+    </div>
+
+    <div class="footer-mascot">
+        <img src="/wario-sprite.png" alt="Wario" class="wario-sprite" />
+    </div>
+
+    <div class="footer" style="margin-top: 18px; font-size: 8px; color: var(--gb-medium); text-align: center; gap: 10px;">
+        <a href="/gameboy-music-maker">Game Boy music maker</a>
+        <span style="opacity: 0.75;">·</span>
+        <a href="/midi-to-8-bit" style="color: var(--gb-dark);">MIDI to 8-bit</a>
+        <span style="opacity: 0.75;">·</span>
+        <a href="/8-bit-synth-online" style="color: var(--gb-dark);">8-bit synth</a>
+        <span style="opacity: 0.75;">·</span>
+        <a href="/wario-8-bit-music" style="color: var(--gb-dark);">Wario 8-bit</a>
+        <span style="opacity: 0.75;">·</span>
+        <a href="https://github.com/b1rdmania/motif" target="_blank" rel="noopener noreferrer" style="color: var(--gb-dark);">GitHub</a>
+        <span style="opacity: 0.75;">·</span>
+        <span>
+            Built by
+            <a href="https://github.com/b1rdmania" target="_blank" rel="noopener noreferrer" style="color: var(--gb-dark);">b1rdmania</a>
+            (<a href="https://x.com/b1rdmania" target="_blank" rel="noopener noreferrer" style="color: var(--gb-dark);">X</a>)
+        </span>
+    </div>
+
+    <div id="faqModalBackdrop" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="faqTitle">
+        <div class="modal" role="document">
+            <header>
+                <h3 id="faqTitle">FAQ</h3>
+                <div class="spacer"></div>
+                <button id="faqCloseBtn" type="button">Close</button>
+            </header>
+            <main>
+                <div class="faq-grid">
+                    <div class="faq-item">
+                        <h4>How it works</h4>
+                        <p>Search a song or upload your own MIDI, choose a source, then press Play 8-bit version. Pulse, wave and noise synthesis gives it a Game Boy-inspired sound. Processing runs in your browser.</p>
+                    </div>
+
+                    <div class="faq-item">
+                        <h4>Can I upload my own MIDI?</h4>
+                        <p>Yes. Use <strong>Upload MIDI</strong> next to Search and pick a <code>.mid</code> or <code>.midi</code> file from your device. It is parsed locally in your browser — nothing is uploaded to our servers.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Can I save the generated version?</h4>
+                        <p>After playback starts, use Save 30s WAV to download up to 30 seconds of the 8-bit version.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Can I share my result?</h4>
+                        <p>Yes — if you used <strong>Search</strong> and picked an online MIDI source, <strong>Copy link</strong> and <strong>Share to X</strong> appear after playback starts. They link directly to your song at wario.style.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Why can't I share an uploaded MIDI?</h4>
+                        <p>Share links need a fetchable online MIDI URL. Files you upload stay on your device only, so Copy link and Share to X are hidden for those — you can still play, generate, and export them.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Why "Enable Audio" on iPhone?</h4>
+                        <p>Apple blocks sound until you tap something. Hit the button once and you're good. Still silent? Check your ringer switch.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>About</h4>
+                        <p>A non-commercial project by <a href="https://x.com/b1rdmania" target="_blank" rel="noopener noreferrer">@b1rdmania</a> for lols. Please don't sue me. Built with Claude Code.</p>
+                        <p style="margin-top: 8px;"><a href="https://github.com/b1rdmania/motif" target="_blank" rel="noopener noreferrer">GitHub repo</a></p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Ps. I love Claude Code.</h4>
+                        <img src="/wario.png" alt="Wario moment" style="margin-top: 8px; max-width: 100%; opacity: 0.85;" />
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

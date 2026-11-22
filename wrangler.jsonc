@@ -1,0 +1,28 @@
+// Cloudflare Worker for wario.style: serves the Vite build (dist/) and the
+// small API that used to run as the Express function on Vercel.
+// Deploy: npm run deploy
+{
+  "name": "motif",
+  "account_id": "ff7e84841bce6f90ee9479e0cb31b2ca",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-05-28",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    // Unknown pages show the themed 404, then offer a timed warp home.
+    "not_found_handling": "404-page",
+    "run_worker_first": [
+      "/api/*", "/s/*", "/health", "/v2", "/v2/",
+      "/v2.html", "/index.html", "/embed.html", "/play.html", "/models.html",
+      "/gameboy-music-maker.html", "/midi-to-8-bit.html", "/8-bit-synth-online.html", "/wario-8-bit-music.html"
+    ]
+  },
+  "kv_namespaces": [
+    // Short share links (share:<code>), moved from Redis Labs.
+    { "binding": "SHARES", "id": "37496a5d13214ddd88a7d464b1d455ac" }
+  ],
+  "observability": { "enabled": true },
+  // The bare domain goes to the redirect Worker in wrangler.apex.jsonc.
+  "routes": [{ "pattern": "www.wario.style", "custom_domain": true }]
+}
