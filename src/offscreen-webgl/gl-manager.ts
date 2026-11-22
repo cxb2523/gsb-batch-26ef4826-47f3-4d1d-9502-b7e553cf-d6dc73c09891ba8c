@@ -15,7 +15,7 @@ export class WebGLManager {
 	private startTime: number | null = null;
 	private onEachFrameFunctions: Record<string, RunOnWorkerContextFn> = {};
 	private canvas: HTMLCanvasElement;
-	private gl: WebGLRenderingContext;
+	private gl: WebGLRenderingContext | null;
 	private width: number;
 	private height: number;
 	private onPaint?: (width: number, height: number) => void;
@@ -38,6 +38,7 @@ export class WebGLManager {
 
 	private usesPingPongGroups: boolean = false;
 	private programLinked: boolean = false;
+	private destroyed: boolean = false;
 
 	public constructor(
 		canvas: HTMLCanvasElement,
@@ -64,7 +65,7 @@ export class WebGLManager {
 			get: (target, prop, receiver) => {
 				if (prop.toString().endsWith('Async')) {
 					const originalMethod = target[prop.toString().slice(0, -5) as keyof WebGLManager] as (...args: any[]) => any;
-					return async (...args: any[]) => originalMethod(args);
+					return async (...args: any[]) => originalMethod.apply(target, args);
 				}
 				return Reflect.get(target, prop, receiver);
 			},
@@ -85,57 +86,93 @@ export class WebGLManager {
 		}
 	}
 
+	/**
+	 * Guard for every mutating/rendering entry point. Each manager owns its own
+	 * state, so a destroyed canvas can never touch GL resources still in use by
+	 * other canvases sharing the same underlying context.
+	 */
+	private ensureActive(): Result<true> {
+		if (this.destroyed || !this.gl) {
+			return err(new Error('[OffscreenCanvas @ GLManager] WebGLManager has been destroyed'));
+		}
+		return ok(true);
+	}
+
 	public destroy(): Result<WebGLManager> {
+		// Idempotent: destroying twice must never throw an uncaught exception.
+		if (this.destroyed) return ok(this);
+		this.destroyed = true;
+
 		this.frameTask?.cancel();
 		this.frameTask = null;
 		try {
-			if (this.program) {
-				this.gl.deleteProgram(this.program);
-				this.program = null;
-			}
-			if (this.vertexShader) {
-				this.gl.deleteShader(this.vertexShader);
-				this.vertexShader = null;
-			}
-			if (this.fragmentShaders) {
-				for (const shader of this.fragmentShaders) {
-					this.gl.deleteShader(shader);
+			const gl = this.gl;
+			if (gl) {
+				if (this.program) {
+					gl.deleteProgram(this.program);
+					this.program = null;
 				}
-				this.fragmentShaders = null;
-			}
-			if (this.shaderPrograms) {
-				for (const programGroup of this.shaderPrograms) {
-					for (const program of programGroup) {
-						this.gl.deleteProgram(program);
+				if (this.vertexShader) {
+					gl.deleteShader(this.vertexShader);
+					this.vertexShader = null;
+				}
+				if (this.fragmentShaders) {
+					for (const shader of this.fragmentShaders) {
+						gl.deleteShader(shader);
 					}
+					this.fragmentShaders = null;
 				}
-				this.shaderPrograms = null;
+				if (this.shaderPrograms) {
+					for (const programGroup of this.shaderPrograms) {
+						for (const program of programGroup) {
+							gl.deleteProgram(program);
+						}
+					}
+					this.shaderPrograms = null;
+				}
+				if (this.fragmentShaderGroups) {
+					for (const group of this.fragmentShaderGroups) {
+						for (const shader of group) gl.deleteShader(shader);
+					}
+					this.fragmentShaderGroups = null;
+				}
+				this.quadBuffers.forEach((buffer) => gl.deleteBuffer(buffer));
+				this.quadBuffers.clear();
+				if (this.framebuffers) {
+					for (const fbo of this.framebuffers) fbo.destroy(gl);
+					this.framebuffers = null;
+				}
+				// Leave the shared context in a neutral state so surviving canvases
+				// never inherit this canvas' bound framebuffer/texture.
+				gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+				gl.bindTexture(gl.TEXTURE_2D, null);
 			}
-			for (const group of this.fragmentShaderGroups || []) {
-				for (const shader of group) this.gl.deleteShader(shader);
-			}
-			this.quadBuffers.forEach((buffer) => this.gl.deleteBuffer(buffer));
-			this.quadBuffers.clear();
-			for (const fbo of this.framebuffers || []) fbo.destroy();
-			this.framebuffers = null;
 			this.programUniformStates.clear();
 			this.uniformLocations.clear();
 			this.positionLocations.clear();
+			this.uniformValues = {};
+			this.uniformVersions = {};
+			this.onEachFrameFunctions = {};
+			this.usesPingPongGroups = false;
 			this.programLinked = false;
 		} catch (e) {
 			console.error('[OffscreenCanvas @ GLManager] Error during cleanup', e);
 			return err(new Error(`[OffscreenCanvas @ GLManager] Cleanup failed: ${e}`));
 		}
-		this.gl = null as any;
+		this.gl = null;
 		return ok(this);
 	}
 
 	public setVertexShader(vertexShaderSource: string): Result<WebGLManager> {
-		const { data: vertexShader, error: vertexShaderErr } = createShaderFromSource(this.gl, this.gl.VERTEX_SHADER, vertexShaderSource);
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
+		const gl = this.gl!;
+		const { data: vertexShader, error: vertexShaderErr } = createShaderFromSource(gl, gl.VERTEX_SHADER, vertexShaderSource);
 
 		if (vertexShaderErr) {
 			return err(new Error(`[OffscreenCanvas @ GLManager] Failed to compile Vertex Shader: ${vertexShaderErr}`));
 		} else {
+			if (this.vertexShader) gl.deleteShader(this.vertexShader);
 			this.vertexShader = vertexShader;
 		}
 
@@ -195,10 +232,13 @@ export class WebGLManager {
 	}
 
 	public setFragmentShaderGroups(fragmentShaderGroupSources: string[][]): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
 		if (!this.vertexShader) return err(new Error('[OffscreenCanvas @ GLManager] Vertex shader is required'));
 		if (!fragmentShaderGroupSources.length || fragmentShaderGroupSources.some((group) => !group.length)) {
 			return err(new Error('[OffscreenCanvas @ GLManager] Shader groups cannot be empty'));
 		}
+		const gl = this.gl!;
 		const groups: WebGLShader[][] = [];
 		const programGroups: WebGLProgram[][] = [];
 		try {
@@ -208,29 +248,35 @@ export class WebGLManager {
 				groups.push(shaders);
 				programGroups.push(programs);
 				for (const source of sources) {
-					const result = createShaderFromSource(this.gl, this.gl.FRAGMENT_SHADER, source);
+					const result = createShaderFromSource(gl, gl.FRAGMENT_SHADER, source);
 					if (result.error) throw new Error(`[OffscreenCanvas @ GLManager] Failed to compile Fragment Shader: ${result.error}`);
 					shaders.push(result.data);
-					const program = this.gl.createProgram();
+					const program = gl.createProgram();
 					if (!program) throw new Error('[OffscreenCanvas @ GLManager] Failed to create WebGL program');
 					programs.push(program);
-					this.gl.attachShader(program, this.vertexShader);
-					this.gl.attachShader(program, result.data);
-					this.gl.linkProgram(program);
-					if (!this.gl.getProgramParameter(program, this.gl.LINK_STATUS)) {
-						throw new Error(`[OffscreenCanvas @ GLManager] Program linking failed: ${this.gl.getProgramInfoLog(program)}`);
+					gl.attachShader(program, this.vertexShader);
+					gl.attachShader(program, result.data);
+					gl.linkProgram(program);
+					if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+						throw new Error(`[OffscreenCanvas @ GLManager] Program linking failed: ${gl.getProgramInfoLog(program)}`);
 					}
 				}
 			}
 		} catch (error) {
-			for (const group of groups) for (const shader of group) this.gl.deleteShader(shader);
-			for (const group of programGroups) for (const program of group) this.gl.deleteProgram(program);
+			for (const group of groups) for (const shader of group) gl.deleteShader(shader);
+			for (const group of programGroups) for (const program of group) gl.deleteProgram(program);
 			return err(error instanceof Error ? error : new Error(String(error)));
 		}
-		for (const group of this.fragmentShaderGroups || []) for (const shader of group) this.gl.deleteShader(shader);
-		for (const group of this.shaderPrograms || []) for (const program of group) this.gl.deleteProgram(program);
-		this.quadBuffers.forEach((buffer) => this.gl.deleteBuffer(buffer));
+		for (const group of this.fragmentShaderGroups || []) for (const shader of group) gl.deleteShader(shader);
+		for (const group of this.shaderPrograms || []) for (const program of group) gl.deleteProgram(program);
+		this.quadBuffers.forEach((buffer) => gl.deleteBuffer(buffer));
 		this.quadBuffers.clear();
+		// Ping-pong framebuffers are tied to the previous program set; drop them
+		// so a later resize rebuilds against the new shader configuration.
+		if (this.framebuffers) {
+			for (const fbo of this.framebuffers) fbo.destroy(gl);
+			this.framebuffers = null;
+		}
 		this.programUniformStates.clear();
 		this.uniformLocations.clear();
 		this.positionLocations.clear();
@@ -275,28 +321,52 @@ export class WebGLManager {
 	}
 
 	public paintCanvas(): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
 		if (this.shaderPrograms && this.fragmentShaderGroups) {
-			if (this.canvas.width < this.width) this.canvas.width = this.width;
-			if (this.canvas.height < this.height) this.canvas.height = this.height;
+			// The GL canvas is a shared scratch surface. Every manager owns its
+			// own logical size, so size it to exactly THIS canvas' viewport before
+			// each paint instead of only ever growing it. A backing-store change
+			// (grow OR shrink) clears the default framebuffer, which is why the
+			// full scene is always re-rendered below: another manager's resize can
+			// never leave a stale or blank frame behind here.
+			let resized = false;
+			if (this.canvas.width !== this.width) {
+				this.canvas.width = this.width;
+				resized = true;
+			}
+			if (this.canvas.height !== this.height) {
+				this.canvas.height = this.height;
+				resized = true;
+			}
 			const result = this.renderWithFragmentShaderGroups();
 			if (!result.error) this.onPaint?.(this.width, this.height);
+			else if (resized) {
+				// Surface the resize even when rendering could not run.
+				this.onPaint?.(this.width, this.height);
+			}
 			return result;
 		}
 
 		return ok(this);
 	}
 
+	/**
+	 * (Re)builds the ping-pong framebuffers at the requested size. Old FBOs and
+	 * their textures are always released first, so repeated resize cycles
+	 * (including shrink-then-grow on a shared context) never leak resources and
+	 * never leave stale-sized textures bound.
+	 */
 	private setupPingPongBuffers(width: number, height: number): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
+		const gl = this.gl!;
 		try {
 			if (this.framebuffers) {
-				// Resize existing framebuffers
-				for (const fbo of this.framebuffers) {
-					fbo.resize(width, height);
-				}
-			} else {
-				// Create new framebuffers
-				this.framebuffers = [new FrameBufferObject(this.gl, width, height), new FrameBufferObject(this.gl, width, height)];
+				for (const fbo of this.framebuffers) fbo.destroy(gl);
+				this.framebuffers = null;
 			}
+			this.framebuffers = [new FrameBufferObject(gl, width, height), new FrameBufferObject(gl, width, height)];
 			return ok(this);
 		} catch (e) {
 			return err(new Error(`[OffscreenCanvas @ GLManager] Error setting up ping-pong buffers: ${e}`));
@@ -304,13 +374,27 @@ export class WebGLManager {
 	}
 
 	private drawArrays(): Result<WebGLManager> {
-		this.gl?.drawArrays(this.gl?.TRIANGLE_FAN, 0, 4);
+		const gl = this.gl;
+		if (!gl) return err(new Error('[OffscreenCanvas @ GLManager] WebGL context not available'));
+		gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
 		return ok(this);
 	}
 
 	public renderWithFragmentShaderGroups(): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
+		const gl = this.gl!;
 		if (!this.fragmentShaderGroups || !this.shaderPrograms) {
 			return err(new Error('[OffscreenCanvas @ GLManager] Missing framebuffers, fragment shader groups, or programs'));
+		}
+
+		// Multi-pass pipelines need ping-pong targets at the current size.
+		if (
+			this.usesPingPongGroups &&
+			(!this.framebuffers || this.framebuffers[0].width !== this.width || this.framebuffers[0].height !== this.height)
+		) {
+			const fboResult = this.setupPingPongBuffers(this.width, this.height);
+			if (fboResult.error) return fboResult;
 		}
 
 		// Expect framebuffers to be initialized for subgroups groups >= 2
@@ -337,37 +421,50 @@ export class WebGLManager {
 					targetFramebuffer = pong?.framebuffer || null; // Ping-pong within group
 				}
 
-				this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, targetFramebuffer);
-				this.gl.disable(this.gl.SCISSOR_TEST);
-				this.gl.viewport(0, 0, this.width, this.height);
-				this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+				gl.bindFramebuffer(gl.FRAMEBUFFER, targetFramebuffer);
+				// Reset rasterizer state that could otherwise leak from another
+				// canvas sharing this GL context.
+				gl.disable(gl.SCISSOR_TEST);
+				gl.disable(gl.BLEND);
+				gl.colorMask(true, true, true, true);
+				gl.viewport(0, 0, this.width, this.height);
+				gl.clearColor(0, 0, 0, 0);
+				gl.clear(gl.COLOR_BUFFER_BIT);
 
-				this.gl.useProgram(program);
+				gl.useProgram(program);
 				const buffer = this.quadBuffers.get(program);
 				if (buffer) {
 					let position = this.positionLocations.get(program);
 					if (position === undefined) {
-						position = this.gl.getAttribLocation(program, 'v_position');
+						position = gl.getAttribLocation(program, 'v_position');
 						this.positionLocations.set(program, position);
 					}
-					this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer);
-					this.gl.vertexAttribPointer(position, 3, this.gl.FLOAT, false, 0, 0);
-					this.gl.enableVertexAttribArray(position);
+					gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+					gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+					gl.enableVertexAttribArray(position);
 				}
-				this.gl.activeTexture(this.gl.TEXTURE0);
+				gl.activeTexture(gl.TEXTURE0);
 				this.setUniformsForProgram(program);
-				this.gl.bindTexture(this.gl.TEXTURE_2D, ping?.texture || null);
-				this.drawArrays();
+				gl.bindTexture(gl.TEXTURE_2D, ping?.texture || null);
+				const drawResult = this.drawArrays();
+				if (drawResult.error) return drawResult;
 
 				// Swap ping and pong for next iteration
 				[ping, pong] = [pong, ping];
 			}
 		}
 
+		// Release context-wide bindings so the next canvas sharing this context
+		// starts from a neutral state instead of inheriting our FBO/texture.
+		gl.bindTexture(gl.TEXTURE_2D, null);
+		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
 		return ok(this);
 	}
 
 	public resize(width: number, height: number): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
 		this.width = width;
 		this.height = height;
 		if (this.usesPingPongGroups) {
@@ -378,6 +475,9 @@ export class WebGLManager {
 	}
 
 	public setupWholeScreenQuad(): Result<WebGLBuffer> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
+		const gl = this.gl!;
 		if (!this.program) {
 			return err(new Error('[OffscreenCanvas @ GLManager] No program available to setup quad'));
 		}
@@ -388,17 +488,19 @@ export class WebGLManager {
 
 			for (const programGroup of this.shaderPrograms) {
 				for (const program of programGroup) {
-					const buffer = createWholeScreenQuad(this.gl, program);
+					const buffer = createWholeScreenQuad(gl, program);
 					this.quadBuffers.set(program, buffer);
 					buffers.push(buffer);
 				}
 			}
 
 			return ok(buffers[0]);
-		} else return ok(createWholeScreenQuad(this.gl, this.program));
+		} else return ok(createWholeScreenQuad(gl, this.program));
 	}
 
 	private setUniformsForProgram(program: WebGLProgram): void {
+		const gl = this.gl;
+		if (!gl) return;
 		let appliedVersions = this.programUniformStates.get(program);
 		if (!appliedVersions) {
 			appliedVersions = {};
@@ -418,33 +520,38 @@ export class WebGLManager {
 
 			let location = locations[uniformName];
 			if (location === undefined) {
-				location = this.gl.getUniformLocation(program, uniformName);
+				location = gl.getUniformLocation(program, uniformName);
 				locations[uniformName] = location;
 			}
 			if (!location) continue;
 
 			const value = this.uniformValues[uniformName];
 			if (Array.isArray(value)) {
-				setFloatUniforms(this.gl, location, ...value);
+				setFloatUniforms(gl, location, ...value);
 			} else {
-				setFloatUniforms(this.gl, location, value);
+				setFloatUniforms(gl, location, value);
 			}
 		}
 	}
 
 	public updateUniform(uniform: WebGLUniformName, value: number | number[]): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
 		this.uniformValues[uniform] = Array.isArray(value) ? [...value] : value;
 		this.uniformVersions[uniform] = ++this.uniformVersion;
 		return ok(this);
 	}
 
 	public updateUniforms(values: Record<WebGLUniformName, number | number[]>): Result<WebGLManager> {
-		for (const [uniform, value] of Object.entries(values)) this.updateUniform(uniform as WebGLUniformName, value);
+		for (const [uniform, value] of Object.entries(values)) {
+			const result = this.updateUniform(uniform as WebGLUniformName, value);
+			if (result.error) return result;
+		}
 		return ok(this);
 	}
 
 	public checkWebGLVitals(): Result<WebGLManager> {
-		if (!this.gl) {
+		if (this.destroyed || !this.gl) {
 			return err(new Error('[OffscreenCanvas @ GLManager] WebGL context not available'));
 		}
 		if (!this.programLinked) {
@@ -473,6 +580,8 @@ export class WebGLManager {
 	}
 
 	public runOnContext(key: string, fn: RunOnWorkerContextFn, onEachFrame: boolean = false): any {
+		const guard = this.ensureActive();
+		if (guard.error) throw guard.error;
 		if (onEachFrame) {
 			this.onEachFrameFunctions[key] = fn;
 		} else {
@@ -482,6 +591,8 @@ export class WebGLManager {
 	}
 
 	public setFrameRate(frameRate: number): Result<WebGLManager> {
+		const guard = this.ensureActive();
+		if (guard.error) return err(guard.error);
 		if (frameRate <= 0) {
 			return err(new Error('[OffscreenCanvas @ GLManager] Frame rate must be greater than 0'));
 		}
@@ -491,6 +602,7 @@ export class WebGLManager {
 			return ok(this);
 		}
 		this.frameTask = scheduleFrames(interval, (now) => {
+			if (this.destroyed) return;
 			this.startTime ??= now;
 			this.frame++;
 			this.timeElapsed = now - this.startTime;
@@ -547,16 +659,9 @@ class FrameBufferObject {
 		this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
 	}
 
-	public resize(width: number, height: number): void {
-		this.width = width;
-		this.height = height;
-		this.setupTexture();
-		this.setupFramebuffer();
-	}
-
-	public destroy(): void {
-		this.gl.deleteFramebuffer(this.framebuffer);
-		this.gl.deleteTexture(this.texture);
+	public destroy(gl: WebGLRenderingContext): void {
+		gl.deleteFramebuffer(this.framebuffer);
+		gl.deleteTexture(this.texture);
 	}
 
 	public bind(): void {
