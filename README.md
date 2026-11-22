@@ -1,0 +1,385 @@
+<p align="center">
+  <img src="beamdeck-icon.svg" alt="BeamDeck icon" width="96">
+</p>
+
+<h1 align="center">BeamDeck</h1>
+
+<p align="center"><i>Videos, music and Android Auto on the screens and speakers of any car in BeamNG.drive</i></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/BeamNG.drive-0.40-3b5bd6?style=for-the-badge" alt="BeamNG.drive 0.40">
+  <img src="https://img.shields.io/badge/BeamMP-multiplayer-3b5bd6?style=for-the-badge" alt="BeamMP multiplayer">
+  <img src="https://img.shields.io/badge/Linux-supported-3b5bd6?style=for-the-badge&logo=linux&logoColor=white" alt="Linux">
+  <img src="https://img.shields.io/badge/Windows-supported-3b5bd6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/Android_Auto-USB_or_Wi--Fi-3b5bd6?style=for-the-badge&logo=android&logoColor=white" alt="Android Auto">
+</p>
+
+<p align="center">
+  <a href="#features"><b>Features</b></a> ·
+  <a href="#setup"><b>Setup</b></a> ·
+  <a href="#android-auto-setup"><b>Android Auto</b></a> ·
+  <a href="#multiplayer-setup-beammp"><b>Multiplayer</b></a> ·
+  <a href="#real-routes-setup"><b>Real Routes</b></a> ·
+  <a href="#game-controls"><b>Game Controls</b></a> ·
+  <a href="#troubleshooting"><b>Troubleshooting</b></a>
+</p>
+
+<p align="center">
+  <img src="screenshots/game-android-auto.jpg" alt="Inside a car in BeamNG: Android Auto on the dashboard screen, with BeamNG's own map in place of Google Maps and a song playing" width="66%">
+  &nbsp;
+  <img src="screenshots/window-car-tab.png" alt="The BeamDeck window on its Car tab: car screens, car audio, bass shake, multiplayer sharing, voice chat and Android Auto controls" width="27%">
+</p>
+<p align="center"><sub>Left: Android Auto from a phone on a car's dash, with the game's map in the Maps pane. 
+Right: the BeamDeck window, Car tab.</sub></p>
+
+BeamDeck has three parts: a small **helper** program, a **control window** (an app-style browser window, where things are picked and where the sound plays) and a **BeamNG mod** (it puts the picture on the car's screens and reports where the car and camera are, so the sound behaves like it comes from the car). An optional **relay** connects players on a BeamMP server.
+
+## Features
+
+### Car Screens
+
+* **Videos:** paste a YouTube (or any yt-dlp supported) link or a file path. Links stream within seconds; **Save** keeps a copy, and the **Files** button opens the saved videos' folder (to delete them, for example).
+* **Any screen:** dashboard and infotainment screens of any car that has them, and the windscreen BeamNavigator accessory. Screens are found from each car's own configuration; nothing per car is hard-coded.
+* **Now playing card** with title, artist, progress and cover when music is playing.
+* **Dims with the headlights**, and Android Auto switches to its night theme.
+
+### Music
+
+* **Local library** (any folders), **Navidrome**, or **App sound**: any program's audio (Spotify, a browser, a music player) picked from a list and played through the car.
+* Queue, shuffle, previous / next, and a now-playing bar at the bottom of the window.
+
+### Car Audio
+
+Everything BeamDeck plays (videos, the music library, Navidrome, **App sound** and Android Auto's own music and navigation voice) goes through the same car-speaker effect, worked out about 20 times a second from where the camera is and what the car looks like.
+
+| Where the camera is | How it sounds |
+| :--- | :--- |
+| **Inside the car** (any interior camera) | Clear, like the door speakers: full range with a little extra low end, slightly panned to the car's centre |
+| **Outside, car closed** | Muffled through the body (high frequencies cut, more so further away), with a boomy low end, quieter with distance and panned to where the car is |
+| **Outside, door open or window broken** | Opens up towards the interior sound: an opening on the listener's side counts fully, the far side less; a broken window counts about 84% of an open door, and several openings add up |
+| **Walking away** | The music stays in the car that was left (walking mode and, in multiplayer, spectating never move it), like a parked car with the stereo on |
+| **Car audio off** | Plain stereo sound, the same everywhere, for third-person play or headphones without the effect |
+
+* **Smooth:** changes glide over a fraction of a second, so opening a door or walking around the car never clicks or jumps.
+* **Volume:** the slider in the window, or the **music volume** game controls (shown on screen); remembered between sessions.
+* **Pause with game:** optional, pauses BeamDeck's player while the game is paused.
+* **Any car:** doors, lids and windows are found from each car's own parts (door latches, glass break groups), so modded cars work too.
+
+#### Other Sound Sources
+
+* **BeamDeck TV:** when the camera is nearer a BeamDeck TV than the car (and not inside the car), the sound comes from the TV instead: clear, never muffled, quieter with distance and panned to it. It plays from one place at a time, never both.
+* **Other players' cars (BeamMP):** each car plays its owner's music through the same effect (muffled from outside, louder with their doors or windows open on the listener's side), plus **Doppler**: higher and faster as a car approaches, lower as it drives away (kept within real car speeds, about ±12%).
+* **Voice chat (BeamMP):** voices come from where each player is, in a car or on foot, and are never muffled by cars or doors: full volume within 2 m, half at about 12 m, silent past 90 m. Their own volume control and game controls.
+
+#### Bass Shake
+
+Heavy bass physically moves the car: the doors flex in and out and lids buzz (about 12 Hz), and on big hits the body bounces and rocks (about 3 Hz). It only reacts to real bass (a gate ignores quiet or mid-range music), follows the strength slider in the **Car** tab (0 turns it off), and works on any car with doors or a body to move.
+
+### Android Auto
+
+* The phone's **Android Auto on the car's screen**, through Google's Desktop Head Unit. **USB** by default (no developer mode needed), or **Wi-Fi** through the head unit server.
+* **Click the dash to tap:** a two-pass set-up (four corners from two camera positions) ties taps to the screen itself, so any camera angle works afterwards.
+* **Game map** over the Maps pane: BeamNG's own map at the car's position, following wherever Maps sits in Android Auto's layout (left, right, full screen), day and night. The real map is never shown on the car.
+* Its music and navigation voice play through the car, like any other source.
+* **Android phones only, no Apple CarPlay:** CarPlay only connects to head units that contain Apple's authentication chip (from Apple's MFi programme), which a PC can't provide, so an iPhone can't connect to a software head unit like this one. iPhone users can still use everything else, including **App sound** for music.
+
+### BeamMP Multiplayer
+
+* **Everyone's car plays their own music**, positioned and muffled the same way, with **Doppler** when cars pass.
+* **Shared screens:** each player's car screen (video, Android Auto with the game map, or now playing) shows on their car in the other players' games.
+* **Proximity voice chat:** players hear each other from where they are (in a car or on foot), quieter with distance, never muffled. Voice activation or push to talk, with a microphone picker and sensitivity meter.
+* Built to stay in sync: reconnects, freezes and song changes rebuild cleanly, and a listener that can't join a stream asks for a fresh one.
+
+### BeamDeck TV
+
+* The TV prop gets a **BeamDeck** configuration: it shows the same as the car screen, and when the camera is nearer the TV than the car, the sound comes from the TV, clear and positioned.
+
+### Real Routes
+
+A driving job inside BeamDeck, on **BeamNG.Earth** (real streets) or any regular map:
+
+* **Bus:** drive real transit routes from a GTFS feed (OC Transpo by default): stops, timetable, passengers getting on and off, stop requests, a score for timekeeping and comfort, and the bus's own destination signs. On regular maps that come with bus lines (West Coast USA, East Coast USA, Italy, Utah, Jungle Rock Island), the map's own lines are offered instead, so BeamNG.Earth isn't needed, with a timetable worked out from each line's length (a bus every 15 minutes).
+* **Announcements:** the tablet calls out the next stop, and the route and destination when people get on, like a real bus. Riders speak their lines out loud, each in their own voice.
+* **Rides:** a ride-share shift. Riders (alone or in groups of two or three) ask for trips, you pick them up and drop them off, and they rate the pickup time, the trip time, smoothness and safety. Some trips are long runs across town or airport runs, fares surge at rush hour and late at night, and now and then a rider changes their destination on the way. Emergency riders only care about getting there fast (a medical emergency to a hospital doesn't mind anything else), and when one gets in, the tablet and Android Auto maps switch to an emergency mode: a flash, a banner, the whole route drawn in red, red and blue light at the edges until the drop-off. Open the console with `#demo-emergency` at the end of its address to see it without driving. Going offline shows a summary of the shift; fares, tips, a history, a day-by-day record and a driver profile are kept between sessions.
+* **Freight:** trucking jobs on BeamNG.Earth, picked from a job board like Euro Truck Simulator's. The tablet lists generated jobs round a market town you choose (local, regional and long-haul, between real towns anywhere in the world, with the Ottawa to Toronto corridor and every town on the 416 and 401 between them built in) and themed scenarios: the 450 km Ottawa to Toronto Express, a Corridor run with several drops in Brockville, Kingston, Belleville and on, a fuel run, last-mile parcels, a concrete rush, a log haul, a port run, a milk run, steel from the mill, and a European drawbar combination. Pickups and drop-offs are real businesses found through BeamNG.Earth. A job starts with the truck set down 1.5 to 2.6 km from the pickup (or at it, with the switch on the Jobs page): drive there, stop in the pickup area and stand still while it loads. The trailer is hooked on then, or a rigid truck gets one of its own built-in loads: a flatbed's steel pipes, wood planks, marble block or storage boxes, a box body's pallets, a tipper's rocks, a tanker's diesel, petrol, milk or water, picked to match the cargo and the part whose weight is nearest the job's. The clock starts once it is loaded, and at each drop you stand still for a few seconds while it is unloaded. You pick any truck the game has, stock or mod, and BeamDeck spawns it at the pickup with a trailer that fits its hitch: the T-Series, MD-Series, Percheron (with the FPU European trailers first), box trucks, dump trucks, mixers, vans and pickups. A custom planner builds your own route through any towns. The cargo is scored on smooth driving (hard braking and corners, hits, a trailer that comes unhooked), speeding and time, and pays accordingly.
+* **Truck control panel:** while a freight job runs, the tablet shows the map with directions beside live truck stats (speed and limit, rpm, gear, load, coolant and oil temperature, fuel, weight, trailer, trip, odometer, cruise, retarder, parking brake) and the truck's own controls: retarder and engine brake levels, parking brake, cruise control, front, rear and inter-axle diff locks, transfer case, lift axle, fifth wheel and eye hitch release, trailer air, dump bed and concrete mixer. A tap on **PTO** switches the engine speed high or low for hydraulic work, and holding it opens a slider to set the exact rpm. Only the controls the truck actually has are shown.
+* **Riders:** 100 built-in people, plus anyone you add from the console with a name and a picture (friends, characters). The driver has a profile with an uploaded picture.
+* **Riders you can see:** people wait at the roadside as cards (and 3D models, if you make them), and sit in the car as its own seat occupants. Any seat can also be filled by hand, the driver's included.
+* **Tablet console:** a web page for a tablet or second screen: route picker, live map (heading-up or 3D chase view) with the route and destination, ride offers, history, profile, seats, and a music bar.
+* **Android Auto app:** a small Android app that shows the same map, route and turn-by-turn directions on Android Auto, on the car's dash, in step with the tablet.
+
+See [Real Routes Setup](#real-routes-setup).
+
+### Light on the Game
+
+* Car screens get pictures only when they change, nearby TVs at most 15 times a second (the 2 nearest within 60 m), and everything heavy (downloads, video, Android Auto capture, audio) runs in the helper and the window, outside the game.
+
+## Setup
+
+### 1. Requirements
+
+| | Linux | Windows |
+| :--- | :--- | :--- |
+| **Always** | Python 3, `ffmpeg`, `yt-dlp`, a Chromium-based browser (Edge, Chrome, Chromium, Brave or Vivaldi) | Python 3 from python.org (not the Microsoft Store one), `ffmpeg`, `yt-dlp`, Edge or Chrome |
+| **App sound** | PipeWire or PulseAudio (`pactl`); `playerctl` for the song title | [VB-CABLE](https://vb-audio.com/Cable/) and NirSoft's [`svcl.exe`](https://www.nirsoft.net/utils/sound_volume_command_line.html) |
+| **Android Auto** | An Android phone; `adb` (android-tools), `Xvfb`, `xdotool`, `libc++`, `bsdtar` (for the download), USB access to the phone (e.g. the `android-udev` rules) | An Android phone; the head unit (downloaded by the installer), [Zadig](https://zadig.akeo.ie) once for USB, VB-CABLE + `svcl.exe` for its sound |
+
+BeamNG.drive itself runs natively on Linux or on Windows; the installers find its user folder (also a moved one, from `BeamNG.drive.ini`).
+
+### 2. Install
+
+**Linux**
+
+```sh
+git clone <this repository> BeamDeck && cd BeamDeck
+./install.sh                                   # helper, window, launcher, icon, user service, BeamNG mod, head unit
+systemctl --user enable --now beamdeck         # start the helper now and at login
+```
+
+If BeamNG's user folder isn't found: `BEAMNG_USERFOLDER=/path/to/BeamNG.drive/current ./install.sh`.
+
+**Windows** (PowerShell)
+
+```powershell
+winget install Python.Python.3.12 Gyan.FFmpeg yt-dlp.yt-dlp
+# in the BeamDeck folder:
+powershell -ExecutionPolicy Bypass -File install.ps1                # add -AndroidAuto to download the head unit
+```
+
+For app sound or Android Auto's sound: install VB-CABLE, and copy `svcl.exe` into `%LOCALAPPDATA%\BeamDeck\app`. Keep the normal speakers or headphones as the default output device.
+
+### 3. First Run
+
+1. Open **BeamDeck** from the app menu or Start menu. Its window opens; **leave it open while playing**, since the sound comes from it.
+2. Start BeamNG (restart it if it was already running, so it loads the mod). The dot at the top right of the window turns green with the car's name once the game is connected.
+3. **Settings** tab: add music folders, a Navidrome server, or a different browser or BeamNG folder if needed, then **Save**.
+4. **Car** tab: turn on **Car screens** (the picture on the car's screens) and **Car audio** (the sound coming from the car instead of plainly from the speakers).
+5. **Play** tab: paste a link and press **Play**, or pick music in the **Music** tab.
+
+### 4. TV Prop (optional)
+
+In BeamNG's vehicle selector, pick **TV** and its **BeamDeck** configuration. With **Car screens** on, it shows the same as the car's screen.
+
+## Android Auto Setup
+
+Android phones only; Apple CarPlay isn't possible (see [Android Auto](#android-auto) above).
+
+**USB (default, no developer mode):**
+
+1. On the phone: **Android Auto settings → Previously connected cars → ⋮ → Add new cars to Android Auto** must be on.
+2. Plug the phone in by USB and turn on **Car → Android Auto** in the BeamDeck window. The phone switches to car mode and a window titled **Android Auto - Desktop Head Unit** opens (on Windows, keep it visible somewhere on screen; BeamDeck copies its picture).
+3. **Windows only, once per PC:** in car mode the phone appears as USB ID `18D1 2D01`, which Windows binds to the wrong driver. Run `adb kill-server`, turn Android Auto on in BeamDeck, then in **Zadig** (Options → List All Devices, untick "Ignore Hubs or Composite Parents") pick the composite device `18D1 2D01` (current driver `usbccgp`), choose **WinUSB** and **Replace Driver**. Unplug, replug, and turn Android Auto off and on. Normal phone USB (file transfer, charging) is unaffected, since that's a different USB ID. To undo it: **Device Manager → Universal Serial Bus devices →** the phone's entry **→ Uninstall device**, tick "Attempt to remove the driver", and replug.
+4. **Set up the screen once per car model:** sit in the car, press **Car → Set up screen**, click the screen's four corners in the game, move the camera a little (W/S), and click the four corners again. Clicking the car's screen then taps Android Auto.
+5. **Car → Game map** puts BeamNG's map over Google Maps.
+
+**Wi-Fi (optional; the phone and PC on the same network):**
+
+1. Install `adb`: on Linux the `android-tools` package; on Windows `winget install Google.PlatformTools`, then **restart the PC** so BeamDeck finds it.
+2. Phone, once: **Settings → About phone →** tap **Build number** 7 times (developer options), then **Developer options → Wireless debugging → Pair device with pairing code**, and on the PC run `adb pair <phone-ip>:<pairing-port>` with the 6-digit code.
+3. Phone, once: **Android Auto settings →** tap **Version** 10 times (Android Auto's developer mode).
+4. BeamDeck: **Settings → Android Auto → Phone connection: Head unit server**, then **Save**.
+5. Each time: turn on Wireless debugging, run `adb connect <phone-ip>:<port>` (the port on the phone's Wireless debugging screen changes each time), start **Android Auto settings → ⋮ → Start head unit server**, then **Car → Android Auto** in BeamDeck.
+
+## Multiplayer Setup (BeamMP)
+
+> [!IMPORTANT]
+> Multiplayer needs **your own server**: a BeamMP server you control (the BeamDeck mod goes into its `Resources/Client` folder, so public servers run by others won't have it), and a machine to run the **relay** that every player can reach. Both can be the same machine: a home server, a VPS, or a PC that stays on while you play. Single player needs neither.
+
+### 1. Choose the Server Machine
+
+Any always-on Linux or Windows machine works; the BeamMP server and the relay are both light. The BeamMP server only syncs cars, and the relay passes on about 100 kbit/s per player sharing music, plus video frames while screens are shared and around 20 kbit/s while someone talks.
+
+### 2. Make It Reachable
+
+Every player needs to reach the machine on port **30814** (BeamMP, TCP and UDP) and **47140** (relay, TCP). Pick one:
+
+* **Same home network:** use the machine's LAN address (e.g. `192.168.1.20`). Nothing else to set up.
+* **[Tailscale](https://tailscale.com) (recommended for friends elsewhere):** install it on the server and on every player's PC, and share the server with them (or invite them to the tailnet). Use the server's Tailscale address (`100.x.y.z`). No router changes, and nothing is exposed to the internet.
+* **Port forwarding:** forward TCP and UDP 30814 and TCP 47140 on the router to the server, and use the public IP. The relay has no password, so anyone who finds the port can listen in; Tailscale or a LAN is safer.
+
+If the server has a firewall, allow those ports (e.g. `sudo ufw allow 30814` and `sudo ufw allow 47140/tcp`).
+
+### 3. Set Up the BeamMP Server
+
+1. Download **BeamMP-Server** for the server's system from its [releases page](https://github.com/BeamMP/BeamMP-Server/releases) into its own folder (e.g. `~/beammp-server`).
+2. Get an **AuthKey**: sign in at [keymaster.beammp.com](https://keymaster.beammp.com) and create a key for the server.
+3. Run the server once (`./BeamMP-Server` on Linux after `chmod +x BeamMP-Server`, or the `.exe` on Windows). It creates `ServerConfig.toml` and a `Resources` folder; stop it with Ctrl+C.
+4. Edit `ServerConfig.toml`, section `[General]`:
+
+   ```toml
+   AuthKey = "your-key-from-keymaster"
+   Name = "My BeamDeck server"
+   Map = "/levels/italy/info.json"      # any map, e.g. /levels/west_coast_usa/info.json
+   MaxPlayers = 8
+   Port = 30814
+   Private = true                       # hidden from the public server list; players use Direct Connect
+   ```
+
+5. Start it again and leave it running (for example in `tmux`/`screen` or as a systemd service on Linux).
+6. Players join from the BeamMP launcher with **Direct Connect**: the server's address and port 30814.
+
+### 4. Add BeamDeck to the Server
+
+Build the game mod and put it in the server's `Resources/Client` folder:
+
+```sh
+./make-beammp-zip.sh                                          # builds beamdeck.zip
+./make-beammp-zip.sh myserver:beammp-server/Resources/Client/ # or build and copy it there with scp
+```
+
+Nothing goes in `Resources/Server`. Restart the BeamMP server after adding or updating it; players download it when they join.
+
+### 5. Run the Relay
+
+The relay passes music, car screens and voice between players. It is a single Python script using only the standard library, in [`relay/`](relay). Copy the `relay` folder to the server, then either:
+
+```sh
+# with Docker (Linux: the docker package or get.docker.com; Windows: Docker Desktop)
+cd relay
+RELAY_BIND=0.0.0.0 docker compose up -d       # or one address only, e.g. the Tailscale IP: RELAY_BIND=100.x.y.z
+```
+
+```sh
+# without Docker (needs Python 3); keep it running like the BeamMP server
+cd relay
+python3 beamdeck-relay.py                    # listens on port 47140; BEAMDECK_RELAY_PORT changes it
+```
+
+Check it from a player's PC: opening `http://<server-address>:47140/players` in a browser should show `[]` (nobody sharing yet).
+
+### 6. On Each Player's PC
+
+1. Install BeamDeck (the server only hands out the game mod; the sound is played by the BeamDeck window).
+2. **Settings → Multiplayer → Music relay address:** `ws://<server-address>:47140` (just `<server-address>:47140` works too), **Save**, then **Test**: it should say "Connected".
+3. **Car** tab: **Share my music**, **Share my screen** and **Voice chat** are on by default. **Settings → Multiplayer** has push to talk, the microphone and the voice sensitivity. Allow the microphone when the window asks, and use headphones for voice chat.
+4. Click once anywhere in the BeamDeck window after opening it, then join the server.
+
+**For Windows players:** `./make-friend-zip.sh [output-folder] [ws://server-address:47140]` builds `BeamDeck-Windows.zip` (into `dist/` by default) with the Windows files, the mod, this README and a `RELAY.txt` with the relay address.
+
+## Real Routes Setup
+
+### What Goes Where
+
+| Device | What | From |
+| :--- | :--- | :--- |
+| PC | **BeamDeck** (helper, window and game mod) | This repository; see [Setup](#setup) |
+| PC, optional | **BeamNG.Earth**, for real streets and real bus routes. Without it, Rides works on any regular map | [TecnaGamer/BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth) (its own app and mod; follow its instructions) |
+| Tablet or any second screen | **The console**: nothing to install, it is a web page served by BeamDeck | See [The Tablet Console](#the-tablet-console) |
+| Phone, optional | **Real Routes for Android Auto**: the map and directions on the car's dash | `RealRoutes-Auto.apk` on this repository's [Releases](../../releases) page, or built from `realroutes-auto/` |
+| PC and phone, optional | **BeamNG.Earth Live GPS**: the phone's location follows the car on BeamNG.Earth | [Leopri2008/BeamNG.Earth-LiveGPS](https://github.com/Leopri2008/BeamNG.Earth-LiveGPS) (a PC script and a phone app) |
+
+BeamNG.Earth and Live GPS are separate projects by other authors with their own licences; they are not included here and are downloaded from their own pages.
+
+BeamDeck runs the Real Routes helper itself; the game side is part of the BeamDeck mod. The first time the console opens it offers to download and prepare the transit feed (set another feed with `routes_gtfs` and `routes_agency` in `config.json`).
+
+### The Tablet Console
+
+The console is a web page served by BeamDeck at `http://127.0.0.1:47130/routes/`. On the PC itself, open that address in a browser.
+
+BeamDeck only listens on the PC, so another device needs the page passed on to it. Any address that ends up at `/routes/` works; the page uses relative links, so nothing in it needs to be changed. Two ways:
+
+* **Tailscale** (PC and tablet in the same tailnet): `tailscale serve --bg --https=8447 http://127.0.0.1:47130/routes/`, then open `https://<pc-name>.<tailnet>.ts.net:8447` on the tablet. Only the console is passed on, not the rest of BeamDeck.
+* **Home network:** a reverse proxy on the PC (Caddy, nginx) from a LAN port to the same address, and the firewall opened for that port.
+
+The helper answers private and Tailscale addresses only. In Chrome on the tablet, **⋮ → Add to Home screen → Install** makes it a full-screen app that keeps the screen awake.
+
+| Part of the console | Does |
+| :--- | :--- |
+| **Bus** | Pick a route, direction and trip (own clock or real time), then drive: schedule deviation, next stop, stop request bell, doors and kneeling, stops list or map, and a summary at the end. On a regular map the list shows that map's own bus lines |
+| **Rides → Drive** | Go online, accept or decline offers, the map with the route to the pickup or drop-off, and the rider's profile |
+| **Rides → History / Profile** | Past trips with ratings and comments; earnings, rating, the driver's name and picture (upload one, or use one of your people), and a day-by-day table of rides, earnings, time online and bus trips |
+| **Rides → People** | Add a rider with a name and a picture chosen on that device, remove one, and choose who asks for rides: everyone, only your own people, or only the built-in ones |
+| **Rides → Seats** | Put any character in any seat, the driver's seat included. The car reloads in place (about a second) when a seat changes, so do it while stopped |
+| **Freight → Jobs** | The job board for the market town (pick any town), filtered to what fits the selected truck, or by local, regional, long haul and scenarios. Take a job and the truck and trailer appear at the pickup |
+| **Freight → Garage** | Every truck the game reports, with its specs and what it can carry (semi tractor, box, flatbed, tanker, dump, mixer, eye hitch for drawbar trailers, pickup or van). A mod truck that is misread can be corrected here. The star marks a favourite model |
+| **Freight → Plan / History** | Plan a route between any two towns with drops in the towns between them; past deliveries with pay, rating, cargo condition and time |
+| **Freight (driving)** | The map with turn-by-turn directions, the job's drops, time left and cargo condition, live truck gauges and the truck control panel with the PTO slider |
+| **Music bar** (bottom of every view) | What is playing, volume, previous, play / pause, next, and the time. Controls BeamDeck's player, the app picked under App sound, or the phone's music through Android Auto |
+| **Announcements** (speech-bubble button in the music bar) | Turn stop and route announcements and riders' voices on or off, and pick the announcer's voice. They're spoken by the tablet (the browser's own speech), so the tablet's volume sets how loud they are; tap the page once after opening it, as browsers only speak after a touch |
+
+The console reloads itself when BeamDeck has a newer version of it, so a tablet that keeps it open picks up updates without a manual reload.
+
+### The Android Auto App
+
+`realroutes-auto/` is an Android app (Android 12 or newer) that puts the Real Routes map on Android Auto: the car's position, the route, pickup and drop-off pins and turn-by-turn steps, light with the headlights off and dark with them on.
+
+1. Install it: download `RealRoutes-Auto.apk` from the [Releases](../../releases) page onto the phone and open it (allow the browser or file manager to install apps when asked). To build it instead: `cd realroutes-auto && ./gradlew installDebug` with the phone connected by USB (needs the Android SDK).
+2. Open **Real Routes** on the phone and enter the console's address (the same one the tablet uses).
+3. In **Android Auto settings**, tap **Version** ten times, then **⋮ → Developer settings → Unknown sources**, so Android Auto shows apps that didn't come from the Play Store.
+4. Start Android Auto (in BeamDeck: **Car → Android Auto**) and open **Real Routes** from its app list.
+
+**Updates:** from version 0.2.0 the app checks this repository's Releases when it opens (at most every 6 hours, or straight away with **Check for updates**) and offers new versions with **Update / Later / Skip this version**. The first update asks once for permission to install apps. Versions before 0.2.0 have no update check, so install 0.2.0 by hand.
+
+Publishing a new version: raise `versionCode` and `versionName` in `realroutes-auto/app/build.gradle.kts`, build it, and attach the APK to a release tagged `v<versionName>-realroutes` (e.g. `v0.2.0-realroutes`). The app only picks up non-draft, non-pre-release releases with that tag ending, and the APK must be signed with the same key as the installed one, or Android refuses the update.
+
+On BeamNG.Earth, the game's position can also be fed to the phone as its location with the [**Live GPS**](https://github.com/Leopri2008/BeamNG.Earth-LiveGPS) add-on: install its phone app, download its PC script, give the script's path under **Settings → Live GPS** in the BeamDeck window, and turn **Live GPS** on there; BeamDeck then runs the script.
+
+### Riders' Pictures and Models
+
+BeamDeck comes with 100 generic riders, shown as plain pictograms; no pictures or models of real people or characters are included. Everything else is the player's own and stays in the player's data folder (`~/.local/share/beamdeck/realroutes` on Linux, `%LOCALAPPDATA%\BeamDeck\realroutes` on Windows), outside the repository.
+
+* **One person at a time:** **Rides → People** in the console. The picture is cropped on the device and saved as the person's round picture and roadside card. People with only a picture ride as BeamNG's own seat dummy.
+* **A folder of pictures:** `python3 realroutes/make_avatars.py "<folder>"`, where the folder holds one sub-folder of pictures per person. It finds the face, crops a round picture and a roadside card for each (crop and resize only), and keeps an `@artist` in the file name as the credit. Needs `opencv-python` below version 5 and the `lbpcascade_animeface.xml` detector in `~/.cache/realroutes/`.
+* **3D models (optional):** `realroutes/tools/` has the Blender scripts to pose a model you have the right to use (standing, and seated for the car) and export it for BeamNG: `rig.py` (poses with the model's own skeleton, or builds one), then `export_beamng.py`. The results go in `<data>/realroutes/models/<Name>/` and BeamDeck copies them into the game at start.
+
+## Game Controls
+
+Bound in BeamNG under **Options → Controls** (search "BeamDeck"). All are unbound by default.
+
+| Control | Does |
+| :--- | :--- |
+| Play / pause, next song, previous song | BeamDeck's player while it plays; otherwise the phone's music through Android Auto |
+| Music volume up / down | Everything BeamDeck plays, with an on-screen level |
+| Voice volume up / down | Other players' voices |
+| Push to talk | Hold to talk (when voice chat is set to push to talk) |
+| Mute / unmute mic | Turns the microphone off or on |
+
+## Troubleshooting
+
+| Problem | Fix |
+| :--- | :--- |
+| "Game not connected" | Restart BeamNG after installing (it loads the mod at start). Check the mod is in `mods/unpacked/beamdeck` in BeamNG's user folder. |
+| No sound | The window must stay open; click once inside it. Check **Car audio** and the volume slider. |
+| YouTube links stop working | Update yt-dlp: `yt-dlp -U` (or the package manager's update). |
+| Android Auto: "Attaching to USB device…" on Windows | The Zadig step above (WinUSB on the `18D1 2D01` composite device). |
+| Android Auto picture only fills part of the car screen, or the game map doesn't cover Maps (Windows) | Fixed for Windows display scaling (125 %, 150 %): update BeamDeck. |
+| Android Auto: phone doesn't connect | "Add new cars to Android Auto" on the phone; try another cable or port. |
+| Multiplayer: others can't hear or see each other | Same relay address for everyone, and **Test** says "Connected". |
+| Real Routes: the tablet shows "game not connected" | BeamNG must be running with the BeamDeck mod; after an update, press **Ctrl+L** in the game. |
+| Freight: the Garage is empty | The truck list comes from the game: start BeamNG with the BeamDeck mod once (it is remembered afterwards), or press **Refresh from the game**. |
+| Freight: no load shows on a rigid truck | The load is the truck's own built-in load part, switched on when loading finishes (the truck reloads in place for about a second). A truck or mod config with no load slot for that cargo gets none and the cockpit says so. The part names tried are in `LOAD_PATTERNS` in `mod/lua/ge/extensions/realroutes.lua`. **Skip the drive** on the cockpit moves the truck to the pickup if the starting point is somewhere awkward. |
+| Freight: a trailer is in place but not hooked up | Press **Hook up again** on the cockpit, or back onto it with the coupler button. A trailer is only spawned if its hitch matches one on the truck, so a truck that no trailer fits says so and the job returns to the board. |
+| Freight: pay or ratings feel wrong | The limits are at the top of `realroutes/freight.py` (`LIMIT`, `SPEEDING_KMH`, `TICKET`, `SLACK`); the cargo catalogue, towns and truck classes are in `realroutes/freight_data.py`. |
+| Real Routes: a seated rider doesn't appear | Seats use BeamNG's seat occupants, so the car needs occupant seats (the official cars have them). The car reloads when a seat changes; if it didn't, pick the seat again. |
+| Real Routes: riders rate too harshly or too kindly | The limits are at the top of `realroutes/rides.py` (`JOLT`, `CRASH`, `SPEEDING_KMH`). |
+| The helper doesn't start (Windows) | `%LOCALAPPDATA%\BeamDeck\helper.log` and `launcher.log` show why. |
+
+## How It Fits Together
+
+| Part | Role |
+| :--- | :--- |
+| `beamdeck-server.py` | The helper (port 47130): streams and downloads, music library and Navidrome, app sound, Android Auto head unit and capture, and the link to the game |
+| `beamdeck-ui.html` | The window: picking what plays, all the audio processing, multiplayer sending and receiving, voice chat |
+| `beamdeck-launch.py` | Starts the helper if needed and opens the window in its own browser profile |
+| `mod/` | The BeamNG mod: game script, car-screen script and page, TV prop configuration, game controls |
+| `relay/` | The multiplayer relay (`beamdeck-relay.py`) and its compose file |
+| `realroutes/` | Real Routes: the helper (`realroutes_helper.py`, `rides.py`), the tablet console (`console.html`), the feed baker, and the tools for riders' pictures and models |
+| `realroutes-auto/` | The Real Routes app for Android Auto |
+| `install.sh`, `install.ps1` | Installers for Linux and Windows |
+| `make-beammp-zip.sh`, `make-friend-zip.sh` | Build the server's mod package and the Windows package for other players |
+
+The full design, the reasoning behind it and the problems solved along the way are in [**docs/beamdeck.md**](docs/beamdeck.md). Google's Desktop Head Unit and NirSoft's `svcl.exe` are not included; the installers download the head unit from Google, and `svcl.exe` comes from NirSoft's site.
+
+## About This Project
+
+AI was used to handle troubleshooting and bug fixes in this project, as I am still learning Python.
+
+## Disclaimer
+
+**BeamDeck** is an independent, community-developed open-source project and is not affiliated, associated, authorized, endorsed by, or in any way officially connected with Google, Spotify, Meta (WhatsApp), BeamNG, or any of their subsidiaries or affiliates.
+
+All product and company names, logos, brands, trademarks, and registered trademarks mentioned or displayed in this repository are the property of their respective owners. Their use in this project is strictly for descriptive, identification, and compatibility purposes ("nominative fair use") and does not imply any endorsement, sponsorship, or official relationship.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
