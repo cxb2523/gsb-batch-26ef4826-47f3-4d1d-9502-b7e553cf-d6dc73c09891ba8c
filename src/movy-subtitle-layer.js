@@ -78,11 +78,59 @@ export function initMovySubtitle(deps = {}) {
   let cues = []; let translations = new Map(); let translating = new Set();
   let cueIndex = -1; let shownKey = '';
   let tickTimer = 0; let loadToken = 0;
+  let contextEpoch = 0;
+  let activeContextKey = '';
+  let activeContext = null;
   let currentKey = ''; let currentSrc = '';
 
   const settings = { ...readJson(SETTINGS_KEY, {}), size: 1, offset: 0, bottom: 9, ai: false, aiTouched: false, trackUrl: '' };
 
   function persist() { writeJson(SETTINGS_KEY, settings); }
+
+  // 播放上下文守卫：
+  //  - contextEpoch：切换影片/切集/载入本地字幕时自增，作废上一个上下文的全部在途请求；
+  //  - userSeq：用户主动选择轨道（含关闭字幕）时自增，作废在途的自动发现/在线搜索；
+  //  - discoverSeq / onlineSeq：同一类链路内部相互取代，最新一次请求胜出。
+  // 任何异步结果落地前都必须通过对应的 alive 校验，否则一律丢弃。
+  let discoverSeq = 0;
+  let onlineSeq = 0;
+  let userSeq = 0;
+
+  function bumpUserSelection() {
+    userSeq += 1;
+    return userSeq;
+  }
+
+  function invalidateInFlight() {
+    contextEpoch += 1;
+    loadToken += 1;
+    discoverSeq += 1;
+    onlineSeq += 1;
+    userSeq += 1;
+    return contextEpoch;
+  }
+
+  function isCurrentEpoch(epoch) {
+    return epoch === contextEpoch;
+  }
+
+  function beginDiscover() {
+    discoverSeq += 1;
+    return { epoch: contextEpoch, user: userSeq, seq: discoverSeq };
+  }
+
+  function discoverAlive(token) {
+    return !!token && token.epoch === contextEpoch && token.user === userSeq && token.seq === discoverSeq;
+  }
+
+  function beginOnline() {
+    onlineSeq += 1;
+    return { epoch: contextEpoch, user: userSeq, seq: onlineSeq };
+  }
+
+  function onlineAlive(token) {
+    return !!token && token.epoch === contextEpoch && token.user === userSeq && token.seq === onlineSeq;
+  }
 
   function modalOpen() {
     const modal = doc.querySelector('#playerModal');
@@ -139,9 +187,9 @@ export function initMovySubtitle(deps = {}) {
     doc.body.appendChild(panel);
     panel.addEventListener('click', (event) => {
       const row = event.target && event.target.closest ? event.target.closest('[data-sub-track]') : null;
-      if (row) { chooseTrack(row.dataset.subTrack); return; }
+      if (row) { userChooseTrack(row.dataset.subTrack); return; }
       const onlineRow = event.target && event.target.closest ? event.target.closest('[data-sub-online]') : null;
-      if (onlineRow) { chooseOnline(Number(onlineRow.dataset.subOnline)); return; }
+      if (onlineRow) { userChooseOnline(Number(onlineRow.dataset.subOnline)); return; }
       const act = event.target && event.target.closest ? event.target.closest('[data-sub-act]') : null;
       if (!act) return;
       const kind = act.dataset.subAct;
@@ -151,9 +199,9 @@ export function initMovySubtitle(deps = {}) {
       if (kind === 'offset-') { settings.offset = Number((settings.offset - 0.2).toFixed(1)); persist(); renderPanel(); tick(true); }
       if (kind === 'offset+') { settings.offset = Number((settings.offset + 0.2).toFixed(1)); persist(); renderPanel(); tick(true); }
       if (kind === 'reset') { settings.offset = 0; settings.bottom = 9; settings.size = 1; persist(); applyGeometry(); renderPanel(); tick(true); }
-      if (kind === 'off') { chooseTrack(''); }
+      if (kind === 'off') { userChooseTrack(''); }
       if (kind === 'load') { loadLocalFile(); }
-      if (kind === 'search') { onlineTried = false; searchOnline(playContext()); }
+      if (kind === 'search') { onlineTried = false; onlineBusy = false; searchOnline(playContext()); }
     });
     return panel;
   }
@@ -227,8 +275,12 @@ export function initMovySubtitle(deps = {}) {
     return eng || list[0];
   }
 
-  async function chooseTrack(url) {
+  async function chooseTrack(url, opts) {
+    const user = !!(opts && opts.user);
+    if (user) { bumpUserSelection(); onlineBusy = false; }
     const wanted = decodeURIComponent(String(url || ''));
+    // 切换轨道会让任何在途的加载结果失效，避免旧请求晚到后覆盖当前选择。
+    loadToken += 1;
     if (!wanted) {
       activeTrack = null; cues = []; cueIndex = -1; shownKey = '';
       if (primary) primary.textContent = '';
@@ -246,9 +298,20 @@ export function initMovySubtitle(deps = {}) {
     await loadCues(track);
   }
 
+  function userChooseTrack(url) {
+    return chooseTrack(url, { user: true });
+  }
+
   async function applyLocalCues(list, name) {
     if (!Array.isArray(list) || !list.length) return;
-    const entry = { url: 'local:' + (name || 'file'), lang: 'local', language: 'local', label: name || '本地字幕', online: true };
+    // 本地字幕立即生效：让所有在途的发现/在线搜索/加载请求全部作废。
+    invalidateInFlight();
+    onlineBusy = false;
+    // 已有的在线候选属于旧上下文/旧搜索，一并清掉，避免本地字幕生效后又被旧列表替代。
+    onlineTracks = [];
+    onlineTried = false;
+    const entry = { url: 'local:' + (name || 'file'), lang: 'local', language: 'local', label: name || '本地字幕' };
+    entry.localCues = list.slice().sort((a, b) => a.s - b.s);
     activeTrack = entry;
     tracks = [entry];
     cueIndex = -1; shownKey = '';
@@ -259,7 +322,7 @@ export function initMovySubtitle(deps = {}) {
     persist();
     renderPanel();
     updateButton();
-    cues = list.slice().sort((a, b) => a.s - b.s);
+    cues = entry.localCues.slice();
     diag.cues = cues.length;
     primeTranslate();
     tick(true);
@@ -268,17 +331,21 @@ export function initMovySubtitle(deps = {}) {
   async function loadLocalFile() {
     const api = bridge();
     if (!api || typeof api.subPick !== 'function') return;
+    const epoch = contextEpoch;
     try {
       const result = await api.subPick();
+      if (!isCurrentEpoch(epoch)) return;
       if (!result || result.canceled) return;
       if (!result.ok) { diag.errors.push(result.error || '本地字幕解析失败'); renderPanel(); return; }
       await applyLocalCues(result.cues, result.name);
     } catch (error) { diag.errors.push('load: ' + String((error && error.message) || error)); }
   }
 
-  async function chooseOnline(index) {
+  async function chooseOnline(index, opts) {
     const track = onlineTracks[index];
     if (!track) return;
+    if (opts && opts.user) { bumpUserSelection(); onlineBusy = false; }
+    loadToken += 1;
     activeTrack = track;
     settings.trackUrl = track.url;
     persist();
@@ -287,11 +354,21 @@ export function initMovySubtitle(deps = {}) {
     await loadCues(track);
   }
 
+  function userChooseOnline(index) {
+    return chooseOnline(index, { user: true });
+  }
+
   async function loadCues(track) {
     const api = bridge();
     if (!api || !track) return;
+    // 本地字幕已解析完成，重新选中时直接用内存里的 cue，避免再把 local: 当成 URL 去请求。
+    if (Array.isArray(track.localCues) && track.localCues.length) {
+      await applyLocalCues(track.localCues, track.label);
+      return;
+    }
     const token = ++loadToken;
-    cues = []; translating = new Set(); cueIndex = -1; shownKey = '';
+    const epoch = contextEpoch;
+    cues = []; resetTranslateQueue(); cueIndex = -1; shownKey = '';
     nativeLastIndex = -2;
     if (nativeTrack) nativeTrack.mode = 'hidden';
     clearNative();
@@ -300,10 +377,11 @@ export function initMovySubtitle(deps = {}) {
     if (secondary) secondary.textContent = '';
     diag.fetches += 1;
     try {
+      const context = contextPayload();
       const result = track.online
-        ? await api.subOnlineLoad({ track: track.payload })
-        : await api.subCues({ url: track.url, lang: track.lang || track.language || '' });
-      if (token !== loadToken) return;
+        ? await api.subOnlineLoad({ track: track.payload, context })
+        : await api.subCues({ url: track.url, lang: track.lang || track.language || '', context });
+      if (token !== loadToken || !isCurrentEpoch(epoch)) return;
       if (result && result.ok && Array.isArray(result.cues)) {
         cues = result.cues;
         diag.cues = cues.length;
@@ -331,6 +409,14 @@ export function initMovySubtitle(deps = {}) {
 
   const translateQueue = [];
   let translateActive = 0;
+  // 失败过的文本不再自动重排，否则失败 -> tick -> primeTranslate 会形成无限重试。
+  const translateFailed = new Set();
+
+  function resetTranslateQueue() {
+    translateQueue.length = 0;
+    translating = new Set();
+    translateFailed.clear();
+  }
 
   function hydrateTranslations() {
     const saved = readJson(TRANS_KEY, {});
@@ -381,17 +467,21 @@ export function initMovySubtitle(deps = {}) {
       const job = translateQueue.shift();
       translateActive += 1;
       const from = (activeTrack && (activeTrack.lang || activeTrack.language)) || '';
+      const epoch = contextEpoch;
+      let ok = false;
       translateOne(job.text, from)
-        .then((value) => { if (value) translations.set(job.text, value); })
+        .then((value) => { if (value) { ok = true; translations.set(job.text, value); } })
         .catch(async () => {
           try {
             const map = await translateViaMain([job.text], from);
-            if (map && map[job.text]) translations.set(job.text, map[job.text]);
+            if (map && map[job.text]) { ok = true; translations.set(job.text, map[job.text]); }
           } catch { diag.errors.push('translate-fallback'); }
         })
         .finally(() => {
           translateActive -= 1;
           translating.delete(job.text);
+          if (!ok) translateFailed.add(job.text);
+          if (!isCurrentEpoch(epoch)) return;
           if (translations.size && translations.size % 12 === 0) persistTranslations();
           pumpTranslate();
           tick(true);
@@ -408,7 +498,7 @@ export function initMovySubtitle(deps = {}) {
     let queued = 0;
     for (let i = from; i < to; i += 1) {
       const text = cues[i].t;
-      if (translations.has(text) || translating.has(text)) continue;
+      if (!text || translations.has(text) || translating.has(text) || translateFailed.has(text)) continue;
       translating.add(text);
       translateQueue.push({ text });
       queued += 1;
@@ -495,28 +585,36 @@ export function initMovySubtitle(deps = {}) {
   function discoverTracks(context) {
     const api = bridge();
     if (!api) return;
-    if (!context || !context.streamUrl || typeof api.subDiscover !== 'function') { huntOtherProviders(context); return; }
+    const token = beginDiscover();
+    if (!context || !context.streamUrl || typeof api.subDiscover !== 'function') { huntOtherProviders(context, token); return; }
     diag.discover += 1;
     api.subDiscover({ streamUrl: context.streamUrl, subtitles: [] })
       .then((result) => {
+        if (!discoverAlive(token)) return;
         const found = normalizeTracks(result && result.tracks);
         diag.discovered = found.length;
-        if (!found.length) { huntOtherProviders(context); return; }
-        applyTracks(found);
+        if (!found.length) { huntOtherProviders(context, token); return; }
+        applyTracks(found, token);
       })
-      .catch((error) => { diag.errors.push('discover: ' + String((error && error.message) || error)); huntOtherProviders(context); });
+      .catch((error) => {
+        if (!discoverAlive(token)) return;
+        diag.errors.push('discover: ' + String((error && error.message) || error));
+        huntOtherProviders(context, token);
+      });
   }
 
-  function applyTracks(found) {
+  function applyTracks(found, token) {
+    if (token ? !discoverAlive(token) : !isCurrentEpoch(contextEpoch)) return;
     tracks = found;
     renderPanel();
     const target = pickDefaultTrack(found);
     if (target) chooseTrack(encodeURIComponent(target.url));
   }
 
-  async function huntOtherProviders(context) {
+  async function huntOtherProviders(context, token) {
     const api = bridge();
-    if (!api || typeof api.sources !== 'function' || !context) { searchOnline(context); return; }
+    if (token && !discoverAlive(token)) return;
+    if (!api || typeof api.sources !== 'function' || !context) { searchOnline(context, token); return; }
     const tried = new Set([String(context.provider || '')]);
     let all = [];
     try {
@@ -538,17 +636,26 @@ export function initMovySubtitle(deps = {}) {
           seasonId: context.seasonId,
           episodeId: context.episodeId,
         });
+        if (token ? !discoverAlive(token) : !isCurrentEpoch(contextEpoch)) return;
         const found = normalizeTracks(result && result.subtitles);
-        if (found.length) { diag.huntHit = provider; applyTracks(found); return; }
+        if (found.length) { diag.huntHit = provider; applyTracks(found, token); return; }
       } catch {  }
     }
+    if (token ? !discoverAlive(token) : !isCurrentEpoch(contextEpoch)) return;
     renderPanel();
-    searchOnline(context);
+    searchOnline(context, token);
   }
 
-  async function searchOnline(context) {
+  async function searchOnline(context, discoverToken) {
     const api = bridge();
-    if (onlineTried || !api || typeof api.subOnline !== 'function' || !context) return;
+    if (!api || typeof api.subOnline !== 'function' || !context) return;
+    if (discoverToken && !discoverAlive(discoverToken)) return;
+    // 用户主动点“搜在线”时允许重试；自动链路仍受 onlineTried 约束。
+    const manual = !discoverToken;
+    if (!manual && onlineTried) return;
+    // 手动搜索是用户意图，应让在途的自动发现失效，避免旧发现结果回头覆盖。
+    if (manual) bumpUserSelection();
+    const live = beginOnline();
     onlineTried = true;
     onlineBusy = true;
     renderPanel();
@@ -559,7 +666,10 @@ export function initMovySubtitle(deps = {}) {
         mediaType: context.mediaType,
         season: context.seasonId,
         episode: context.episodeId,
+        tmdbId: context.tmdbId,
+        streamUrl: context.streamUrl,
       });
+      if (!onlineAlive(live)) return;
       const list = (result && Array.isArray(result.tracks) ? result.tracks : []).map((item, index) => ({
         url: 'online:' + index + ':' + (item.source || '') + ':' + (item.lang || ''),
         lang: item.lang || '',
@@ -575,15 +685,33 @@ export function initMovySubtitle(deps = {}) {
         await chooseOnline(list.indexOf(best));
       }
     } catch (error) {
+      if (!onlineAlive(live)) return;
       diag.errors.push('online: ' + String((error && error.message) || error));
     }
+    if (!onlineAlive(live)) return;
     onlineBusy = false;
     renderPanel();
   }
 
   function contextKey(context) {
     if (!context) return '';
-    return [context.tmdbId || '', context.seasonId || '', context.episodeId || '', context.streamUrl || '', context.title || ''].join('|');
+    return [context.tmdbId || '', context.mediaType || '', context.seasonId || '',
+      context.episodeId || '', context.streamUrl || '', context.title || ''].join('|');
+  }
+
+  // 供主进程做缓存隔离的上下文摘要；必须随请求一起下发。
+  function contextPayload() {
+    const ctx = activeContext || playContext();
+    if (!ctx) return null;
+    return {
+      tmdbId: ctx.tmdbId || '',
+      mediaType: ctx.mediaType || '',
+      seasonId: ctx.seasonId ?? '',
+      episodeId: ctx.episodeId ?? '',
+      title: ctx.title || '',
+      year: ctx.year || '',
+      streamUrl: ctx.streamUrl || '',
+    };
   }
 
   function videoSrc() {
@@ -592,7 +720,10 @@ export function initMovySubtitle(deps = {}) {
   }
 
   function resetForSwitch() {
-    loadToken += 1;
+    invalidateInFlight();
+    translateQueue.length = 0;
+    translateFailed.clear();
+    translating = new Set();
     tracks = []; activeTrack = null; cues = []; cueIndex = -1; shownKey = ''; diag.cues = 0;
     onlineTracks = []; onlineBusy = false; onlineTried = false;
     nativeLastIndex = -2;
@@ -620,9 +751,14 @@ export function initMovySubtitle(deps = {}) {
   }
 
   function openFor(context) {
+    // 每次进入播放上下文都是一次“重新打开”：无条件作废所有在途请求，
+    // 保证上一轮（即使 key 相同）的发现/在线/加载结果不会落到这次状态上。
+    invalidateInFlight();
     diag.opens += 1;
     openFor.lastAt = Number((context && context.at) || 0);
     currentKey = contextKey(context);
+    activeContextKey = currentKey;
+    activeContext = context || null;
     currentSrc = videoSrc();
     tracks = normalizeTracks(context && context.subtitles);
     onlineTracks = []; onlineTried = false; onlineBusy = false;
@@ -675,8 +811,8 @@ export function initMovySubtitle(deps = {}) {
     const key = String(event.key || '').toLowerCase();
     if (key === 'v') {
       event.preventDefault();
-      if (activeTrack) chooseTrack('');
-      else { const target = pickDefaultTrack(tracks); if (target) chooseTrack(encodeURIComponent(target.url)); }
+      if (activeTrack) userChooseTrack('');
+      else { const target = pickDefaultTrack(tracks); if (target) userChooseTrack(encodeURIComponent(target.url)); }
       return;
     }
     if (key === ',') { event.preventDefault(); settings.offset = Number((settings.offset - 0.1).toFixed(1)); persist(); tick(true); }
@@ -787,8 +923,10 @@ export function initMovySubtitle(deps = {}) {
     const api = bridge();
     if (!api || typeof api.subParse !== 'function') return;
     try {
+      const epoch = contextEpoch;
       const text = decodeFileBytes(await file.arrayBuffer());
       const result = await api.subParse({ text });
+      if (!isCurrentEpoch(epoch)) return;
       if (result && result.ok) await applyLocalCues(result.cues, file.name);
       else diag.errors.push('拖入字幕解析失败');
     } catch (error) { diag.errors.push('drop: ' + String((error && error.message) || error)); }
@@ -800,7 +938,10 @@ export function initMovySubtitle(deps = {}) {
   const observer = new MutationObserver(() => {
     if (!modalOpen()) {
       if (panel && !panel.classList.contains('is-hidden')) panel.classList.add('is-hidden');
-      if (cues.length || activeTrack || tracks.length) { resetForSwitch(); currentKey = ''; currentSrc = ''; }
+      if (cues.length || activeTrack || tracks.length || activeContextKey) {
+        resetForSwitch();
+        currentKey = ''; currentSrc = ''; activeContextKey = ''; activeContext = null;
+      }
       return;
     }
     if (modalOpen() && watchSwitch()) return;
@@ -814,6 +955,31 @@ export function initMovySubtitle(deps = {}) {
     }
   });
   observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+
+  // 仅在显式传入 testHooks 时暴露内部状态，供本地测试断言使用；生产环境不暴露。
+  if (deps.testHooks) {
+    deps.testHooks.state = () => ({
+      tracks: tracks.slice(),
+      onlineTracks: onlineTracks.slice(),
+      activeTrack,
+      cues: cues.slice(),
+      displayed: primary ? primary.textContent : '',
+      secondary: secondary ? secondary.textContent : '',
+      contextKey: activeContextKey,
+      epoch: contextEpoch,
+      onlineBusy,
+      onlineTried,
+    });
+    deps.testHooks.openFor = openFor;
+    deps.testHooks.searchOnline = (context) => searchOnline(context);
+    deps.testHooks.chooseTrack = (url) => userChooseTrack(encodeURIComponent(url));
+    deps.testHooks.applyLocalCues = (list, name) => applyLocalCues(list, name);
+    deps.testHooks.resetForSwitch = resetForSwitch;
+    deps.testHooks.watchSwitch = watchSwitch;
+    deps.testHooks.setContext = (context) => {
+      window.localStorage.setItem(PLAYCTX_KEY, JSON.stringify({ at: Date.now(), ...context }));
+    };
+  }
 
   return () => { observer.disconnect(); window.clearInterval(tickTimer); };
 }

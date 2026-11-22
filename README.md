@@ -95,14 +95,31 @@ direct
 CineFlow/
 ├─ build/                # 应用图标等构建资源
 ├─ electron/             # Electron 主进程与 preload
-├─ scripts/              
+├─ scripts/              # 开发/测试脚本
 ├─ src/
+├─ tests/                # 字幕状态一致性等本地测试
 ├─ index.html
 ├─ package.json
 ├─ vite.config.mjs
 |--申请API.md
 └─ README.md
 ```
+
+## 测试
+
+字幕层与主进程字幕服务可在纯 Node 环境下运行，无需安装 Electron / Vite 依赖：
+
+```bash
+npm test
+```
+
+覆盖的关键路径：
+
+- 手动切轨后新字幕正确显示；
+- 切集时旧请求晚到不覆盖新状态；
+- 本地拖入字幕后旧在线结果不生效；
+- 自动发现 / 在线搜索晚到时不写入 tracks、onlineTracks，也不覆盖 activeTrack；
+- 主进程 cue 缓存（内存 + 磁盘）与在线搜索缓存按播放上下文隔离，同一 URL 不跨影片/跨集命中。
 
 Proudly supported by the LINUX DO community.
 

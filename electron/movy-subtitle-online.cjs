@@ -248,21 +248,41 @@ async function fetchBilibiliJson(url) {
     .filter((line) => line.t && line.e > line.s);
 }
 
-function createOnlineSubtitles({ log } = {}) {
+function contextIdentity(context) {
+  if (!context || typeof context !== 'object') return '';
+  const parts = [
+    context.tmdbId ?? context.filmId ?? context.movieId ?? '',
+    context.mediaType ?? '',
+    context.seasonId ?? context.season ?? '',
+    context.episodeId ?? context.episode ?? '',
+    context.title ?? '',
+    context.year ?? '',
+    context.streamUrl ?? '',
+  ].map((item) => String(item == null ? '' : item));
+  return parts.join('|');
+}
+
+function createOnlineSubtitles({ log, subf2mSearch = searchSubf2m, bilibiliSearch = searchBilibili } = {}) {
   const cache = new Map();
+  const CACHE_MAX = 64;
 
   async function search(context = {}) {
-    const key = crypto.createHash('sha1').update(JSON.stringify(context)).digest('hex').slice(0, 16);
-    if (cache.has(key)) return cache.get(key);
+    // 缓存键只依据规范化的播放上下文身份；season/seasonId 之类的别名写法会归一为同一份缓存。
+    const identity = contextIdentity(context);
+    const key = crypto.createHash('sha1').update(identity).digest('hex').slice(0, 16);
+    if (cache.has(key)) {
+      const hit = cache.get(key);
+      return { ...hit, cached: true };
+    }
     const started = Date.now();
     let tracks = [];
-    try { tracks = await searchSubf2m(context, log); } catch (error) { log && log('在线字幕 subf2m 失败: ' + ((error && error.message) || error)); }
+    try { tracks = await subf2mSearch(context, log); } catch (error) { log && log('在线字幕 subf2m 失败: ' + ((error && error.message) || error)); }
     if (!tracks.length) {
-      try { tracks = await searchBilibili(context); } catch (error) { log && log('在线字幕 B 站失败: ' + ((error && error.message) || error)); }
+      try { tracks = await bilibiliSearch(context); } catch (error) { log && log('在线字幕 B 站失败: ' + ((error && error.message) || error)); }
     }
-    const result = { ok: tracks.length > 0, tracks, ms: Date.now() - started };
+    const result = { ok: tracks.length > 0, tracks, ms: Date.now() - started, contextKey: identity };
     cache.set(key, result);
-    if (cache.size > 40) cache.delete(cache.keys().next().value);
+    if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
     log && log('在线字幕：' + (tracks.length ? tracks.length + ' 条 · ' + result.ms + 'ms' : '无匹配'));
     return result;
   }

@@ -127,7 +127,7 @@ async function readSubtitleFile(file) {
   return { ok: cues.length > 0, cues, name: require('node:path').basename(file), error: cues.length ? '' : '没有解析出字幕' };
 }
 
-function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, channels = {} } = {}) {
+function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, channels = {}, fetchTextImpl = null, onlineImpl = null } = {}) {
   const names = {
     cues: channels.cues || 'cf:m2:movy-sub-cues',
     translate: channels.translate || 'cf:m2:movy-sub-translate',
@@ -139,12 +139,41 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     stats: channels.stats || 'cf:m2:movy-sub-stats',
   };
   const dir = userDataDir ? path.join(userDataDir, 'movy-subs') : '';
-  const online = require('./movy-subtitle-online.cjs').createOnlineSubtitles({ log });
+  const online = onlineImpl || require('./movy-subtitle-online.cjs').createOnlineSubtitles({ log });
   const cueCache = new Map();
+  const CUE_CACHE_MAX = 160;
   const translations = new Map();
   let translateInflight = 0;
   const translateQueue = [];
   let diskLoaded = false;
+
+  // 播放上下文身份：同一 URL 的字幕/搜索结果在不同影片、不同集之间必须分开。
+  function contextIdentity(context) {
+    if (!context || typeof context !== 'object') return '';
+    const parts = [
+      context.tmdbId ?? context.filmId ?? context.movieId ?? '',
+      context.mediaType ?? '',
+      context.seasonId ?? context.season ?? '',
+      context.episodeId ?? context.episode ?? '',
+      context.streamUrl ?? '',
+      context.title ?? '',
+    ];
+    const text = parts.map((item) => String(item == null ? '' : item)).join('|');
+    return /^\|+$/.test(text) ? '' : text;
+  }
+
+  function scopedKey(url, context) {
+    const identity = contextIdentity(context);
+    return identity ? identity + '::' + url : String(url || '');
+  }
+
+  function cacheSet(key, value) {
+    cueCache.set(key, value);
+    if (cueCache.size > CUE_CACHE_MAX) {
+      const oldest = cueCache.keys().next().value;
+      if (oldest !== undefined) cueCache.delete(oldest);
+    }
+  }
 
   function sha1(value) { return crypto.createHash('sha1').update(String(value)).digest('hex'); }
 
@@ -169,6 +198,7 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
   }
 
   async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS) {
+    if (typeof fetchTextImpl === 'function') return fetchTextImpl(url, timeoutMs);
     const list = sessionList();
     if (!list.length) throw new Error('no-fetch');
     const headers = { 'user-agent': UA, referer: REFERER, origin: ORIGIN, accept: '*/*' };
@@ -184,10 +214,12 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     throw lastError || new Error('fetch-failed');
   }
 
-  function diskCuePath(url) { return dir ? path.join(dir, sha1(url) + '.json') : ''; }
+  // 磁盘缓存也按播放上下文隔离：不同影片/不同集即使共用同一个字幕 URL，
+  // 也不会互相命中对方的 cue。context 为空时退化为按 URL 缓存。
+  function diskCuePath(key) { return dir ? path.join(dir, sha1(key) + '.json') : ''; }
 
-  function readCueDisk(url) {
-    const file = diskCuePath(url);
+  function readCueDisk(key) {
+    const file = diskCuePath(key);
     if (!file) return null;
     try {
       const raw = fsp.readFileSync(file, 'utf8');
@@ -197,8 +229,8 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     } catch { return null; }
   }
 
-  function writeCueDisk(url, payload) {
-    const file = diskCuePath(url);
+  function writeCueDisk(key, payload) {
+    const file = diskCuePath(key);
     if (!file || !ensureDir()) return;
     try { fsp.writeFileSync(file, JSON.stringify(payload), 'utf8'); } catch {  }
   }
@@ -411,25 +443,26 @@ function createMovySubtitle({ log = () => {}, userDataDir = '', ipcMain = null, 
     return { ok: found.length > 0, tracks: found, from: found.length ? 'probe' : 'none' };
   }
 
-  async function fetchCues({ url, lang } = {}) {
+  async function fetchCues({ url, lang, context } = {}) {
     const started = Date.now();
     const target = String(url || '');
     if (!/^https?:\/\//i.test(target)) return { ok: false, error: '地址无效', cues: [] };
-    const mem = cueCache.get(target);
+    const key = scopedKey(target, context);
+    const mem = cueCache.get(key);
     if (mem && Array.isArray(mem.cues) && mem.cues.length) {
       return { ok: true, cues: mem.cues, cached: 'memory', lang: lang || mem.lang || '', ms: Date.now() - started };
     }
-    const disk = readCueDisk(target);
+    const disk = readCueDisk(key);
     if (disk) {
-      cueCache.set(target, { cues: disk.cues, lang: disk.lang });
+      cacheSet(key, { cues: disk.cues, lang: disk.lang });
       return { ok: true, cues: disk.cues, cached: 'disk', lang: lang || disk.lang || '', ms: Date.now() - started };
     }
     try {
       const text = await fetchText(target);
       const cues = parseCues(text);
       if (!cues.length) return { ok: false, error: '字幕为空', cues: [] };
-      cueCache.set(target, { cues, lang: lang || '' });
-      writeCueDisk(target, { lang: lang || '', savedAt: Date.now(), cues });
+      cacheSet(key, { cues, lang: lang || '' });
+      writeCueDisk(key, { lang: lang || '', savedAt: Date.now(), cues, url: target });
       log('movy 字幕 ' + cues.length + ' 条 · ' + (Date.now() - started) + 'ms');
       return { ok: true, cues, cached: 'network', lang: lang || '', ms: Date.now() - started };
     } catch (error) {
