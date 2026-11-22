@@ -1,14 +1,11 @@
 import { atom } from 'jotai';
 import { type ScaleName } from '../lib/audio';
+import type { Level } from '../lib/level';
 
 // --- Types ---
 export type Screen = 'levelSelect' | 'game' | 'result';
 
-export interface Level {
-  name: string;
-  patterns: number[][];
-  ranks: number[];
-}
+export type { Level };
 
 export interface LevelIndexInfo {
   id: number;
@@ -58,19 +55,21 @@ export const currentLevelAtom = atom(async (get) => {
   return levelData;
 });
 
-// Represents the player's current key presses [A, S, D, F, Space, J, K, L, ;]
-export const playerStateAtom = atom<number[]>([0, 0, 0, 0, 0, 0, 0, 0, 0]);
-
-// The current step/pattern the player is on within a level
-export const currentStepAtom = atom<number>(0);
-
-// Tracks the start time of the game (in milliseconds)
-export const startTimeAtom = atom<number>(0);
+/**
+ * The level data of the session that is currently mounted.
+ *
+ * This is published by the game session *after* it has fully reset the
+ * per-level state, so the UI never renders one level's dots/steps with
+ * another level's data. It intentionally remains readable on the result
+ * screen (which needs the level name/ranks) even though the session is gone.
+ */
+export const levelDataAtom = atom<Level | null>(null);
 
 // Holds the final time when a level is completed
 export const finalTimeAtom = atom<number>(0);
 
-// A derived atom to check if the game is currently active
-export const gameActiveAtom = atom(
-  (get) => get(screenAtom) === 'game' && get(currentLevelAtom) !== null
-);
+/**
+ * Incrementing this requests the mounted game session to restart in place
+ * (the in-game "Restart Level" button).
+ */
+export const restartTokenAtom = atom<number>(0);

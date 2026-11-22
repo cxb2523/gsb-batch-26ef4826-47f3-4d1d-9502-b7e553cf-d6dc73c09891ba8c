@@ -1,33 +1,77 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useSyncExternalStore } from 'react';
+import { gameSession } from '../lib/sessionStore';
+import { TouchInputController, type TouchPoint } from '../lib/touchInput';
+import { audioManager } from '../lib/audio';
+import { useGameSession } from '../hooks/useGameSession';
 
-const KEY_MAP: Record<number, string> = {
-  0: 'KeyA', 1: 'KeyS', 2: 'KeyD', 3: 'KeyF',
-  4: 'KeyJ', 5: 'KeyK', 6: 'KeyL', 7: 'Semicolon',
-  8: 'Space',
-};
-
-function dispatchKeyEvent(code: string, type: 'keydown' | 'keyup') {
-  window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true }));
+function toPoints(e: TouchEvent): TouchPoint[] {
+  return Array.from(e.changedTouches).map((touch) => ({
+    identifier: touch.identifier,
+    x: touch.clientX,
+    y: touch.clientY,
+  }));
 }
 
+/**
+ * Full-screen touch surface.
+ *
+ * This is the touch input path. It does not synthesise KeyboardEvents:
+ * `TouchInputController` reports presses/releases straight to the shared
+ * `gameSession` with one source id per touch point, so touch gets the same
+ * "already pressed" dedup as the keyboard. Sliding between zones releases the
+ * old note before pressing the new one; leaving the board, `touchcancel`,
+ * a level switch and unmount all release the held note.
+ */
 function TouchOverlay() {
-  const [pressedZones, setPressedZones] = useState(Array(9).fill(false));
+  const { generation } = useGameSession();
   const zoneRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const touchToZoneMap = useRef<Map<number, number>>(new Map());
   const overlayRef = useRef<HTMLDivElement>(null);
+  const [controller] = useState(
+    () =>
+      new TouchInputController({
+        press: (code, source) => gameSession.press(code, source),
+        release: (code, source) => gameSession.release(code, source),
+        startAudio: () => {
+          if (!audioManager.isInitialized()) {
+            void audioManager.start().catch(() => {
+              // Audio is best-effort; gameplay continues silently on failure.
+            });
+          }
+        },
+        getZoneAt: (x, y) => {
+          for (let i = 0; i < zoneRefs.current.length; i++) {
+            const node = zoneRefs.current[i];
+            if (!node) continue;
+            const rect = node.getBoundingClientRect();
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+              return i;
+            }
+          }
+          return -1;
+        },
+      }),
+  );
 
-  const getZoneIndexFromCoordinates = useCallback((x: number, y: number) => {
-    for (let i = 0; i < zoneRefs.current.length; i++) {
-      const node = zoneRefs.current[i];
-      if (node) {
-        const rect = node.getBoundingClientRect();
-        if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-          return i;
-        }
-      }
-    }
-    return -1;
-  }, []);
+  // Zone highlight state is derived from the controller so it always matches
+  // which notes are actually held (including after a moved-out/cancelled touch).
+  const subscribe = useCallback(
+    (listener: () => void) => controller.onChange(listener),
+    [controller],
+  );
+  const pressedZones = useSyncExternalStore(
+    subscribe,
+    () => controller.zonesSnapshot,
+    () => controller.zonesSnapshot,
+  ) as boolean[];
+
+  // A level generation change means the session cleared all held keys; drop
+  // any touch bookkeeping so the overlay cannot reference a stale note.
+  useEffect(() => {
+    controller.releaseAll();
+    return () => {
+      controller.releaseAll();
+    };
+  }, [controller, generation]);
 
   useEffect(() => {
     const overlayNode = overlayRef.current;
@@ -35,63 +79,15 @@ function TouchOverlay() {
 
     const handleTouchStart = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const zoneIndex = getZoneIndexFromCoordinates(touch.clientX, touch.clientY);
-          if (zoneIndex !== -1 && !touchToZoneMap.current.has(touch.identifier)) {
-            touchToZoneMap.current.set(touch.identifier, zoneIndex);
-            dispatchKeyEvent(KEY_MAP[zoneIndex], 'keydown');
-            nextPressed[zoneIndex] = true;
-          }
-        }
-        return nextPressed;
-      });
+      controller.touchStart(toPoints(e));
     };
-
     const handleTouchMove = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const oldZoneIndex = touchToZoneMap.current.get(touch.identifier);
-          const newZoneIndex = getZoneIndexFromCoordinates(touch.clientX, touch.clientY);
-
-          if (oldZoneIndex !== newZoneIndex) {
-            // Release the old key
-            if (oldZoneIndex !== undefined) {
-              dispatchKeyEvent(KEY_MAP[oldZoneIndex], 'keyup');
-              nextPressed[oldZoneIndex] = false;
-            }
-            // Press the new key
-            if (newZoneIndex !== -1) {
-              touchToZoneMap.current.set(touch.identifier, newZoneIndex);
-              dispatchKeyEvent(KEY_MAP[newZoneIndex], 'keydown');
-              nextPressed[newZoneIndex] = true;
-            } else {
-              // Finger moved out of any valid zone
-              touchToZoneMap.current.delete(touch.identifier);
-            }
-          }
-        }
-        return nextPressed;
-      });
+      controller.touchMove(toPoints(e));
     };
-
     const handleTouchEndOrCancel = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const zoneIndex = touchToZoneMap.current.get(touch.identifier);
-          if (zoneIndex !== undefined) {
-            touchToZoneMap.current.delete(touch.identifier);
-            dispatchKeyEvent(KEY_MAP[zoneIndex], 'keyup');
-            nextPressed[zoneIndex] = false;
-          }
-        }
-        return nextPressed;
-      });
+      controller.touchEnd(toPoints(e));
     };
 
     overlayNode.addEventListener('touchstart', handleTouchStart as EventListener, { passive: false });
@@ -105,7 +101,7 @@ function TouchOverlay() {
       overlayNode.removeEventListener('touchend', handleTouchEndOrCancel as EventListener);
       overlayNode.removeEventListener('touchcancel', handleTouchEndOrCancel as EventListener);
     };
-  }, [getZoneIndexFromCoordinates]);
+  }, [controller]);
 
   return (
     <div

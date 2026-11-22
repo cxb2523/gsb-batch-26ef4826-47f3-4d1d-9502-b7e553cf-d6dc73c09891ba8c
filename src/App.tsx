@@ -1,22 +1,23 @@
-import { useAtom } from 'jotai';
+import { useAtom, useSetAtom } from 'jotai';
 import { RefreshCw, Home, Maximize, Minimize } from 'lucide-react';
-import { audioManager } from './lib/audio';
-import { screenAtom } from './atoms/gameAtoms';
+import { screenAtom, selectedLevelInfoAtom, currentLevelIndexAtom, finalTimeAtom } from './atoms/gameAtoms';
 import GameContainer from './components/GameContainer';
 import { useGameLogic } from './hooks/useGameLogic';
-import { useGlobalAudio } from './hooks/useGlobalAudio';
 import { useEffect, useState } from 'react';
 import TouchOverlay from './components/TouchOverlay';
 import { useScreenOrientation } from './hooks/useScreenOrientation';
 import { useFullscreen } from './hooks/useFullscreen';
+import { gameSession } from './lib/sessionStore';
 
 const isTouchDevice = () => 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 function App() {
-  useGlobalAudio(); // Mount the global audio handler
   const { isFullscreen, toggleFullscreen } = useFullscreen();
   const { lockOrientation, unlockOrientation } = useScreenOrientation();
   const [screen, setScreen] = useAtom(screenAtom);
+  const setSelectedLevelInfo = useSetAtom(selectedLevelInfoAtom);
+  const setCurrentLevelIndex = useSetAtom(currentLevelIndexAtom);
+  const setFinalTime = useSetAtom(finalTimeAtom);
   const { resetGameState } = useGameLogic();
   const [showTouchOverlay, setShowTouchOverlay] = useState(false);
 
@@ -25,7 +26,12 @@ function App() {
   }, []);
 
   const handleBackToMenu = () => {
-    audioManager.releaseAll();
+    // End the level session (releases notes, clears keys/step/timer) before
+    // the game screen unmounts.
+    gameSession.stop();
+    setSelectedLevelInfo(null);
+    setCurrentLevelIndex(-1);
+    setFinalTime(0);
     unlockOrientation();
     setScreen('levelSelect');
   };

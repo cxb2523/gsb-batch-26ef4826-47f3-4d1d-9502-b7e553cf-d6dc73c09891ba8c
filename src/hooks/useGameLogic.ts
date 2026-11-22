@@ -1,135 +1,71 @@
 import { useEffect, useCallback, useRef } from 'react';
-import { useAtom, useSetAtom, useAtomValue } from 'jotai';
-import {
-  screenAtom,
-  currentLevelAtom,
-  playerStateAtom,
-  currentStepAtom,
-  startTimeAtom,
-  finalTimeAtom,
-  gameActiveAtom,
-} from '../atoms/gameAtoms';
+import { useAtom, useSetAtom } from 'jotai';
+import { restartTokenAtom, screenAtom } from '../atoms/gameAtoms';
 import { audioManager } from '../lib/audio';
+import { gameSession } from '../lib/sessionStore';
+import { KeyboardInputController } from '../lib/keyboardInput';
 
-const CODE_MAP: Record<string, { index: number, key: string }> = {
-  'KeyA': { index: 0, key: 'a' },
-  'KeyS': { index: 1, key: 's' },
-  'KeyD': { index: 2, key: 'd' },
-  'KeyF': { index: 3, key: 'f' },
-  'Space': { index: 4, key: ' ' },
-  'KeyJ': { index: 5, key: 'j' },
-  'KeyK': { index: 6, key: 'k' },
-  'KeyL': { index: 7, key: 'l' },
-  'Semicolon': { index: 8, key: ';' },
-};
-
+/**
+ * Mounts the single keyboard input path for the whole app.
+ * All dedup / auto-repeat / cross-level key-hold handling lives in
+ * `KeyboardInputController`, which is shared with the test suite.
+ */
 export function useGameLogic() {
-  const pressedKeys = useRef(new Set<string>());
-  const setScreen = useSetAtom(screenAtom);
-  const currentLevel = useAtomValue(currentLevelAtom);
-  const setPlayerState = useSetAtom(playerStateAtom);
-  const [currentStep, setCurrentStep] = useAtom(currentStepAtom);
-  const [startTime, setStartTime] = useAtom(startTimeAtom);
-  const setFinalTime = useSetAtom(finalTimeAtom);
-  const gameActive = useAtomValue(gameActiveAtom);
+  const setRestartToken = useSetAtom(restartTokenAtom);
+  const [screen] = useAtom(screenAtom);
+  const screenRef = useRef(screen);
 
-  // Use refs to hold the latest state for use in event handlers
-  // This avoids re-creating handlers on every state change
-  const stateRef = useRef({
-    currentLevel,
-    currentStep,
-    startTime,
-    gameActive,
-  });
+  // Keep the latest screen without re-registering listeners (which would
+  // drop the physically-held key set on every screen change).
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
 
   useEffect(() => {
-    stateRef.current = {
-      currentLevel,
-      currentStep,
-      startTime,
-      gameActive,
-    };
-  }, [currentLevel, currentStep, startTime, gameActive]);
-
-  const resetGameState = useCallback(() => {
-    audioManager.releaseAll();
-    pressedKeys.current.clear();
-    setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    setCurrentStep(0);
-    setStartTime(0);
-  }, [setPlayerState, setCurrentStep, setStartTime]);
-
-  const checkWinCondition = useCallback((currentState: number[]) => {
-    const { currentLevel: level, currentStep: step, startTime: time } = stateRef.current;
-    if (!level) return;
-
-    const targetPattern = level.patterns[step];
-    const match = currentState.every((val, index) => val === targetPattern[index]);
-
-    if (match) {
-      if (step < level.patterns.length - 1) {
-        setCurrentStep(step + 1);
-      } else {
-        audioManager.releaseAll();
-        pressedKeys.current.clear();
-        setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        const endTime = Date.now();
-        setFinalTime(endTime - time);
-        setScreen('result');
-      }
-    }
-  }, [setCurrentStep, setFinalTime, setScreen, setPlayerState]);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined || !stateRef.current.gameActive || pressedKeys.current.has(e.code)) return;
-
-      e.preventDefault();
-      pressedKeys.current.add(e.code);
-
-      setStartTime((prevStartTime) => {
-        if (prevStartTime === 0) {
-          return Date.now();
+    const controller = new KeyboardInputController({
+      isLevelActive: () => gameSession.getSnapshot().active,
+      isMenu: () => screenRef.current === 'levelSelect',
+      press: (code) => gameSession.press(code, 'keyboard'),
+      release: (code) => gameSession.release(code, 'keyboard'),
+      startAudio: () => {
+        if (!audioManager.isInitialized()) {
+          void audioManager.start().catch(() => {
+            // Audio is best-effort; gameplay continues silently on failure.
+          });
         }
-        return prevStartTime;
-      });
-      
-      setPlayerState(prevPlayerState => {
-        const newState = [...prevPlayerState];
-        newState[keyInfo.index] = 1;
-        checkWinCondition(newState);
-        return newState;
-      });
-    };
+      },
+      playMenuNote: (key) => audioManager.playNote(key),
+      releaseMenuNote: (key) => audioManager.releaseNote(key),
+      releaseAllHeld: () => {
+        gameSession.releaseSource('keyboard');
+        audioManager.releaseAll();
+      },
+    });
 
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined || !stateRef.current.gameActive) return;
-
-      e.preventDefault();
-      pressedKeys.current.delete(e.code);
-
-      setPlayerState(prevPlayerState => {
-        const newState = [...prevPlayerState];
-        newState[keyInfo.index] = 0;
-        checkWinCondition(newState);
-        return newState;
-      });
+    const handleKeyDown = (e: KeyboardEvent) => controller.handleKeyDown(e);
+    const handleKeyUp = (e: KeyboardEvent) => controller.handleKeyUp(e);
+    const handleBlur = () => controller.handleBlur();
+    const handleVisibility = () => {
+      if (document.hidden) controller.handleBlur();
     };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibility);
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      controller.handleBlur();
     };
-  }, [checkWinCondition, setPlayerState, setStartTime]); // Dependencies are now stable
+  }, []);
 
-  useEffect(() => {
-    resetGameState();
-  }, [currentLevel, resetGameState]);
+  const resetGameState = useCallback(() => {
+    setRestartToken((token) => token + 1);
+  }, [setRestartToken]);
 
   return { resetGameState };
 }

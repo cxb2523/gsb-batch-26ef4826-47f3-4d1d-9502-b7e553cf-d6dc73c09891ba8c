@@ -1,10 +1,8 @@
 import * as Tone from 'tone';
+import { AudioEngine, type AudioBackend } from './audioEngine';
+import { KEY_BINDINGS } from './keymap';
 
-let polySynth: Tone.PolySynth;
-let reverb: Tone.Reverb;
-let audioInitialized = false;
-
-const KEYS = ['a', 's', 'd', 'f', ' ', 'j', 'k', 'l', ';'];
+const KEYS = KEY_BINDINGS.map((binding) => binding.key);
 
 export const scales = {
   'C Major Chord': ['C2', 'E2', 'G2', 'A2', 'C3', 'G3', 'A3', 'C4', 'E4'],
@@ -29,20 +27,43 @@ function buildScaleMap(scaleName: ScaleName): Record<string, string> {
 
 currentScale = buildScaleMap('C Major Scale');
 
-async function initializeAudio() {
-  if (audioInitialized) return;
-  
-  await Tone.start();
-  reverb = new Tone.Reverb(0.7).toDestination();
-  polySynth = new Tone.PolySynth(Tone.Synth, {
-    volume: 10,
-  }).connect(reverb);
-  audioInitialized = true;
-  console.log('Audio context started and initialized.');
+/**
+ * Lazily creates the Tone graph inside the first `start()` call, which runs
+ * only after `Tone.start()` has resumed the AudioContext. Nodes must not be
+ * constructed before the context is running.
+ */
+class ToneBackend implements AudioBackend {
+  private polySynth: Tone.PolySynth | null = null;
+  private reverb: Tone.Reverb | null = null;
+
+  async start(): Promise<void> {
+    await Tone.start();
+    // Re-check: another caller may have completed the graph while we awaited.
+    if (this.polySynth) return;
+    this.reverb = new Tone.Reverb(0.7).toDestination();
+    this.polySynth = new Tone.PolySynth(Tone.Synth, {
+      volume: 10,
+    }).connect(this.reverb);
+  }
+
+  triggerAttack(note: string): void {
+    this.polySynth?.triggerAttack(note, Tone.now());
+  }
+
+  triggerRelease(note: string): void {
+    this.polySynth?.triggerRelease(note, Tone.now());
+  }
+
+  releaseAll(): void {
+    this.polySynth?.releaseAll();
+  }
 }
 
+const engine = new AudioEngine(new ToneBackend(), (key) => currentScale[key]);
+
 export const audioManager = {
-  start: initializeAudio,
+  /** Idempotent; concurrent calls share one Tone.start()/graph setup. */
+  start: () => engine.ensureStarted(),
   setScale: (scaleName: ScaleName) => {
     currentScale = buildScaleMap(scaleName);
   },
@@ -53,23 +74,15 @@ export const audioManager = {
     });
     currentScale = scaleMap;
   },
-  playNote: (key: string) => {
-    if (!audioInitialized) return;
-    const note = currentScale[key];
-    if (note) {
-      polySynth.triggerAttack(note, Tone.now());
-    }
-  },
-  releaseNote: (key: string) => {
-    if (!audioInitialized) return;
-    const note = currentScale[key];
-    if (note) {
-      polySynth.triggerRelease(note, Tone.now());
-    }
-  },
-  releaseAll: () => {
-    if (!audioInitialized) return;
-    polySynth.releaseAll();
-  },
-  isInitialized: () => audioInitialized,
+  playNote: (key: string) => engine.playNote(key),
+  releaseNote: (key: string) => engine.releaseNote(key),
+  releaseAll: () => engine.releaseAll(),
+  isInitialized: () => engine.isInitialized(),
+  /**
+   * Binds audio to the level lifecycle: starts a new session and silences
+   * every note from the previous one. Returns the new session id.
+   */
+  beginLevelSession: () => engine.beginSession(),
+  endLevelSession: () => engine.endSession(),
+  getSessionId: () => engine.getSessionId(),
 };

@@ -1,5 +1,5 @@
-import { Suspense, useState } from 'react';
-import { useAtom, useSetAtom, useAtomValue } from 'jotai';
+import { Suspense } from 'react';
+import { useSetAtom } from 'jotai';
 import {
   screenAtom,
   levelIndexAtom,
@@ -7,40 +7,43 @@ import {
   scaleAtom,
   type LevelIndexInfo,
   currentLevelIndexAtom,
-  playerStateAtom,
-  currentStepAtom,
-  startTimeAtom,
+  finalTimeAtom,
 } from '../atoms/gameAtoms';
 import { audioManager, scales, type ScaleName } from '../lib/audio';
-import { useMenuKeyboard } from '../hooks/useMenuKeyboard';
+import { gameSession } from '../lib/sessionStore';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useScreenOrientation } from '../hooks/useScreenOrientation';
+import { useAtom, useAtomValue } from 'jotai';
+import { useState } from 'react';
 
 function LevelList() {
   const levelIndex = useAtomValue(levelIndexAtom);
   const setScreen = useSetAtom(screenAtom);
   const setSelectedLevelInfo = useSetAtom(selectedLevelInfoAtom);
   const setCurrentLevelIndex = useSetAtom(currentLevelIndexAtom);
-  const setPlayerState = useSetAtom(playerStateAtom);
-  const setCurrentStep = useSetAtom(currentStepAtom);
-  const setStartTime = useSetAtom(startTimeAtom);
+  const setFinalTime = useSetAtom(finalTimeAtom);
   const { enterFullscreen } = useFullscreen();
   const { lockOrientation } = useScreenOrientation();
 
   const handleLevelSelect = async (levelInfo: LevelIndexInfo, index: number) => {
-    // Start audio context on first user interaction
+    // Leaving whatever screen we were on: make sure no old session sounds.
+    gameSession.stop();
+    setFinalTime(0);
+
+    // Kick off the AudioContext inside this click gesture. Audio is
+    // best-effort and must never block navigation: if resume() is pending or
+    // rejects, the level still opens (and plays silently).
     if (!audioManager.isInitialized()) {
-      await audioManager.start();
+      void audioManager.start().catch(() => {
+        // Audio is best-effort.
+      });
     }
 
     await enterFullscreen();
     await lockOrientation('landscape');
-    
-    // Reset game state before starting a new level
-    setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    setCurrentStep(0);
-    setStartTime(0);
-    
+
+    // The game screen begins the fresh level session once the level loads;
+    // that is where keys/step/timer are reset and the audio session is bound.
     setSelectedLevelInfo(levelInfo);
     setCurrentLevelIndex(index);
     setScreen('game');
@@ -62,7 +65,6 @@ function LevelList() {
 }
 
 function LevelSelectScreen() {
-  useMenuKeyboard(); // Enable keyboard sounds on this screen
   const [currentScale, setCurrentScale] = useAtom(scaleAtom);
   const [customScaleInput, setCustomScaleInput] = useState('C2 D2 E2 G2 A2 C3 D3 E3 G3');
   const [showCustomInput, setShowCustomInput] = useState(false);
@@ -82,7 +84,7 @@ function LevelSelectScreen() {
       alert('Please enter exactly 9 notes separated by spaces.');
     }
   };
-  
+
   const handleCustomButtonClick = () => {
     setShowCustomInput(!showCustomInput);
     if (currentScale !== 'Custom') {
@@ -93,7 +95,7 @@ function LevelSelectScreen() {
   return (
     <section className="w-[90%] max-w-3xl p-5 rounded-2xl bg-black/10 backdrop-blur-lg border border-white/20">
       <h1 className="text-center font-black text-4xl mb-6">Finger Dance</h1>
-      
+
       <div className="mb-6">
         <label className="block text-sm font-bold mb-3 text-center">
           SELECT MUSICAL SCALE
