@@ -15,6 +15,9 @@ export let updateParamsInCode = (soundId, toneId) => {
   let sound = Sounds.findOne(soundId)
   let tone = Tones.findOne(toneId)
 
+  // the sound or its param record may be gone (deleted / muted / re-evaluated)
+  if (!sound || !tone || !tone.options || !tone.options.vars) return false
+
   let values = tone.options.vars.map(v => `${v[0]} - ${v[1][v[0]]} - ${ v[1].persistedValue ? v[1].persistedValue : ''}`)
   console.log(values)
 

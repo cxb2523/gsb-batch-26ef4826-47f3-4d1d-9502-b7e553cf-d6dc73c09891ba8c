@@ -4,6 +4,7 @@ import { check } from 'meteor/check';
 import { random, filter, uniq, each } from 'lodash';
 
 import {Sounds} from './sounds';
+import songCleanup from './songCleanup';
 
 export const Songs = new Mongo.Collection('songs');
 
@@ -49,16 +50,13 @@ Meteor.methods({
     Songs.update(song._id, { $set: { selectedSound: soundId } })
   },
 
-  // clean all songs from possible orphans id
+  // clean all songs from possible orphans id (sounds list + selectedSound)
   'songs.cleanSoundsSongs' () {
     let songs = Songs.find().fetch()
 
     each(songs, song => {
-      Songs.update(song._id, { $set: { sounds: filter(song.sounds, sid => {
-          // if the sound still exist keep it, otherwise remove it
-          return Sounds.find(sid).fetch().length > 0
-        })
-      }})
+      let cleaned = songCleanup.cleanSongDoc(song, sid => Sounds.find(sid).count() > 0)
+      Songs.update(song._id, { $set: cleaned })
     })
   }
 });

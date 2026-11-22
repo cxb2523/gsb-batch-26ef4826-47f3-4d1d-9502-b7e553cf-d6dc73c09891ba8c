@@ -17,6 +17,8 @@ export default class MixTable extends React.Component {
 
   changeValue = (tone, i, value) => {
 
+    if (!tone.options || !tone.options.vars || !tone.options.vars[i]) return
+
     let nameProp = tone.options.vars[i][0]
     if (isNumber(tone.options.vars[i][1].persistedValue)) tone.options.vars[i][1].persistedValue = value
     else tone.options.vars[i][1][nameProp] = value
@@ -40,14 +42,14 @@ export default class MixTable extends React.Component {
 		return (
       <Table>
         {this.props.tones.map(tone => (
-          <SoundMixer key={tone.soundId}>
+          <SoundMixer key={tone._id}>
             <SoundName>{tone.name}</SoundName>
             <div>
                {(tone.options && tone.options.vars) && tone.options.vars.map((v,i) =>
                   <Knob
-                    key={`${tone.id}-${i}`}
+                    key={`${tone._id}-${i}`}
                     name={v[0]}
-                    val={v[1].persistedValue ? v[1].persistedValue : v[1][v[0]]}
+                    val={isNumber(v[1].persistedValue) ? v[1].persistedValue : v[1][v[0]]}
                     min={v[2]}
                     max={v[3]}
                     step={v[4]}
