@@ -117,17 +117,34 @@ export function createTimelineMedia(
   return {
     seek,
     stop() {
+      if (stopped) return;
       stopped = true;
-      for (const mixer of mixers.values()) {
+      for (const [id, mixer] of mixers) {
+        const item = find(id);
+        if (item) {
+          const segment = clips.get(id)?.[0];
+          if (segment) {
+            const clip = item.object.animations[segment.clipIndex];
+            if (clip) {
+              const action = mixer.clipAction(clip);
+              action.reset();
+              action.time = 0;
+              mixer.update(0);
+            }
+          }
+        }
+        activeClips.delete(id);
         mixer.stopAllAction();
         mixer.uncacheRoot(mixer.getRoot());
       }
+      mixers.clear();
       for (const { audio } of sounds.values()) {
         audio.pause();
         audio.currentTime = 0;
         audio.removeAttribute('src');
         audio.load();
       }
+      sounds.clear();
     }
   };
 }

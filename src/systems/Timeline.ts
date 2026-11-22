@@ -23,10 +23,15 @@ export function createTimeline(
     if (element.dataset.webId) elements.set(element.dataset.webId, element);
   });
   const initialStyles = new Map<HTMLElement, { transform: string; opacity: string; animation: string }>();
+  const initialTransforms = new Map<string, {
+    position: [number, number, number]; rotation: [number, number, number]; scale: [number, number, number];
+    camera?: { position: [number, number, number]; rotation: [number, number, number] };
+  }>();
   const webValues = new Map<string, { x: number; y: number; rotation: number; scale: number; opacity: number }>();
   const mediaStates = new Map<string, number>();
   const duration = timeline.duration;
   let time = 0;
+  let stopped = false;
   let playing = !preview && timeline.trigger === 'start';
   let pausedByKey = timeline.trigger === 'key';
   const timelineMedia = makeMedia(timeline, objects, three, reportError, preview);
@@ -121,6 +126,19 @@ export function createTimeline(
         webValues.set(item.id, values);
       } else {
         const [kind, axis] = track.property.split('.') as ['position' | 'rotation' | 'scale', 'x' | 'y' | 'z'];
+        if (!initialTransforms.has(item.id)) {
+          initialTransforms.set(item.id, {
+            position: item.object.position.toArray() as [number, number, number],
+            rotation: item.object.rotation.toArray() as [number, number, number],
+            scale: item.object.scale.toArray() as [number, number, number],
+            ...(item.id === activeCameraId && (kind === 'position' || kind === 'rotation')
+              ? { camera: {
+                  position: camera.position.toArray() as [number, number, number],
+                  rotation: camera.rotation.toArray() as [number, number, number]
+                } }
+              : {})
+          });
+        }
         const converted = kind === 'rotation' ? value * Math.PI / 180 : value;
         item.object[kind][axis] = converted;
         if (item.id === activeCameraId && (kind === 'position' || kind === 'rotation')) camera[kind][axis] = converted;
@@ -136,6 +154,7 @@ export function createTimeline(
   }
 
   function seek(value: number) {
+    if (stopped) return;
     time = Math.max(0, Math.min(duration, value));
     render(time);
   }
@@ -163,12 +182,16 @@ export function createTimeline(
   return {
     seek,
     update(delta: number) {
+      if (stopped) return;
       if (playing && timeline.trigger !== 'scroll') {
         seek(time + Math.max(0, delta));
         if (time >= duration) playing = false;
       } else render(time);
     },
     stop() {
+      if (stopped) return;
+      stopped = true;
+      time = 0;
       abort.abort();
       timelineMedia.stop();
       for (const [element, style] of initialStyles) {
@@ -176,6 +199,30 @@ export function createTimeline(
         element.style.opacity = style.opacity;
         element.style.animation = style.animation;
       }
+      for (const track of tracks) {
+        if (track.property === 'media') {
+          const element = elements.get(track.targetId);
+          if (element instanceof HTMLMediaElement) {
+            element.pause();
+            element.currentTime = 0;
+          }
+        }
+      }
+      for (const [id, transform] of initialTransforms) {
+        const item = byId.get(id);
+        if (!item) continue;
+        item.object.position.fromArray(transform.position);
+        item.object.rotation.fromArray(transform.rotation);
+        item.object.scale.fromArray(transform.scale);
+        if (id === activeCameraId && transform.camera) {
+          camera.position.fromArray(transform.camera.position);
+          camera.rotation.fromArray(transform.camera.rotation);
+        }
+      }
+      initialStyles.clear();
+      initialTransforms.clear();
+      webValues.clear();
+      mediaStates.clear();
     }
   };
 }
