@@ -1,0 +1,28 @@
+{
+  "name": "mmm-videoplayer",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "A simple video player module for MagicMirror².",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Snille/MMM-Videoplayer.git"
+  },
+  "scripts": {
+    "lint": "eslint"
+  },
+  "keywords": [
+    "magicmirror",
+    "magicmirror²",
+    "MagicMirror²",
+    "video",
+    "player",
+    "module"
+  ],
+  "author": "Erik Pettersson",
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0"
+  }
+}
