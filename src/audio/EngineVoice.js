@@ -112,9 +112,18 @@ export class EngineVoice {
     this._lastGear = 1;
     this._doppler = 0;
     this._active = true;
+    /** Once released (faded out for disposal) the voice must never be updated again. */
+    this._released = false;
+    this.disposed = false;
+    /** False once `output` has been disconnected from the bus — the self-test asserts on this. */
+    this.connected = true;
+    this._stopScheduled = false;
+    /** Every started source, so release/dispose can stop all of them even if one throws. */
+    this._sources = [];
 
     const t0 = o.startTime ?? ac.currentTime;
     const harmonics = o.harmonics ?? (this.spatial ? 96 : 240);
+    this.harmonics = harmonics;
     const waves = waveSet(ac, this.profile, this.profile.layout, harmonics);
 
     /* ---------------- output chain ---------------- */
@@ -201,6 +210,7 @@ export class EngineVoice {
       this.osc[name] = { osc, gain: g };
     }
     this.oscList = Object.values(this.osc);
+    this._sources.push(...this.oscList.map((v) => v.osc));
 
     /* ---------------- rasp / turbulence ---------------- */
     if (!this.spatial) {
@@ -214,6 +224,7 @@ export class EngineVoice {
       this.raspGain.gain.value = 0;
       this.raspSrc.connect(this.raspBp).connect(this.raspGain).connect(this.mix);
       this.raspSrc.start(t0);
+      this._sources.push(this.raspSrc);
 
       // Firing-synchronous amplitude modulation: the rasp chuffs in time with the exhaust pulses.
       // (Connections SUM with the automated value on an AudioParam, which is exactly what we want.)
@@ -223,6 +234,7 @@ export class EngineVoice {
       this.chuffDepth.gain.value = 0;
       this.chuff.connect(this.chuffDepth).connect(this.raspGain.gain);
       this.chuff.start(t0);
+      this._sources.push(this.chuff);
     }
 
     /* ---------------- turbo ---------------- */
@@ -270,6 +282,7 @@ export class EngineVoice {
       bg.gain.value = 0;
       bov.connect(bbp).connect(bg).connect(this.out);
       bov.start(t0);
+      this._sources.push(whine, whine2, air, bov);
 
       Object.assign(this.turbo, { whine, wg, whine2, wg2, wf, abp, ag, bg, bbp });
     }
@@ -298,7 +311,7 @@ export class EngineVoice {
    * @param {object} o  { gain, dt, doppler (cents) }
    */
   update(s, t, o = {}) {
-    if (!this._active) return;
+    if (!this._active || this._released) return;
     const ac = this.ac;
     const dt = o.dt ?? 1 / 60;
     const prof = this.profile;
@@ -452,19 +465,99 @@ export class EngineVoice {
     this.loudness = 0;
   }
 
-  dispose() {
-    this._active = false;
+  /**
+   * Fade the voice out and hand back the time at which it is silent. Used when a pool shrinks:
+   * the slot stops scheduling, then calls `disconnect()` / `dispose()` at that time, so a cut
+   * voice is never heard clicking off mid-note. Idempotent and safe to call from any state.
+   */
+  release(t = this.ac.currentTime, fade = 0.28) {
+    this._released = true;
+    this.loudness = 0;
+    const end = t + Math.max(fade, 0.02);
+    const g = this.out?.gain;
+    if (g) {
+      try {
+        // Hold the level the automation had reached at `t`, cancelling anything queued after it.
+        // Plain cancelScheduledValues would leave an earlier setTargetAtTime running and pull the
+        // gain straight back up, which is the click this fade exists to avoid.
+        if (typeof g.cancelAndHoldAtTime === 'function') g.cancelAndHoldAtTime(t);
+        else {
+          const cur = Number.isFinite(g.value) ? g.value : 0;
+          g.cancelScheduledValues(t);
+          g.setValueAtTime(cur, t);
+        }
+        g.linearRampToValueAtTime(0.0005, end);
+      } catch {
+        /* offline context already closed */
+      }
+    }
+    return end;
+  }
+
+  /** Cut the voice from the bus. Called after the release fade has elapsed. */
+  disconnect() {
+    if (!this.connected) return;
+    this.connected = false;
     try {
-      for (const v of this.oscList) v.osc.stop();
+      this.output.disconnect();
+    } catch {
+      /* already disconnected */
+    }
+    try {
+      this.send?.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * Offline schedule: stop every source at `t` (after the release fade). The disconnect — which
+   * has no scheduled form — is left to `flushRetired()` once the render is complete, because
+   * disconnecting early would retroactively silence the whole offline buffer.
+   */
+  scheduleStop(t) {
+    if (this._stopScheduled) return;
+    this._stopScheduled = true;
+    for (const src of this._sources) {
+      try {
+        src.stop(t);
+      } catch {
+        /* already stopped */
+      }
+    }
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this._active = false;
+    this._released = true;
+    // Sources first: stop() on a node already stopped throws in some engines, so each is
+    // guarded individually rather than one try/catch around the whole set.
+    for (const src of this._sources) {
+      try {
+        src.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    // Fallback for the legacy fields, in case a source was created without being registered.
+    try {
       this.raspSrc?.stop();
       this.chuff?.stop();
       if (this.turbo) {
         this.turbo.whine.stop();
         this.turbo.whine2.stop();
       }
-      this.output.disconnect();
     } catch {
       /* already stopped */
     }
+    this.disconnect();
+    try {
+      this.out.disconnect();
+    } catch {
+      /* ignore */
+    }
+    this._sources.length = 0;
   }
 }

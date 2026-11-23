@@ -377,6 +377,9 @@ class Game {
     } else {
       this.hud.update(scaled, ctx);
       this.cameras.update(scaled, ctx);
+      // Audio keeps running while paused: the pack must actually fall silent (a frozen car with a
+      // droning engine is the bug), and that needs scheduled fades, not just a skipped update.
+      this.audio.updatePaused(scaled, ctx);
     }
 
     this.renderer.info.reset();

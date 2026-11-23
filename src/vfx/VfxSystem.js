@@ -96,6 +96,11 @@ export class VfxSystem {
     on('car:land', (e) => this._onLand(e));
     on('wheel:surface', (e) => this._onSurfaceChange(e));
     on('race:restart', () => this.skids?.clear());
+    // The player's CarInstance is replaced on a garage swap; the old emitter state must go with
+    // it or the map leaks one entry per car change.
+    on('car:change', ({ previous } = {}) => {
+      if (previous) this.cars.delete(previous);
+    });
   }
 
   _onCollision({ car, impulse = 0, point, normal, tag }) {

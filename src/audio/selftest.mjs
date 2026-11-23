@@ -50,6 +50,7 @@ async function ensureServer() {
   const proc = spawn('npx', ['vite', '--port', String(PORT), '--host', '127.0.0.1', '--strictPort'], {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
+    shell: process.platform === 'win32',
   });
   const deadline = Date.now() + 45000;
   while (Date.now() < deadline) {
@@ -65,14 +66,24 @@ let browser = null;
 const consoleErrors = [];
 const pageErrors = [];
 
+/**
+ * GPU flags for the headless run. `--use-angle=metal` is the fast path on macOS, but Chromium on
+ * Windows aborts the GPU process on it ("AudioContext encountered an error from the audio device
+ * or the WebAudio renderer", then a renderer crash). Only ask for Metal where Metal exists; fall
+ * back to the SwiftShader software rasteriser everywhere else. Audio assertions are unaffected —
+ * they render in an OfflineAudioContext and never touch the GPU.
+ */
+const gpuArgs =
+  process.platform === 'darwin'
+    ? ['--use-gl=angle', '--use-angle=metal']
+    : ['--enable-unsafe-swiftshader', '--disable-gpu'];
+
 try {
   server = await ensureServer();
   browser = await chromium.launch({
     headless: true,
     args: [
-      '--use-gl=angle',
-      '--use-angle=metal',
-      '--enable-unsafe-swiftshader',
+      ...gpuArgs,
       '--mute-audio',
       '--autoplay-policy=no-user-gesture-required',
       '--js-flags=--max-old-space-size=4096',

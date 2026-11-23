@@ -122,6 +122,11 @@ export class RaceSystem {
     }
     this._buildDrivers();
 
+    // A car swap rebuilds the player's CarInstance (CarSystem.swapPlayer), so every map keyed by
+    // instance has to be re-pointed. The lap record is carried over — a change of car is not a
+    // change of race position.
+    bus.on('car:change', (e) => this._onCarChange(e));
+
     // Barrier contact, split two ways. `taps` is every reported touch — brushing a wall on the
     // exit kerb counts. `hits` is contact hard enough to cost real time (a normal-velocity change
     // above BARRIER_HIT_MS), which is what "hit a barrier" actually means to a driver.
@@ -134,6 +139,36 @@ export class RaceSystem {
 
     this.start();
     return this;
+  }
+
+  /**
+   * The player's CarInstance was replaced in place (garage selection). Move every reference the
+   * race holds over to the new instance; the lap record follows the driver, not the chassis.
+   */
+  _onCarChange({ car, previous } = {}) {
+    if (!car || !previous || car === previous) return;
+    const rules = this.rules;
+    const oldRec = rules?.records?.get(previous);
+    if (oldRec) {
+      rules.records.delete(previous);
+      rules.records.set(car, oldRec);
+    }
+    const veh = this.ctx.physics?.get?.(car) ?? null;
+    this._vehicles.set(car, veh);
+    this._projs.set(car, makeProj());
+    this._barrierHits.set(car, this._barrierHits.get(previous) ?? 0);
+    this._barrierTaps.set(car, this._barrierTaps.get(previous) ?? 0);
+    this._barrierHits.delete(previous);
+    this._barrierTaps.delete(previous);
+    this._vehicles.delete(previous);
+    this._projs.delete(previous);
+
+    car.driverName = 'YOU';
+    this._playerAi = veh ? new AiDriver(car, veh, this.ctx, DRIVER_PROFILES[0], 0) : null;
+    this._playerAi?.resync();
+    this.ctx.player = car;
+    this.ctx.cameras?.setTarget?.(car);
+    this._rebuildStandings();
   }
 
   /** (Re)create AI drivers from DRIVER_PROFILES. Index 0 is reserved for the player. */
@@ -239,6 +274,9 @@ export class RaceSystem {
     this._playerAi?.reset();
     this._playerAi?.resync();
     this.ghost.reset(); // a ghost belongs to one event; never carry it into the next
+    // Listeners that keyed state to a particular grid (skid marks, the audio voice pool) must
+    // drop it: the next race may spawn a different set of cars at the same slots.
+    this.ctx.bus.emit('race:restart');
     this.start();
   }
 

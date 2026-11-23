@@ -38,6 +38,19 @@ const TIER = {
   ultra: { opponents: 5, hrtf: true, verb: 1.2, harmonics: 288, music: true },
 };
 
+/** Seconds a retired voice takes to fade out before its nodes are disconnected. */
+const VOICE_FADE = 0.24;
+/** How often the nearest-opponent set may be recomputed, seconds. */
+const REBIND_COOLDOWN = 0.4;
+/**
+ * Hysteresis margin: an unbound challenger must be this much closer than the slot's current car
+ * before it takes the slot over. Without it, two cars trading places at 0.1 m/s re-bind the pool
+ * four times a second and the field audibly stutters even with the cooldown in place.
+ */
+const REBIND_HYSTERESIS = 0.12;
+/** A car beyond this range is not worth a voice, metres. */
+const AUDIBLE_RANGE = 260;
+
 export class AudioSystem {
   constructor(ctx) {
     this.ctx = ctx;
@@ -52,7 +65,13 @@ export class AudioSystem {
     this._tier = TIER.high;
     this._deferred = [];
     this._opponentSlots = [];
+    /** Voices fading out after a shrink/rebind; each is retired when its fade completes. */
+    this._retiring = [];
+    /** Offline only: voices whose scheduled stop has been queued, awaiting flushRetired(). */
+    this._reaped = [];
     this._rebindCooldown = 0;
+    /** Bumped whenever the whole pool must be rebuilt (a car swap); read by the self-test. */
+    this._opponentEpoch = 0;
     this._engineDuck = 0;
     this._sfxDuck = 0;
     this._camMode = 'chase';
@@ -63,6 +82,12 @@ export class AudioSystem {
     this._playerThrottle = 0;
     this._unsub = [];
     this._scrapeCarryover = 0;
+    /**
+     * Test hook: force the opponent pack silent regardless of race state. The self-test uses it to
+     * assert that "silent but still bound" really is silent, then releases it and checks the same
+     * voices come back rather than new ones.
+     */
+    this._forceMute = false;
     /**
      * Self-test hook. When non-null every schedule uses this instead of `ac.currentTime`, which is
      * what lets the whole system be driven deterministically inside an OfflineAudioContext.
@@ -91,8 +116,19 @@ export class AudioSystem {
   }
 
   async init() {
+    this._subscribe();
+    // Create the context here, during boot, rather than in the gesture handler. A browser will
+    // happily construct an AudioContext without a gesture — it just starts `suspended` — and the
+    // construction itself costs ~90 ms of audio-device startup. Paying that behind the loading
+    // screen means unlock() is a resume() and never hitches the first frame of gameplay.
+    this._createContext();
+    return this;
+  }
+
+  /** Wire the bus handlers. Idempotent; split out so the offline harness can use them too. */
+  _subscribe() {
     const bus = this.ctx?.bus;
-    if (!bus) return this;
+    if (!bus?.on || this._unsub.length) return;
     const on = (name, fn) => this._unsub.push(bus.on(name, fn));
 
     on('car:shift', (e) => this._onShift(e));
@@ -106,13 +142,11 @@ export class AudioSystem {
     on('lap:complete', (e) => this._onLap(e));
     on('camera:mode', (e) => (this._camMode = e?.mode ?? 'chase'));
     on('quality:change', (e) => this.onQuality(e?.tier));
-
-    // Create the context here, during boot, rather than in the gesture handler. A browser will
-    // happily construct an AudioContext without a gesture — it just starts `suspended` — and the
-    // construction itself costs ~90 ms of audio-device startup. Paying that behind the loading
-    // screen means unlock() is a resume() and never hitches the first frame of gameplay.
-    this._createContext();
-    return this;
+    // A different car in the player's seat changes what the whole field should sound like: the
+    // opponent slot set is tied to the car definitions, so it is rebuilt from scratch.
+    on('car:change', (e) => this._onPlayerCarChange(e));
+    on('race:restart', () => this._onRaceRestart());
+    on('race:mode', () => this._onRaceRestart());
   }
 
   /* ------------------------------------------------------------ lifecycle */
@@ -170,6 +204,7 @@ export class AudioSystem {
   /** Build against an explicit context (used by the offline self-test). */
   attachContext(ac, opts = {}) {
     this.ac = null;
+    this._subscribe();
     this._buildMaster(ac);
     this.unlocked = true;
     this._tier = TIER[opts.tier] ?? this._tier;
@@ -180,6 +215,9 @@ export class AudioSystem {
     this._buildReverb(0);
     this._buildReverb(1);
     if (opts.music !== false) this._buildMusic();
+    // The pool matters to the lifecycle tests (shrink/expand/pause/car swap), so it is built here
+    // rather than left to the deferred task queue, which an offline render never drains.
+    this._buildOpponents();
     this._deferred = [];
     return this;
   }
@@ -287,13 +325,15 @@ export class AudioSystem {
     if (!this.ac) return;
     const def = defOverride ?? this.ctx?.cars?.player?.def ?? this.ctx?.player?.def;
     if (!def) return; // retried next frame
-    if (this.engine && this.engine.def === def) return;
-    this.engine?.dispose();
+    if (this.engine && !this.engine.disposed && this.engine.def === def) return;
+    // A car change is a change of note, but cutting the old voice dead is an audible click. Fade
+    // it through the same retirement queue the opponent pool uses, then start the new one.
+    if (this.engine) this._retire(this.engine, this._t());
     this.engine = new EngineVoice(this.ac, def, {
       dest: this.engineBus,
       reverbSend: this.reverbSend,
       harmonics: this._tier.harmonics,
-      startTime: this.ac.currentTime,
+      startTime: this._t(),
     });
     this.stats.profile = profileNameForCar(def);
   }
@@ -324,10 +364,79 @@ export class AudioSystem {
     this.music.setSection(phase === 'racing' ? 'race' : phase === 'countdown' ? 'countdown' : 'idle');
   }
 
+  /**
+   * Resize the pool to the tier's voice count.
+   *
+   * Shrinking fades each surplus voice out first and hands it to `_retiring`; it is only
+   * disconnected and its nodes freed once the fade has actually elapsed (see `_reapRetiring`).
+   * Cutting it dead at the shrink instant is what left silent-but-connected voices in the mix.
+   * Growing appends slots with no voice at all — a new voice is never created until a car is
+   * actually bound to it, and it starts at zero gain, so expansion can never click.
+   */
   _buildOpponents() {
-    const n = this._tier.opponents;
-    while (this._opponentSlots.length > n) this._opponentSlots.pop()?.voice?.dispose();
-    while (this._opponentSlots.length < n) this._opponentSlots.push({ car: null, voice: null });
+    const n = Math.max(0, this._tier.opponents | 0);
+    let changed = false;
+    while (this._opponentSlots.length > n) {
+      const slot = this._opponentSlots.pop();
+      slot.car = null;
+      if (slot.voice) {
+        this._retire(slot.voice, this._t());
+        slot.voice = null;
+      }
+      changed = true;
+    }
+    while (this._opponentSlots.length < n) {
+      this._opponentSlots.push({ car: null, voice: null });
+      changed = true;
+    }
+    if (changed) this._rebindCooldown = Math.min(this._rebindCooldown, REBIND_COOLDOWN);
+  }
+
+  /** Start a voice's fade and queue it for node teardown when the fade completes. */
+  _retire(voice, t) {
+    if (!voice || voice.disposed) return;
+    let end;
+    try {
+      end = voice.release(t, VOICE_FADE);
+    } catch {
+      end = t;
+    }
+    // A voice already queued for teardown must not be queued twice.
+    if (this._retiring.some((r) => r.voice === voice) || this._reaped.some((r) => r.voice === voice)) return;
+    this._retiring.push({ voice, at: end });
+  }
+
+  /**
+   * Disconnect + dispose every retired voice whose fade has elapsed. Called each update.
+   *
+   * In an OfflineAudioContext the whole timeline is scheduled before any of it is rendered, so
+   * tearing nodes down mid-loop would erase the voice from the start of the render rather than
+   * from the end of its fade. Offline, the source stops are therefore scheduled at the fade end
+   * and the actual disconnect is deferred to `flushRetired()`, which the self-test calls after
+   * `startRendering()`; live, teardown happens at the right wall-clock moment.
+   */
+  _reapRetiring(t) {
+    for (let i = this._retiring.length - 1; i >= 0; i--) {
+      const r = this._retiring[i];
+      if (r.at > t) continue;
+      if (this.offlineTime !== null) {
+        r.voice.scheduleStop?.(r.at);
+        this._reaped.push(r);
+      } else {
+        r.voice.disconnect?.();
+        r.voice.dispose?.();
+      }
+      this._retiring.splice(i, 1);
+    }
+  }
+
+  /** Offline only: tear down nodes whose fade completed during the scheduled run. */
+  flushRetired() {
+    for (const r of this._reaped) {
+      r.voice.disconnect?.();
+      r.voice.dispose?.();
+    }
+    this._reaped.length = 0;
   }
 
   onQuality(tier) {
@@ -339,6 +448,44 @@ export class AudioSystem {
       this._verbBuffer = null;
       this.convolver.buffer = buildImpulseResponse(this.ac, this._verbOpts());
     }
+  }
+
+  /**
+   * The player is now in a different car. Everything the pool knows about "what an opponent
+   * sounds like" was derived from the previous hero car, so the pool is dropped and rebuilt:
+   * every bound voice is faded out, freed by `_reapRetiring`, and the player's own engine is
+   * rebuilt from the new definition. The next rebind creates voices from the new car's def.
+   */
+  _onPlayerCarChange(e) {
+    const def = e?.car?.def ?? this.ctx?.cars?.player?.def ?? this.ctx?.player?.def;
+    this._resetOpponentPool();
+    this._engineDuck = 0;
+    if (def) this._buildEngine(def);
+  }
+
+  /**
+   * Race restart / mode change: the pack is re-spawned at the line, and may be a different set of
+   * cars. Bindings are dropped (not re-pointed) so no voice can survive over to the wrong car,
+   * and the player engine is rebuilt if the seat changed.
+   */
+  _onRaceRestart() {
+    this._resetOpponentPool();
+    const def = this.ctx?.cars?.player?.def ?? this.ctx?.player?.def;
+    if (def && this.engine?.def !== def) this._buildEngine(def);
+  }
+
+  /** Fade out and forget every bound voice, keeping the pool's capacity for the new binding. */
+  _resetOpponentPool() {
+    const t = this._t();
+    for (const slot of this._opponentSlots) {
+      slot.car = null;
+      if (slot.voice) {
+        this._retire(slot.voice, t);
+        slot.voice = null;
+      }
+    }
+    this._rebindCooldown = Math.min(this._rebindCooldown, REBIND_COOLDOWN);
+    this._opponentEpoch++;
   }
 
   /* -------------------------------------------------------------- listener */
@@ -614,7 +761,9 @@ export class AudioSystem {
     }
 
     /* ---- opponents ---- */
-    this._updateOpponents(t, step, ctx);
+    // Retired voices finish their fade even while the pack is muted or the pool is empty.
+    this._reapRetiring(t);
+    this._updateOpponents(t, step, ctx, this._packAudible(ctx));
 
     /* ---- music ---- */
     if (this.music) {
@@ -629,53 +778,101 @@ export class AudioSystem {
   }
 
   /**
-   * Assign the pooled spatial voices to the nearest opponents. Hysteresis + a rebind cooldown stop
-   * the pack from thrashing the pool when cars trade places.
+   * Update while the simulation is frozen (Esc / pause screen). The player's own layers are
+   * driven with an empty state so wind, road and tyre noise stop with the car; the opponent pool
+   * is silenced but its bindings are kept, so resuming picks the same voice up on the same car.
+   * Called by main.js from the paused branch of the frame loop instead of `update()`.
    */
-  _updateOpponents(t, dt, ctx) {
+  updatePaused(dt, ctx) {
+    if (!this.unlocked || !this.ac || !this.enabled) return;
+    const t = this._t();
+    const step = clamp(dt || 1 / 60, 1 / 480, 0.2);
+    this._reapRetiring(t);
+    // The camera still settles while paused, so the listener keeps tracking it; only the car
+    // layers are parked.
+    this._updateListener(t, step);
+    this.engine?.silence(t);
+    this.tyres?.update(null, t, {});
+    this.ambience?.update(null, t, { gain: 1, duck: 0 });
+    this.sfx?.update(step, t, { speed: 0 });
+    for (const slot of this._opponentSlots) slot.voice?.silence(t);
+    this._engineDuck = damp(this._engineDuck, 0, 10, step);
+    this._sfxDuck = damp(this._sfxDuck, 0, 10, step);
+    this.stats.opponents = 0;
+    void ctx;
+  }
+
+  /**
+   * Should the car voices be sounding right now?
+   *
+   * A paused race, the results screen, the front end, or any overlay that freezes the pack all
+   * mean the same thing: the field is not moving, so its engines must not keep droning. Bindings
+   * are kept (see `_updateOpponents`) — only the sound is parked — so resuming never has to
+   * rebuild the pool and can never end up with two voices for one car.
+   */
+  _packAudible(ctx) {
+    if (this._forceMute) return false;
+    // `ctx.game.paused` is the harness/QA freeze; `race.paused` is the player's pause screen.
+    // Both freeze the pack, so both must silence it.
+    if (ctx?.game?.paused ?? this.ctx?.game?.paused) return false;
+    const race = ctx?.race ?? this.ctx?.race;
+    if (race) {
+      if (race.paused) return false;
+      const phase = race.phase;
+      if (phase === 'finished' || phase === 'idle') return false;
+    }
+    const screen = ctx?.hud?.screen ?? this.ctx?.hud?.screen;
+    // 'paused' keeps the HUD screen name while the pause flag is set, so it is already covered by
+    // the race.paused check; 'race' is the only driving screen. Everything else is a menu.
+    if (screen && screen !== 'race' && screen !== 'paused') return false;
+    return true;
+  }
+
+  /**
+   * Assign the pooled spatial voices to the nearest opponents.
+   *
+   * The pool is a fixed number of voices; cars are bound to them by distance. Three properties
+   * matter and each has a test:
+   *
+   *  • **nearest first, never more than the tier allows.** The candidate list is sorted by
+   *    listener distance and truncated to the slot count.
+   *  • **no churn when places swap.** A currently bound car keeps its slot unless a challenger
+   *    is closer by `REBIND_HYSTERESIS` (12%), and rebinding only happens once per
+   *    `REBIND_COOLDOWN`. Two cars side by side therefore do not trade the voice every frame.
+   *  • **silent-but-bound while frozen.** When the race is paused/finished or the front end is
+   *    up, every voice is silenced but the `car` binding is left intact. Unfreezing resumes the
+   *    same voice on the same car from its current state, so no duplicate voice is ever created.
+   */
+  _updateOpponents(t, dt, ctx, audible = true) {
     const slots = this._opponentSlots;
-    if (!slots.length) return;
+    this.stats.opponents = 0;
+    if (!slots.length) {
+      // Still park anything bound to a slot that no longer exists (shouldn't happen, but a
+      // shrink + a rebind in the same frame must not leave an unowned voice running).
+      this._rebindCooldown = Math.min(this._rebindCooldown, REBIND_COOLDOWN);
+      return;
+    }
     const cars = ctx?.cars?.instances;
     const player = ctx?.cars?.player ?? ctx?.player ?? null;
-    if (!cars?.length) return;
-
-    this._rebindCooldown -= dt;
     const lp = this._listenerPos;
 
-    if (this._rebindCooldown <= 0) {
-      this._rebindCooldown = 0.4;
-      const cand = [];
-      for (const c of cars) {
-        if (c === player || !c.state) continue;
-        const p = c.state.position;
-        const d = Math.hypot(p.x - lp.x, p.y - lp.y, p.z - lp.z);
-        if (d < 260) cand.push({ car: c, d });
-      }
-      cand.sort((a, b) => a.d - b.d);
-      const want = cand.slice(0, slots.length).map((x) => x.car);
-      // free slots whose car dropped out
+    // Frozen: keep bindings, park the voices. This is the pause / results / menu path.
+    if (!audible) {
       for (const slot of slots) {
-        if (slot.car && !want.includes(slot.car)) slot.car = null;
+        slot.voice?.silence(t);
       }
-      for (const car of want) {
-        if (slots.some((sl) => sl.car === car)) continue;
-        const free = slots.find((sl) => !sl.car);
-        if (!free) break;
-        free.car = car;
-        if (!free.voice || free.voice.def !== car.def) {
-          free.voice?.dispose();
-          free.voice = new EngineVoice(this.ac, car.def, {
-            spatial: true,
-            dest: this.spatialBus,
-            reverbSend: this.reverbSend,
-            harmonics: Math.min(112, this._tier.harmonics),
-            startTime: t,
-          });
-          if (free.voice.panner && !this._tier.hrtf) free.voice.panner.panningModel = 'equalpower';
-        }
-      }
+      return;
     }
 
+    this._rebindCooldown -= dt;
+
+    if (cars?.length && this._rebindCooldown <= 0) {
+      this._rebindCooldown = REBIND_COOLDOWN;
+      this._rebind(t, cars, player, lp);
+    }
+
+    // Follow each bound car. A slot whose car went away (spawn churn, restart) is silenced but
+    // keeps its voice; the next rebind decides whether that voice is reused or retired.
     let live = 0;
     for (const slot of slots) {
       if (!slot.voice) continue;
@@ -689,6 +886,108 @@ export class AudioSystem {
       slot.voice.update(st, t, { dt, gain: 0.85, doppler: cents });
     }
     this.stats.opponents = live;
+  }
+
+  /**
+   * Recompute the binding set, keeping hysteresis on the cars that already hold a voice.
+   * Split out from `_updateOpponents` so the self-test can reason about a single rebind tick.
+   */
+  _rebind(t, cars, player, lp) {
+    const slots = this._opponentSlots;
+    const n = slots.length;
+
+    // ---- candidates, nearest first ----
+    const cand = [];
+    for (const c of cars) {
+      if (c === player || !c.state || !c.def) continue;
+      const p = c.state.position;
+      const d = Math.hypot(p.x - lp.x, p.y - lp.y, p.z - lp.z);
+      if (d < AUDIBLE_RANGE) cand.push({ car: c, d });
+    }
+    cand.sort((a, b) => a.d - b.d);
+    if (!cand.length) {
+      for (const slot of slots) if (slot.car) slot.car = null;
+      return;
+    }
+    const distOf = new Map();
+    for (const c of cand) distOf.set(c.car, c.d);
+
+    // ---- keep what is still in range, then fill the free slots with the nearest newcomers ----
+    const want = [];
+    for (const slot of slots) {
+      if (slot.car && distOf.has(slot.car)) want.push(slot.car);
+    }
+    // A car can only be in one slot; drop any duplicate a previous bug may have left behind.
+    for (let i = 0; i < want.length; i++) {
+      for (let j = want.length - 1; j > i; j--) {
+        if (want[j] === want[i]) want.splice(j, 1);
+      }
+    }
+    for (const c of cand) {
+      if (want.length >= n) break;
+      if (!want.includes(c.car)) want.push(c.car);
+    }
+    // Trim if the retained set somehow exceeds capacity (defensive; cannot happen normally).
+    while (want.length > n) want.pop();
+
+    // ---- hysteresis: only a clearly closer car displaces a bound one ----
+    // Iterate because one swap changes who the "farthest bound car" is. Bounded by the candidate
+    // count, so this cannot spin.
+    for (let guard = 0; guard < cand.length + n; guard++) {
+      let worstIdx = -1;
+      let worstD = -Infinity;
+      for (let i = 0; i < want.length; i++) {
+        const d = distOf.get(want[i]) ?? Infinity;
+        if (d > worstD) {
+          worstD = d;
+          worstIdx = i;
+        }
+      }
+      let bestNew = null;
+      for (const c of cand) {
+        if (want.includes(c.car)) continue;
+        if (!bestNew || c.d < bestNew.d) bestNew = c;
+      }
+      if (!bestNew || worstIdx < 0) break;
+      // The challenger must beat the incumbent by the margin, and the incumbent must still be
+      // a real candidate for the swap to make sense.
+      if (bestNew.d >= worstD * (1 - REBIND_HYSTERESIS)) break;
+      want[worstIdx] = bestNew.car;
+    }
+
+    // ---- apply ----
+    const wanted = new Set(want);
+    for (const slot of slots) {
+      if (slot.car && !wanted.has(slot.car)) {
+        slot.car = null;
+        // Keep the voice: an unbound voice is silent and may be reused for a car of the same
+        // type next rebind. Only a type change forces a rebuild.
+        slot.voice?.silence(t);
+      }
+    }
+    for (const car of want) {
+      if (slots.some((sl) => sl.car === car)) continue;
+      const free = slots.find((sl) => !sl.car);
+      if (!free) break;
+      free.car = car;
+      if (!free.voice || free.voice.disposed || free.voice.def !== car.def) {
+        if (free.voice) this._retire(free.voice, t);
+        free.voice = this._makeOpponentVoice(car.def, t);
+      }
+    }
+  }
+
+  /** Build one spatial opponent voice. Always starts at zero gain (see EngineVoice's out node). */
+  _makeOpponentVoice(def, t) {
+    const voice = new EngineVoice(this.ac, def, {
+      spatial: true,
+      dest: this.spatialBus,
+      reverbSend: this.reverbSend,
+      harmonics: Math.min(112, this._tier.harmonics),
+      startTime: t,
+    });
+    if (voice.panner && !this._tier.hrtf) voice.panner.panningModel = 'equalpower';
+    return voice;
   }
 
   dispose() {
@@ -705,6 +1004,10 @@ export class AudioSystem {
     this.ambience?.dispose();
     this.sfx?.dispose();
     this.music?.dispose();
+    for (const r of this._retiring) r.voice.dispose?.();
+    this._retiring.length = 0;
+    for (const r of this._reaped) r.voice.dispose?.();
+    this._reaped.length = 0;
     for (const s of this._opponentSlots) s.voice?.dispose();
     this._opponentSlots.length = 0;
     this.ac?.close?.();

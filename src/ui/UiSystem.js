@@ -295,6 +295,15 @@ export class UiSystem {
     for (const s of this.el.garage.querySelectorAll('.spec')) {
       s.hidden = s.dataset.car !== id;
     }
+    // Actually put the selected car in the player's seat. This is what makes the garage a
+    // selection rather than a cosmetic panel (README "known gaps"), and it is the path that used
+    // to leave the engine pool sounding like the previous car: CarSystem.swapPlayer emits
+    // `car:change`, which audio uses to rebuild every bound voice from the new definition.
+    const cars = this.ctx.cars;
+    const player = this._player();
+    if (cars?.swapPlayer && player && player.def?.id !== id) {
+      cars.swapPlayer(id, { paint: parseInt(this._paint.slice(1), 16) });
+    }
   }
 
   _pickPaint(btn) {

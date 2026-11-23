@@ -135,6 +135,50 @@ export class CarSystem {
     return inst;
   }
 
+  /**
+   * Put a different car in the player's seat, preserving where the old car was and how fast it
+   * was going. The old instance is removed from the scene and detached from physics, and the new
+   * one takes its place at the SAME index in `instances`, so grid ordering and every
+   * `instances.forEach((c, i) => spawns[i])` in RaceSystem stay coherent.
+   *
+   * Emits `car:change` with `{ car, previous, def }` — the audio pool uses it to rebuild every
+   * bound voice from the new definition (CONTRACTS §2 extension, additive).
+   */
+  swapPlayer(defId, opts = {}) {
+    const old = this.player;
+    if (!old) return null;
+    const def = this.defs.find((d) => d.id === defId);
+    if (!def || def === old.def) return old;
+
+    const idx = this.instances.indexOf(old);
+    const pos = (opts.position ?? old.root.position).clone();
+    const quat = (opts.quaternion ?? old.root.quaternion).clone();
+    const prevState = old.state;
+    const speed = Math.abs(prevState?.speed ?? 0);
+    const paint = opts.paint ?? old._paint?.color?.getHex?.() ?? def.paint.base;
+
+    // ---- retire the old car ----
+    this.ctx.scene.remove(old.root);
+    this.ctx.physics?.detach?.(old);
+    const oi = this.instances.indexOf(old);
+    if (oi >= 0) this.instances.splice(oi, 1);
+
+    // ---- spawn the replacement, then put it back at the old car's slot ----
+    const inst = this.spawn(def.id, { isPlayer: true, position: pos, quaternion: quat, paint });
+    inst.setPaint(paint);
+    const si = this.instances.indexOf(inst);
+    if (si >= 0 && idx >= 0) {
+      this.instances.splice(si, 1);
+      this.instances.splice(Math.min(idx, this.instances.length), 0, inst);
+    }
+    this.ctx.physics?.attach?.(inst);
+    this.ctx.physics?.reset?.(inst, pos, quat);
+    if (speed > 0.1) this.ctx.physics?.setVelocityAlong?.(inst, speed);
+
+    this.ctx.bus?.emit?.('car:change', { car: inst, previous: old, def, paint });
+    return inst;
+  }
+
   // ------------------------------------------------------------------ blueprint
 
   _blueprint(def, quality) {

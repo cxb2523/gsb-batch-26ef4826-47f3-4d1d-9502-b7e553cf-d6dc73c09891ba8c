@@ -93,7 +93,17 @@ node tools/screenshot.mjs --only 01,04 --nohud     # subset, no UI overlay
 node tools/screenshot.mjs --smoke                  # boot gate; non-zero exit on any error
 node tools/screenshot.mjs --quality ultra
 node tools/gputiers.mjs                            # starting-tier rules vs. real GPU strings
+node src/audio/selftest.mjs                        # offline synthesis + level/spectrum checks
+node src/audio/pooltest.mjs                        # opponent voice-pool lifecycle checks
 ```
+
+`pooltest.mjs` is the regression gate for the engine-voice pool. It drives the real `AudioSystem`
+inside an `OfflineAudioContext` and asserts, numerically, that: the nearest opponents hold voices
+and never more than the quality tier allows; a garage car change rebuilds every bound voice from
+the new car; dropping a tier fades surplus voices out and then disconnects and frees their nodes,
+while raising a tier creates silent voices only when a car binds; and pausing silences the pack
+without destroying bindings, so resuming reuses the same voices with no duplicates. No audio device
+is required.
 
 `gputiers.mjs` exists because the starting tier is invisible on the machine you develop on — an
 M4 Pro resolves to `high` whether the rules are right or wrong — so a bad rule ships silently and
@@ -188,7 +198,6 @@ impact-per-unit-work, most valuable first.
   silhouettes still read as cutouts at close range.
 - `sampleGround` and the terrain mesh disagree by up to 7.9 m at t≈0.80, where the circuit passes
   close to itself. Pre-existing; not yet fixed.
-- Garage car *selection* is cosmetic (`ctx.cars` has no swap API); paint does apply.
 - The drift scenario tends to end in a pile-up rather than a sustained slide, so shot 03 is not a
   good showcase of the (now working) drift physics.
 - The QA autopilot cannot hold the racing line everywhere; a few track sections still run wide,

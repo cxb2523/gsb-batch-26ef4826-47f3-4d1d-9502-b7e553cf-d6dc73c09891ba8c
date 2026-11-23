@@ -99,6 +99,21 @@ bus.on(name, fn) -> unsubscribe    bus.off(name, fn)    bus.emit(name, payload)
 | `quality:change` | `{ tier }` | settings |
 | `photo:capture` | `{ name }` | tools |
 
+**Additive events** (not in the original table, emitted since this revision; listeners must
+tolerate their absence on older builds):
+
+| event | payload | emitted by |
+|---|---|---|
+| `car:change` | `{ car, previous, def, paint }` — the player's CarInstance was replaced | cars |
+| `race:restart` | — — the grid is being reset; per-grid state must be dropped | race |
+| `race:mode` | `{ mode, label, laps }` | race |
+| `race:position` | `{ car, position, of }` | race |
+| `race:respawn` | `{ car, reason }` | race |
+| `race:sector` | `{ car, sector, time }` | race |
+| `race:cut` | `{ car, missing }` | race |
+| `race:wrongway` | `{ active, car }` | race |
+| `race:offtrack` | `{ active, car }` | race |
+
 ---
 
 ## 3. Input — `src/core/Input.js` (OWNED BY CORE)
@@ -222,7 +237,12 @@ cars.defs                    // Array<CarDef> (see below)
 cars.spawn(defId, opts)      // -> CarInstance ; opts { isPlayer, paint, position, quaternion }
 cars.instances               // Array<CarInstance>
 cars.player                  // CarInstance | null
+cars.swapPlayer(defId, opts) // -> CarInstance ; replaces the hero car in place, emits car:change
 ```
+`swapPlayer` keeps the old car's position and speed, preserves the player's index in `instances`,
+detaches the old instance from physics and re-attaches the new one, and emits
+`car:change { car, previous, def, paint }`. Listeners (audio, race) rebuild their per-car state
+from that event rather than polling `cars.player` for identity changes.
 
 ### CarDef
 
@@ -337,9 +357,25 @@ audio.setListener(camera)
 audio.play(name, opts)  // -> handle { stop(), setVolume(), setRate() }
 audio.masterVolume, audio.musicVolume, audio.sfxVolume
 audio.enabled
+audio.update(dt, ctx)       // normal frame
+audio.updatePaused(dt, ctx) // frozen frame (main.js paused branch): pack falls silent, bindings kept
 ```
 All sound is synthesised with WebAudio (no files). Engine sound is per-car and driven from
 `state.rpm`, `state.engineLoad`, `state.gear`.
+
+**Opponent voice pool.** A fixed number of spatial voices (per tier: low 0, medium 2, high 4,
+ultra 5) are bound to the nearest opponents, re-evaluated at most every 0.4 s with a 12%
+distance hysteresis so cars trading places do not thrash the pool. Its lifecycle follows:
+
+| trigger | effect |
+|---|---|
+| `car:change` (player's car replaced) | every bound voice faded out, freed, and recreated from the new car defs; player engine rebuilt |
+| `race:restart` / `race:mode` | bindings dropped, voices retired, rebuilt on the next tick |
+| `quality:change` (pool shrinks) | surplus voices fade out, then disconnect + free their nodes; surviving slots keep their voice |
+| `quality:change` (pool grows) | slots appended empty; voices are created only when a car binds, and start at zero gain |
+| `race:paused` / `phase==='finished'\|'idle'` / menu screens | voices silenced but still bound; resume reuses the same voices from current car state |
+
+Regression gate: `node src/audio/pooltest.mjs` (headless, OfflineAudioContext; no sound card).
 
 ---
 
