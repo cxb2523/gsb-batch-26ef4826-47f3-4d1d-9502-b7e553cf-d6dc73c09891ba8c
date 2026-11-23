@@ -4,7 +4,7 @@
 
 Frame size determines the analysis window. Hop size determines the spacing between frame starts. A hop smaller than the frame overlaps observations; an equal hop produces adjacent frames; a larger hop leaves gaps.
 
-`frameSignal` and low-level STFT use complete frames. High-level `analyzeAudio` includes a zero-padded tail and records the true sampleCount. It avoids adding redundant frames after the last sample has been covered. StreamingAnalyzer emits complete frames only and accepts arbitrarily partitioned input chunks.
+`frameSignal` and low-level STFT use complete frames. High-level `analyzeAudio` includes a zero-padded tail and records the true sampleCount. It avoids adding redundant frames after the last sample has been covered. StreamingAnalyzer emits complete frames only and accepts arbitrarily partitioned input chunks. When it converts a different input rate, `flush()` completes the frames at the end of the source stream; see [incremental analysis](streaming.md).
 
 `overlapAdd` sums frames at their supplied hop. `istft` compensates window overlap using squared weights. Request the intended output length explicitly when reconstructing. Zero-weight endpoints are unobservable with a symmetric Hann window unless another frame covers them.
 

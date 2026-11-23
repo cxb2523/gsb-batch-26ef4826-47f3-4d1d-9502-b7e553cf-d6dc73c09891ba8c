@@ -6,20 +6,14 @@
 import { AudioBuffer } from './buffer.js';
 import { assertFiniteSamples, assertInteger, assertInRange } from './validation.js';
 import { assertSampleRate } from './sample-rate.js';
-
-const TWO_PI = Math.PI * 2;
+import {
+  DEFAULT_SINC_HALF_WIDTH,
+  planSincKernel,
+  resampledLength,
+  sincKernel,
+} from './resample-kernel.js';
 
 export type ResampleMode = 'linear' | 'nearest' | 'sinc';
-
-function hannWindow(n: number, N: number): number {
-  if (N <= 1) return 1;
-  return 0.5 * (1 - Math.cos((TWO_PI * n) / (N - 1)));
-}
-
-function sinc(x: number): number {
-  if (x === 0) return 1;
-  return Math.sin(Math.PI * x) / (Math.PI * x);
-}
 
 export function resample(
   buffer: AudioBuffer,
@@ -31,7 +25,7 @@ export function resample(
   assertSampleRate(buffer.sampleRate);
   if (!['nearest', 'linear', 'sinc'].includes(mode))
     throw new RangeError('Unknown resampling mode');
-  const halfWidth = options?.sincHalfWidth ?? 8;
+  const halfWidth = options?.sincHalfWidth ?? DEFAULT_SINC_HALF_WIDTH;
   assertInteger(halfWidth, 'sincHalfWidth');
   assertInRange(halfWidth, 2, 64, 'sincHalfWidth');
   for (const channel of buffer.data) assertFiniteSamples(channel);
@@ -40,11 +34,11 @@ export function resample(
     return new AudioBuffer(targetSampleRate, buffer.numChannels, 0);
   }
   const ratio = targetSampleRate / buffer.sampleRate;
-  const outSamples = Math.max(1, Math.round(buffer.numSamples * ratio));
-  const cutoff = Math.min(1, ratio),
-    radius = Math.ceil(halfWidth / cutoff);
-  if (mode === 'sinc' && radius > 512)
-    throw new RangeError('Sinc conversion ratio exceeds kernel budget');
+  const outSamples = resampledLength(buffer.numSamples, ratio);
+  const plan =
+    mode === 'sinc' ? planSincKernel(buffer.sampleRate, targetSampleRate, halfWidth) : null;
+  const cutoff = plan ? plan.cutoff : Math.min(1, ratio),
+    radius = plan ? plan.radius : Math.ceil(halfWidth / cutoff);
   const out = new AudioBuffer(targetSampleRate, buffer.numChannels, outSamples);
   for (let c = 0; c < buffer.numChannels; c++) {
     const src = buffer.getChannel(c);
@@ -68,9 +62,7 @@ export function resample(
         for (let k = -radius; k <= radius; k++) {
           const idx = center + k;
           if (idx < 0 || idx >= src.length) continue;
-          const x = k - frac;
-          const w = hannWindow(k + radius, 2 * radius + 1);
-          const h = cutoff * sinc(x * cutoff) * w;
+          const h = sincKernel(k, frac, radius, cutoff);
           acc += (src[idx] ?? 0) * h;
           wsum += h;
         }

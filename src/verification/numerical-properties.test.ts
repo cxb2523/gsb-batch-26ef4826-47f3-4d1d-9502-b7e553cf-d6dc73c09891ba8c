@@ -763,3 +763,55 @@ it('return maximal disjoint silent runs with exact sample coverage', () => {
   expect([...silent]).toEqual([0, 1, 3, 5, 6, 7, 9]);
   expect(runs.every((run, i) => i === 0 || run.start > runs[i - 1]!.end)).toBe(true);
 });
+
+it('match whole-buffer resampling for streaming input at every tested rate pair', () => {
+  const pairs = [
+    [48000, 16000],
+    [16000, 48000],
+    [44100, 16000],
+    [8000, 11025],
+    [22050, 44100],
+    [48000, 16000],
+  ] as const;
+  for (const [source, rate] of pairs) {
+    const samples = Float32Array.from(
+      { length: 6000 },
+      (_, i) => 0.6 * Math.sin(2 * Math.PI * 0.07 * i + 0.2 * Math.cos(2 * Math.PI * 0.013 * i)),
+    );
+    const converted = c.resampleMono(samples, source, rate, 'sinc');
+    const frames = c.frameSignal(converted, 128, { hopSize: 64, window: null });
+    const analyzer = new c.StreamingAnalyzer({
+      sampleRate: rate,
+      sourceSampleRate: source,
+      frameSize: 128,
+      hopSize: 64,
+    });
+    const streamed = [...analyzer.push(samples), ...analyzer.flush()];
+    expect(streamed.length).toBe(frames.length);
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i]!;
+      let sum = 0;
+      for (const value of frame) sum += value * value;
+      expect(streamed[i]!.rms).toBeCloseTo(Math.sqrt(sum / frame.length), 6);
+    }
+  }
+});
+
+it('keep streaming frame output identical for arbitrary source chunk splits', () => {
+  const source = 44100,
+    rate = 16000,
+    samples = Float32Array.from({ length: 5000 }, (_, i) =>
+      Math.sin((2 * Math.PI * 800 * i) / source),
+    );
+  const options = { sampleRate: rate, sourceSampleRate: source, frameSize: 256, hopSize: 128 };
+  const wholeAnalyzer = new c.StreamingAnalyzer(options),
+    whole = [...wholeAnalyzer.push(samples), ...wholeAnalyzer.flush()];
+  for (const split of [1, 5, 97, 640, 4999]) {
+    const analyzer = new c.StreamingAnalyzer(options),
+      frames: ReturnType<typeof analyzer.push> = [];
+    for (let offset = 0; offset < samples.length; offset += split)
+      frames.push(...analyzer.push(samples.subarray(offset, offset + split)));
+    frames.push(...analyzer.flush());
+    expect(frames).toEqual(whole);
+  }
+});

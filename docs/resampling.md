@@ -12,4 +12,6 @@ Use sinc when reducing rate and retaining spectral shape matters. Nearest and li
 
 All channels use the same geometry. `resampleMono` delegates to the canonical resampling implementation so the two APIs agree. A same-rate call validates options and may return the original buffer.
 
+`StreamingAnalyzer` uses the same sinc kernel when a stream's `sourceSampleRate` differs from its analysis `sampleRate`, so incremental frames agree with converting the whole recording and then framing it. See [incremental analysis](streaming.md).
+
 The implementation is bounded and intended for local analysis, not a claim of mastering-grade sample-rate conversion. Compare known tones near the target Nyquist frequency when assessing a workflow.
