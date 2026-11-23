@@ -2,3 +2,4 @@ examples/
 evaluation/
 .eslintrc.json
 .DS_Store
+test/

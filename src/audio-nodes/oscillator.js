@@ -5,6 +5,9 @@ export default class ROscillator extends RScheduledSource {
   constructor(props) {
     super(props);
 
+    // `periodicWave` is listed for the debug view only: it has no settable
+    // AudioNode property (`updateParams` skips unknown properties) and is
+    // applied explicitly in `instantiateNode`/`componentWillReceiveProps`.
     this.params = {
       frequency: props.frequency,
       detune: props.detune,
@@ -14,24 +17,24 @@ export default class ROscillator extends RScheduledSource {
 
     this.instantiateNode = this.instantiateNode.bind(this);
     this.readyToPlay = true;
-    this.onEnded = this.onEnded.bind(this);
   }
 
-  onEnded(e) {
-    super.onEnded(e);
-    if (this.props.onEnded) this.props.onEnded(e);
-  }
+  /**
+   * Creates the underlying OscillatorNode, or replaces it after it ended.
+   * Incoming connections are re-pointed to the replacement node.
+   */
+  instantiateNode(forceRebuild) {
+    if (!this.node || forceRebuild) {
+      this.renewNode(() => {
+        const node = this.context.audio.createOscillator();
+        node.addEventListener('ended', this.onEnded);
 
-  instantiateNode() {
-    if (!this.node || this.playbackScheduled === false) {
-      this.node = this.context.audio.createOscillator();
-      this.node.addEventListener('ended', this.onEnded);
+        if (this.props.periodicWave) {
+          node.setPeriodicWave(this.props.periodicWave);
+        }
 
-      if (this.props.periodicWave) {
-        this.node.setPeriodicWave(this.props.periodicWave);
-      }
-
-      this.context.nodes.set(this.props.identifier, this.node);
+        return node;
+      });
     }
 
     this.updateParams = this.updateParams.bind(this);
@@ -46,8 +49,16 @@ export default class ROscillator extends RScheduledSource {
   componentWillReceiveProps(nextProps) {
     super.componentWillReceiveProps(nextProps);
 
-    if (this.props.periodicWave !== nextProps.periodicWave) {
-      this.node.setPeriodicWave(nextProps.periodicWave);
+    // `periodicWave` has no AudioParam equivalent, so it has to be set
+    // explicitly. (`type` is an AudioParam-like property handled by
+    // `updateParams`.) A rebuilt node receives the latest wave in
+    // `instantiateNode`, so only apply it to the live node here.
+    if (this.props.periodicWave !== nextProps.periodicWave && nextProps.periodicWave) {
+      try {
+        this.node.setPeriodicWave(nextProps.periodicWave);
+      } catch (e) {
+        if (this.context.debug) console.warn('Could not set periodic wave', e); // eslint-disable-line no-console
+      }
     }
   }
 }

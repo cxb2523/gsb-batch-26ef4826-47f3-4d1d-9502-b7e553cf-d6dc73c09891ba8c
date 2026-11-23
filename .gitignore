@@ -4,3 +4,6 @@ evaluation
 native_test*
 node_modules
 dist
+
+# generated browser-check bundle
+test/browser/bundle.js

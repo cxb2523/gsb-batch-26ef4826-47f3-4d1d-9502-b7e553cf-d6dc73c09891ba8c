@@ -14,17 +14,18 @@ export default class RConstantSource extends RScheduledSource {
     this.onEnded = this.onEnded.bind(this);
   }
 
-  onEnded(e) {
-    super.onEnded(e);
-    if (this.props.onEnded) this.props.onEnded(e);
-  }
-
-  instantiateNode() {
-    if (!this.node || this.playbackScheduled === false) {
-      this.node = this.context.audio.createConstantSource();
-      this.node.addEventListener('ended', this.onEnded);
-
-      this.context.nodes.set(this.props.identifier, this.node);
+  /**
+   * Creates the underlying ConstantSourceNode, or replaces it after it ended
+   * (a ConstantSourceNode can only be started once). Latest params are applied
+   * and incoming connections are re-pointed to the replacement.
+   */
+  instantiateNode(forceRebuild) {
+    if (!this.node || forceRebuild) {
+      this.renewNode(() => {
+        const node = this.context.audio.createConstantSource();
+        node.addEventListener('ended', this.onEnded);
+        return node;
+      });
     }
 
     this.updateParams = this.updateParams.bind(this);

@@ -1,6 +1,7 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import RComponent from './component.js';
+import { getConnectionRegistry } from './connection-registry.js';
 
 window.AudioContext = window.AudioContext || window.webkitAudioContext || null;
 if (!window.AudioContext) {
@@ -27,6 +28,9 @@ export default class RAudioContext extends React.Component {
 
     if (this.props.debug) {
       window.RAudioNodeMap = this.nodes;
+      // exposes the connection registry (`.edges`) for inspection in the
+      // debug UI and the browser lifecycle example
+      window.RAudioConnections = getConnectionRegistry(this._context);
     }
   }
 
@@ -43,6 +47,11 @@ export default class RAudioContext extends React.Component {
   }
 
   componentWillUnmount() {
+    // Tear down every connection made through this context's registry so no
+    // node keeps referencing a destroyed graph, then release the context.
+    const registry = getConnectionRegistry(this._context);
+    registry.reset();
+    this.nodes.clear();
     this._context.suspend();
   }
 

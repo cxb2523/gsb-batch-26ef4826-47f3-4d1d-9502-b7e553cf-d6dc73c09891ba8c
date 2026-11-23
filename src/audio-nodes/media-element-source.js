@@ -11,6 +11,13 @@ export default class RMediaElementSource extends RAudioNode {
   }
 
   createNode() {
+    if (this.node) {
+      // the old node is retired: its outgoing connections are dropped and
+      // incoming ones are re-pointed by `renewNode`
+      this.renewNode(() => this.context.audio.createMediaElementSource(this.props.element));
+      return;
+    }
+
     this.node = this.context.audio.createMediaElementSource(this.props.element);
     this.context.nodes.set(this.props.identifier, this.node);
   }
@@ -27,6 +34,7 @@ export default class RMediaElementSource extends RAudioNode {
   }
 
   componentWillReceiveProps(nextProps) {
+    super.componentWillReceiveProps(nextProps);
     if (nextProps.element !== this.props.element) this.createNode();
   }
 }

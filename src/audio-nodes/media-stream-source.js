@@ -13,6 +13,13 @@ export default class RMediaStreamSource extends RAudioNode {
   }
 
   createNode() {
+    if (this.node) {
+      // the old node is retired: its outgoing connections are dropped and
+      // incoming ones are re-pointed by `renewNode`
+      this.renewNode(() => this.context.audio.createMediaStreamSource(this.props.stream));
+      return;
+    }
+
     this.node = this.context.audio.createMediaStreamSource(this.props.stream);
     this.context.nodes.set(this.props.identifier, this.node);
   }
@@ -29,6 +36,7 @@ export default class RMediaStreamSource extends RAudioNode {
   }
 
   componentWillReceiveProps(nextProps) {
+    super.componentWillReceiveProps(nextProps);
     if (nextProps.stream !== this.props.stream) this.createNode();
   }
 }

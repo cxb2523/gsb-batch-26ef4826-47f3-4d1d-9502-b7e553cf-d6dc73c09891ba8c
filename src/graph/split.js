@@ -24,10 +24,22 @@ export default class RSplit extends RComponent {
   }
 
   componentWillUpdate(nextProps, nextState) {
-    // update the node's record in the node registry
+    // update the node's record in the node registry.
+    // Only remove the old entry if it still belongs to this component.
     if (this.props.identifier !== nextProps.identifier) {
-      this.context.nodes.delete(this.props.identifier);
+      if (this.context.nodes.get(this.props.identifier) === this.inputs) {
+        this.context.nodes.delete(this.props.identifier);
+      }
       this.context.nodes.set(nextProps.identifier, this.inputs);
+    }
+  }
+
+  componentWillUnmount() {
+    // Drop the registry entry so upstream nodes never resolve to a stale
+    // list of inputs. Downstream children remove their incoming connections
+    // through the connection registry when they unmount.
+    if (this.context.nodes.get(this.props.identifier) === this.inputs) {
+      this.context.nodes.delete(this.props.identifier);
     }
   }
 

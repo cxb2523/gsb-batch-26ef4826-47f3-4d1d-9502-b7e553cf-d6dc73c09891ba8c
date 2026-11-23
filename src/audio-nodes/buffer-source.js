@@ -18,24 +18,23 @@ export default class RBufferSource extends RScheduledSource {
     this.instantiateNode = this.instantiateNode.bind(this);
   }
 
-  instantiateNode() {
-    if (!this.node) {
-      this.node = this.context.audio.createBufferSource();
-      this.node.addEventListener('ended', this.onEnded);
-
-      this.context.nodes.set(this.props.identifier, this.node);
+  /**
+   * Creates the underlying AudioBufferSourceNode, or replaces it after it
+   * ended (an AudioBufferSourceNode can only be started once). The latest
+   * props are applied to the node and incoming connections are re-pointed
+   * to the replacement.
+   */
+  instantiateNode(forceRebuild) {
+    if (!this.node || forceRebuild) {
+      this.renewNode(() => {
+        const node = this.context.audio.createBufferSource();
+        node.addEventListener('ended', this.onEnded);
+        return node;
+      });
     }
 
     this.updateParams = this.updateParams.bind(this);
     this.updateParams(this.props);
-  }
-
-  // we need to make a new AudioBufferSourceNode after playback ends
-  onEnded(e) {
-    super.onEnded(e);
-    this.instantiateNode();
-    this.connectToAllDestinations(this.props.destination, this.node);
-    if (this.props.onEnded) this.props.onEnded(e);
   }
 
   componentWillMount() {
@@ -45,6 +44,7 @@ export default class RBufferSource extends RScheduledSource {
 
   componentDidMount() {
     this.readyToPlay = !!this.props.buffer;
+    // RScheduledSource.componentDidMount -> connected + schedule()
     super.componentDidMount();
   }
 
@@ -54,6 +54,19 @@ export default class RBufferSource extends RScheduledSource {
 
   componentDidUpdate(prevProps, prevState) {
     this.readyToPlay = !!this.props.buffer;
+
+    // An AudioBufferSourceNode cannot take a new buffer once it started, so
+    // rebuild it when the buffer changes. `instantiateNode` applies the
+    // latest params to the replacement, the connection registry re-points
+    // incoming edges, and the scheduling step below re-schedules it using the
+    // latest start/stop props.
+    if (this.shouldStartWithPropsChange(prevProps, this.props) && this.playbackScheduled) {
+      this.playbackScheduled = false;
+      this.startTime = null;
+      this.appliedStopTime = null;
+      this.instantiateNode(true);
+    }
+
     super.componentDidUpdate(prevProps, prevState);
   }
 }

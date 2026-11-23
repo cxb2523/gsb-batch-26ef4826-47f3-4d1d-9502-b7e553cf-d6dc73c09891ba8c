@@ -29,7 +29,12 @@ export default class RPipeline extends RComponent {
 
     if (pointer instanceof Array) {
       // it could also happen that the pointer leads to an AudioNode reference (esp. if it's an AudioContextDestination)
-      resolved = pointer.map(identifier => this.context.nodes.get(identifier) || identifier);
+      resolved = pointer.map(identifier => {
+        const reference = this.context.nodes.get(identifier);
+        // nested lists (e.g. RSplit/R Cycle of RSplit) are flattened recursively
+        if (reference instanceof Array) return this.resolvePointer(reference);
+        return reference || identifier;
+      });
     }
 
     return resolved;
